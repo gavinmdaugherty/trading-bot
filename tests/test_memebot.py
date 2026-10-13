@@ -273,9 +273,9 @@ class RugChecks(unittest.TestCase):
         vt = m.PUMP_V_TOK0
         for i in range(8):
             vt -= 1e6
-            self.buy("A1", f"W{i}", 0.5, 1e6, vt)
+            self.buy("A1", f"W{i}", 0.137, 1e6, vt)
         q = self.w.get("A1")
-        self.assertEqual(q["same_amt"], 1.0)  # every buy exactly 0.5 SOL
+        self.assertEqual(q["same_amt"], 1.0)  # every buy exactly 0.137 SOL: a bot farm
         self.buy("A1", "WHALE", 12.0, 5e6, vt - 5e6)
         self.assertGreater(self.w.get("A1")["whale"], 0.7)
 
@@ -296,6 +296,30 @@ class RugChecks(unittest.TestCase):
             vt -= 1e6
             self.buy("Q", f"W{i}", 0.1 + i / 100, 1e6, vt)
         self.assertEqual(list(self.w.meta_q), ["Q"])
+
+
+class RiskPresets(unittest.TestCase):
+    def test_presets_loosen_spark_and_keep_rug_checks(self):
+        import copy
+        for lvl in ("medium", "high"):
+            spark = next(a for a in m.apply_risk(copy.deepcopy(m.AGENTS), lvl) if a["name"] == "Spark")
+            base = next(a for a in m.AGENTS if a["name"] == "Spark")
+            self.assertLess(spark["min_prog"], base["min_prog"])
+            self.assertTrue(spark["exit_dev_sell"] and spark["skip_copycat"])
+            self.assertLessEqual(spark["max_bundle_pct"], 20)
+
+    def test_quick_buy_buttons_are_not_bot_buys(self):
+        self.assertTrue(m.is_preset_buy(0.1) and m.is_preset_buy(0.099) and m.is_preset_buy(1.0))
+        self.assertFalse(m.is_preset_buy(0.137))
+        w = m.PumpWatcher(m.CFG, clock=lambda: 0.0)
+        w.handle(dict(txType="create", mint="P", traderPublicKey="d", symbol="P", initialBuy=0,
+                      vSolInBondingCurve=30.0, vTokensInBondingCurve=m.PUMP_V_TOK0))
+        vt = m.PUMP_V_TOK0
+        for i in range(10):
+            vt -= 1e6
+            w.handle(dict(txType="buy", mint="P", traderPublicKey=f"W{i}", solAmount=0.1, tokenAmount=1e6,
+                          vSolInBondingCurve=30.0 + i / 10, vTokensInBondingCurve=vt))
+        self.assertEqual(w.get("P")["same_amt"], 0.0)
 
 
 class FakeLive:

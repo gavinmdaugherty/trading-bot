@@ -45,6 +45,8 @@ Before a pump.fun entry, these checks are computed live from the trade stream. E
 | Bot activity | Many identical-size buys, a few wallets churning volume, or one whale making most of the move |
 | Momentum | Thin curve, too few holders, fading buys over the last minute, dumping off the high |
 
+`--risk low|medium|high` sets how picky Spark is (default `medium`). `low` uses the strictest settings, and `high` lets through younger, thinner launches. Every level keeps the hard rug checks: creator selling, bundled supply, serial launchers, copycat tickers and reused socials. Common quick-buy sizes (0.1, 0.5, 1 SOL and so on) don't count as bot buys.
+
 If the creator sells while an agent holds the token, the curve agents exit at once. A curve position that graduates moves over to DEX pricing automatically.
 
 **Live pump.fun trading:** `--live --live-agents Spark --live-usd 15` makes Spark trade real USDC. Jupiter routes each buy to the bonding curve, with a 10% slippage cap, and a buy is refused if the route price is more than 10% above the curve price. After a full sell, the bot closes the empty token account to get its rent (about 0.002 SOL) back. With a small bankroll it skips partial take-profits that would be below the $5 minimum order.

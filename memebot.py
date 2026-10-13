@@ -188,6 +188,37 @@ AGENTS = [
          pos_pct=0.10, max_open=4),
 ]
 
+# --risk presets for Spark. "low" is Spark's own (strict) settings above.
+# Every preset keeps the hard rug checks: creator selling, bundles, serial launchers, reused socials.
+RISK = {
+    "low": {},
+    "medium": dict(min_age_s=30, max_age_s=900, min_prog=6, max_prog=60, min_real_sol=2.5,
+                   min_buyers=15, min_uniq_5m=10, min_holders=15, min_bs_5m=1.15, min_net_sol_5m=2.0,
+                   min_buys_60s=3, max_buys_per_wallet=4.0, max_same_amt=0.35, max_whale=0.5,
+                   max_top_pct=6.0, max_top10_pct=32.0, max_dev_pct=6.0, max_bundle_pct=12.0,
+                   max_sniper_pct=20.0, max_creator_launches=1, max_ath_drop=30, max_new_per_min=3),
+    "high": dict(min_age_s=20, max_age_s=1200, min_prog=3, max_prog=70, min_real_sol=1.0,
+                 min_buyers=10, min_uniq_5m=6, min_holders=10, min_bs_5m=1.0, min_net_sol_5m=1.0,
+                 min_buys_60s=2, max_buys_per_wallet=5.0, max_same_amt=0.5, max_whale=0.6,
+                 max_top_pct=8.0, max_top10_pct=38.0, max_dev_pct=8.0, max_bundle_pct=20.0,
+                 max_sniper_pct=30.0, max_creator_launches=2, min_socials=0, max_ath_drop=40,
+                 max_new_per_min=4),
+}
+# Common quick-buy amounts in SOL: many traders using the same button is normal, not a bot farm.
+PRESET_BUYS = (0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5, 10)
+
+
+def is_preset_buy(sol):
+    return any(abs(sol - p) <= p * 0.03 for p in PRESET_BUYS)
+
+
+def apply_risk(agents, level):
+    for a in agents:
+        if a["name"] == "Spark":
+            a.update(RISK[level])
+    return agents
+
+
 CHAIN_IDS = {"ethereum": 1, "bsc": 56, "base": 8453}
 CHAIN_ALIASES = {"solana": "solana", "sol": "solana", "base": "base", "ethereum": "ethereum",
                  "eth": "ethereum", "mainnet": "ethereum", "bsc": "bsc", "bnb": "bsc",
@@ -756,8 +787,9 @@ class PumpWatcher:
                 bsol += sol
                 big = max(big, sol)
                 uniq.add(tr)
-                key = round(sol, 3)
-                sizes[key] = sizes.get(key, 0) + 1
+                if not is_preset_buy(sol):  # identical odd sizes (0.137, 0.137, ...) are the bot signature
+                    key = round(sol, 3)
+                    sizes[key] = sizes.get(key, 0) + 1
                 if ts >= w60:
                     b60 += 1
             else:
@@ -787,7 +819,7 @@ class PumpWatcher:
                  dev_sold=t["dev_sold"], migrated=t["migrated"], complete=t["complete"],
                  from_create=t["from_create"], n_buys=t["n_buys"], n_sells=t["n_sells"],
                  vol_sol=t["vol_sol"], bundle_pct=bundle, sniper_pct=snipers,
-                 same_amt=(max(sizes.values()) / b) if b >= 6 else 0.0,
+                 same_amt=(max(sizes.values()) / b) if b >= 6 and sizes else 0.0,
                  whale=(big / bsol) if bsol > 0 else 0.0, copycat=copycat,
                  creator_launches=t["creator_launches"], meta_state=t["meta_state"],
                  socials=meta.get("socials", 0), meta_failed=bool(meta.get("failed")),
@@ -3046,6 +3078,8 @@ def main():
                     help="save the first 300 raw pump.fun feed messages to pump_debug.jsonl")
     ap.add_argument("--live", action="store_true", help="enable REAL trading on Solana (see --live-agents)")
     ap.add_argument("--live-agents", default="", help="comma-separated agents to mirror with real money, e.g. Bolt")
+    ap.add_argument("--risk", choices=sorted(RISK), default="medium",
+                    help="how picky Spark is: low (strictest), medium (default), high (degen, more rugs)")
     ap.add_argument("--live-only", action="store_true",
                     help="with --live: run only the live agents, so the dashboard shows just your real money")
     ap.add_argument("--live-usd", type=float, default=CFG["live_usd"],
@@ -3090,6 +3124,7 @@ def main():
                   "Fomo's trending board.")
             fomo = None
     notify = Notifier()
+    apply_risk(AGENTS, args.risk)
     engine = Engine(CFG, AGENTS, src, demo=args.demo, live=live, live_names=live_names,
                     live_only=args.live_only,
                     pump=pump, fomo=fomo, notify=notify)
@@ -3113,6 +3148,7 @@ def main():
         threading.Thread(target=fast_loop, name="fast", daemon=True).start()
     mode = "DEMO" if args.demo else ("LIVE + PAPER" if live else "PAPER")
     feeds = ", ".join(["DexScreener"] + (["pump.fun"] if pump else []) + (["Fomo"] if fomo else []))
+    print(f"Spark risk level: {args.risk}")
     print(f"MemeBot running ({mode} mode, watching {feeds}). Dashboard: http://127.0.0.1:{args.port}"
           f"   (Ctrl+C to stop)" + ("\nAlerts on." if notify.enabled else ""))
 
