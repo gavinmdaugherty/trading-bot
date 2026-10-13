@@ -79,7 +79,7 @@ export DISCORD_WEBHOOK_URL=...
 
 ## Live trading
 
-Any agent can have a live twin that trades real USDC on Solana, for example `--live --live-agents Spark --live-usd 15`. Add `--live-only` to skip the paper agents, so the dashboard shows only your real balance. The paper agents don't learn or feed into the live ones; they're only there for comparison. Put the wallet key in a `.env` file next to `memebot.py` (`MEMEBOT_SOLANA_KEY=...`). Never commit that file; `.gitignore` already excludes it.
+Any agent can have a live twin that trades real USDC on Solana, for example `--live --live-agents Spark --live-usd 15`. There is no daily loss cap unless you set one with `--daily-loss 20` (a percentage of the bankroll). Add `--live-only` to skip the paper agents, so the dashboard shows only your real balance. The paper agents don't learn or feed into the live ones; they're only there for comparison. Put the wallet key in a `.env` file next to `memebot.py` (`MEMEBOT_SOLANA_KEY=...`). Never commit that file; `.gitignore` already excludes it.
 
 ## Tests
 

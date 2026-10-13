@@ -79,7 +79,7 @@ CFG = dict(
     extra_slip_pct=1.00,         # per side: latency / MEV allowance
     default_tax_pct=0.0,
     cooldown_min=60,             # no re-entry into the same token for this long
-    daily_loss_pct=15.0,         # an agent stops opening trades after losing this much in a day
+    daily_loss_pct=0.0,          # stop opening trades after losing this % in a day; 0 = no cap (--daily-loss)
     max_new_per_cycle=2,         # per agent
     breakeven_pct=0.0,           # after a partial take-profit, close the rest if it falls back to here
     sol_usd_fallback=150.0,      # used until the first SOL price arrives
@@ -1721,6 +1721,9 @@ class Engine:
             self.state["lineup"] = lineup
         for name in self.acfg:
             self.state["agents"].setdefault(name, self._fresh_agent(name))
+        if not cfg["daily_loss_pct"]:
+            for st in self.state["agents"].values():
+                st["capped"] = False
         for st in self.state["agents"].values():
             for pos in st["positions"].values():
                 if pos.get("venue") == "curve" and self.pump:
@@ -2212,6 +2215,9 @@ class Engine:
                 pos.update(miss=0, last_price=p["price"], last_liq=p["liq"],
                            peak=max(pos["peak"], p["price"]))
                 self._check_exit(name, k, pos, p["price"], liq=p["liq"])
+            if not self.cfg["daily_loss_pct"]:
+                st["capped"] = False  # no daily cap: also clears one saved from an earlier run
+                continue
             cap = st["start"] * self.cfg["daily_loss_pct"] / 100.0
             if st["day_pnl"] <= -cap and not st["capped"]:
                 st["capped"] = True
@@ -3091,6 +3097,9 @@ def main():
     ap.add_argument("--risk", choices=["low", "medium", "high", "degen"], default="medium",
                     help="how picky Spark is: low (strictest), medium (default), high, degen (trenching: "
                          "seconds-old launches, most of them die)")
+    ap.add_argument("--daily-loss", type=float, default=CFG["daily_loss_pct"],
+                    help="stop an agent opening trades after it loses this %% of its bankroll in a day "
+                         "(default 0 = no daily cap)")
     ap.add_argument("--live-only", action="store_true",
                     help="with --live: run only the live agents, so the dashboard shows just your real money")
     ap.add_argument("--live-usd", type=float, default=CFG["live_usd"],
@@ -3135,6 +3144,7 @@ def main():
                   "Fomo's trending board.")
             fomo = None
     notify = Notifier()
+    CFG["daily_loss_pct"] = args.daily_loss
     apply_risk(AGENTS, args.risk)
     engine = Engine(CFG, AGENTS, src, demo=args.demo, live=live, live_names=live_names,
                     live_only=args.live_only,

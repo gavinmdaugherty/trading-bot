@@ -387,6 +387,16 @@ class LiveSpark(unittest.TestCase):
         self.assertIsNone(self.eng._slot_reason("Spark LIVE", k, 5))
         self.assertFalse(self.eng.live_halt)
 
+    def test_daily_cap_off_by_default_and_optional(self):
+        st = self.eng.state["agents"]["Spark LIVE"]
+        st["day_pnl"], st["capped"] = -14.0, True
+        self.eng._exits()
+        self.assertFalse(st["capped"])  # default 0: no daily cap, even with a saved flag
+        self.eng.cfg["daily_loss_pct"] = 15.0
+        self.eng._exits()
+        self.assertTrue(st["capped"])
+        self.assertEqual(self.eng._slot_reason("Spark LIVE", "x", 5), "daily loss cap hit")
+
     def test_live_blocked_when_wallet_sol_low(self):
         self.eng.wallet = dict(pub="x", usdc=15.0, sol=0.001)
         self.assertEqual(self.eng._live_reason("Spark LIVE"), "wallet SOL too low for fees")
