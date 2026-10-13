@@ -29,14 +29,23 @@ Use `--no-pump` or `--no-fomo` to turn a feed off. If `FOMO_API_KEY` isn't set, 
 | **Grad** | graduates | Tokens that graduated from pump.fun within the last 2 hours, traded on their new DEX pool |
 | **Herd** | Fomo | Tokens in the top 25 of Fomo's trending board that also pass the DEX filters |
 
-Before a pump.fun entry, these checks are computed live from the trade stream:
-- the creator has not sold
-- the creator holds only a small share of supply
-- no single wallet, and not the top 10 together, holds too much
-- the volume isn't a few wallets trading back and forth
-- the price is not already sliding off its high
+Before a pump.fun entry, these checks are computed live from the trade stream. Each one blocks the buy:
+
+| Check | Catches |
+|---|---|
+| Bundle detection | Supply bought in the launch block. Those buys happen before anyone can subscribe to the token, so the bot finds them by comparing the curve at creation with the curve at the first trade it sees. |
+| Sniper holdings | How much the wallets that bought in the first 20 seconds still hold |
+| Serial launcher | A creator wallet that has launched other tokens this session |
+| Creator | The creator has sold, or holds too much |
+| Concentration | One wallet, or the top 10 together, holding too much |
+| Copycat ticker | An older launch with the same ticker is already live |
+| Socials | No Twitter, Telegram or website in the metadata, or links reused from another launch (a common scam pattern) |
+| Bot activity | Many identical-size buys, a few wallets churning volume, or one whale making most of the move |
+| Momentum | Thin curve, too few holders, fading buys over the last minute, dumping off the high |
 
 If the creator sells while an agent holds the token, the curve agents exit at once. A curve position that graduates moves over to DEX pricing automatically.
+
+**Live pump.fun trading:** `--live --live-agents Spark --live-usd 15` makes Spark trade real USDC. Jupiter routes each buy to the bonding curve, with a 10% slippage cap, and a buy is refused if the route price is more than 10% above the curve price. After a full sell, the bot closes the empty token account to get its rent (about 0.002 SOL) back. With a small bankroll it skips partial take-profits that would be below the $5 minimum order.
 
 ## Better fills and exits
 
@@ -47,6 +56,9 @@ If the creator sells while an agent holds the token, the curve agents exit at on
 
 ## Dashboard
 
+- A status line shows what the bot is doing right now, how fresh the data is and when the next scan runs. Status lights show the state of DexScreener, pump.fun and Fomo, and a banner explains any connection problem.
+- Each agent card shows why it isn't buying, for example "too young (40), bundled launch (3)".
+- The page keeps your scroll position while it refreshes.
 - A pump.fun panel lists the hottest live launches: curve progress, buyers, buys and sells over 5 minutes, net SOL flow, and flags such as "dev sold".
 - A Fomo trending panel shows each token's 1h move and liquidity.
 - Source badges show where each position and trade came from.
@@ -63,7 +75,7 @@ export DISCORD_WEBHOOK_URL=...
 
 ## Live trading
 
-This works the same way as before. Only DEX agents on Solana can have a live twin, for example `--live --live-agents Bolt,Grad`. The bonding-curve agents are always paper.
+Any agent can have a live twin that trades real USDC on Solana, for example `--live --live-agents Spark --live-usd 15`. Put the wallet key in a `.env` file next to `memebot.py` (`MEMEBOT_SOLANA_KEY=...`). Never commit that file; `.gitignore` already excludes it.
 
 ## Tests
 

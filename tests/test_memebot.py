@@ -241,7 +241,179 @@ class EngineDemo(unittest.TestCase):
         self.assertIn("grad", eng.universe[k]["tags"])
 
 
+class RugChecks(unittest.TestCase):
+    def setUp(self):
+        self.now = 1000.0
+        self.w = m.PumpWatcher(m.CFG, clock=lambda: self.now)
+
+    def create(self, mint, dev="DEV", sym="ABC", vtok=m.PUMP_V_TOK0):
+        self.w.handle(dict(txType="create", mint=mint, traderPublicKey=dev, symbol=sym, initialBuy=0,
+                           vSolInBondingCurve=30.0, vTokensInBondingCurve=vtok, uri="https://ipfs.io/ipfs/x"))
+
+    def buy(self, mint, w, sol, amt, vtok):
+        self.w.handle(dict(txType="buy", mint=mint, traderPublicKey=w, solAmount=sol, tokenAmount=amt,
+                           newTokenBalance=amt, vSolInBondingCurve=40.0, vTokensInBondingCurve=vtok))
+
+    def test_unseen_launch_block_buys_count_as_bundle(self):
+        self.create("B")
+        # 80M tokens left the curve before our first trade: 30M in that trade, 50M unseen
+        self.now += 4
+        self.buy("B", "W1", 1.0, 30e6, m.PUMP_V_TOK0 - 80e6)
+        q = self.w.get("B")
+        self.assertAlmostEqual(q["bundle_pct"], 5.0)
+        self.assertAlmostEqual(q["sniper_pct"], 3.0)
+
+    def test_serial_creator_copycat_and_bot_buys(self):
+        self.create("A1", dev="RUG", sym="CAT")
+        self.now += 10
+        self.create("A2", dev="RUG", sym="cat")
+        q1, q2 = self.w.get("A1"), self.w.get("A2")
+        self.assertEqual((q1["creator_launches"], q2["creator_launches"]), (0, 1))
+        self.assertEqual((q1["copycat"], q2["copycat"]), (False, True))
+        vt = m.PUMP_V_TOK0
+        for i in range(8):
+            vt -= 1e6
+            self.buy("A1", f"W{i}", 0.5, 1e6, vt)
+        q = self.w.get("A1")
+        self.assertEqual(q["same_amt"], 1.0)  # every buy exactly 0.5 SOL
+        self.buy("A1", "WHALE", 12.0, 5e6, vt - 5e6)
+        self.assertGreater(self.w.get("A1")["whale"], 0.7)
+
+    def test_metadata_and_reused_links(self):
+        self.create("S1")
+        self.create("S2")
+        self.w._set_meta("S1", dict(twitter="https://x.com/elonmusk/", telegram="", website=""))
+        self.assertEqual(self.w.get("S1")["meta_state"], 2)
+        self.assertEqual(self.w.get("S1")["socials"], 1)
+        self.assertFalse(self.w.get("S1")["dup_social"])
+        self.w._set_meta("S2", dict(twitter="https://X.com/elonmusk", telegram="", website=""))
+        self.assertTrue(self.w.get("S1")["dup_social"] and self.w.get("S2")["dup_social"])
+
+    def test_meta_queued_after_enough_buys(self):
+        self.create("Q")
+        vt = m.PUMP_V_TOK0
+        for i in range(m.CFG["meta_min_buys"]):
+            vt -= 1e6
+            self.buy("Q", f"W{i}", 0.1 + i / 100, 1e6, vt)
+        self.assertEqual(list(self.w.meta_q), ["Q"])
+
+
+class FakeLive:
+    def __init__(self):
+        self.calls = []
+
+    def buy(self, mint, usd, ref_price, slippage_bps=None, max_dev_pct=None):
+        self.calls.append(("buy", mint, usd, slippage_bps, max_dev_pct))
+        return dict(ok=True, spent_usd=usd, raw=int(usd / ref_price * 1e6), decimals=6, sig="SIG")
+
+    def sell(self, mint, raw):
+        self.calls.append(("sell", mint, raw))
+        return dict(ok=True, got_usd=6.0, sig="SIG2", sold_raw=raw)
+
+    def close_empty(self, mint):
+        self.calls.append(("close", mint))
+        return "SIG3"
+
+    def wallet(self):
+        return dict(pub="x", usdc=15.0, sol=0.05)
+
+
+class LiveSpark(unittest.TestCase):
+    def setUp(self):
+        self.cfg = dict(m.CFG, live_usd=15.0)
+        self.live = FakeLive()
+        src = m.DemoSource()
+        pump = m.DemoPump(self.cfg, clock=time.time)
+        self.eng = m.Engine(self.cfg, m.AGENTS, src, demo=True, pump=pump, live=self.live,
+                            live_names=["Spark"])
+        pump.clock = lambda: self.eng.t
+        self.eng.wallet = self.live.wallet()
+
+    def q(self, **kw):
+        q = dict(addr="MINT1", symbol="GO", price=50 / 900e6 * self.eng.sol_usd, vsol=50.0, vtok=900e6,
+                 mcap=1e4, prog=20.0, buyers=40, net_sol_5m=6.0)
+        q.update(kw)
+        return q
+
+    def test_live_curve_buy_uses_curve_tolerances_and_closes_account(self):
+        self.assertIn("Spark LIVE", self.eng.acfg)
+        self.assertTrue(self.eng._buy_curve("Spark LIVE", self.q()))
+        kind, mint, usd, bps, dev = self.live.calls[0]
+        self.assertEqual((kind, mint, usd), ("buy", "MINT1", 5.0))  # $15 bankroll: minimum $5 order
+        self.assertEqual((bps, dev), (self.cfg["live_curve_slippage_bps"], self.cfg["live_curve_max_dev_pct"]))
+        st = self.eng.state["agents"]["Spark LIVE"]
+        k = m.tkey("solana", "MINT1")
+        pos = st["positions"][k]
+        self.assertTrue(pos["live"] and pos["venue"] == "curve")
+        self.assertAlmostEqual(st["cash"], 10.0)
+        # +35% is past tp1 (30%), but half of $5 is below the $5 minimum order: no partial sell
+        self.eng._check_exit("Spark LIVE", k, pos, pos["ref_price"] * 1.35)
+        self.assertFalse(pos.get("tp1_done"))
+        self.eng._check_exit("Spark LIVE", k, pos, pos["ref_price"] * 0.7)  # stop-loss
+        self.assertNotIn(k, st["positions"])
+        self.assertEqual([c[0] for c in self.live.calls], ["buy", "sell", "close"])
+        self.assertAlmostEqual(st["cash"], 16.0)
+
+    def test_live_blocked_when_wallet_sol_low(self):
+        self.eng.wallet = dict(pub="x", usdc=15.0, sol=0.001)
+        self.assertEqual(self.eng._live_reason("Spark LIVE"), "wallet SOL too low for fees")
+        self.eng.live_halt = True
+        self.assertEqual(self.eng._live_reason("Spark LIVE"), "live trading halted")
+
+    def test_why_not_reports_rug_reasons(self):
+        base = dict(self.q(), migrated=False, complete=False, from_create=True, last_trade=self.eng.t,
+                    age=120, dev_sold=False, dev_pct=1, dev_init_pct=1, creator_launches=0, bundle_pct=1,
+                    sniper_pct=2, top_pct=2, top10_pct=15, copycat=False, dup_social=False, real_sol=20,
+                    holders=60, uniq_5m=30, buys_5m=50, sells_5m=20, same_amt=0.1, whale=0.1, buys_60s=10,
+                    ath_drop=-5, meta_state=2, socials=1)
+        self.assertIsNone(self.eng._why_not_curve("Spark", base))
+        for change, why in [(dict(bundle_pct=20), "bundled launch"), (dict(creator_launches=3), "serial launcher"),
+                            (dict(same_amt=0.6), "bot-sized identical buys"), (dict(socials=0), "no socials"),
+                            (dict(dup_social=True), "reused social links"), (dict(whale=0.8), "one whale driving it"),
+                            (dict(meta_state=1), "checking socials"), (dict(dev_sold=True), "creator sold")]:
+            self.assertEqual(self.eng._why_not_curve("Spark", dict(base, **change)), why)
+
+
+class CloseEmpty(unittest.TestCase):
+    def test_builds_close_instruction_for_empty_account_only(self):
+        try:
+            from solders.keypair import Keypair
+            from solders.transaction import Transaction
+        except ImportError:
+            self.skipTest("solders not installed")
+        kp = Keypair()
+        ex = m.SolanaLive.__new__(m.SolanaLive)
+        ex.kp, ex.pub, ex.cfg = kp, str(kp.pubkey()), m.CFG
+        sent = []
+        prog = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        empty, full = str(Keypair().pubkey()), str(Keypair().pubkey())
+
+        def acc(pk, amount):
+            return {"pubkey": pk, "account": {"owner": prog, "data": {"parsed": {"info": {
+                "owner": ex.pub, "tokenAmount": {"amount": str(amount)}}}}}}
+
+        def rpc(method, params):
+            if method == "getTokenAccountsByOwner":
+                return {"value": [acc(empty, 0), acc(full, 5)]}
+            if method == "getLatestBlockhash":
+                return {"value": {"blockhash": "11111111111111111111111111111111"}}
+            sent.append(params[0])
+            return "SIG"
+        ex._rpc = rpc
+        self.assertEqual(ex.close_empty("MintAAA"), "SIG")
+        tx = Transaction.from_bytes(base64.b64decode(sent[0]))
+        keys = [str(k) for k in tx.message.account_keys]
+        self.assertIn(empty, keys)
+        self.assertNotIn(full, keys)
+        self.assertEqual(len(tx.message.instructions), 1)
+        self.assertEqual(bytes(tx.message.instructions[0].data), bytes([9]))
+        self.assertIsNone(ex.close_empty(m.SolanaLive.USDC))
+
+
 class Dashboard(unittest.TestCase):
+    def test_nan_is_sanitised(self):
+        self.assertEqual(m.finite({"a": [float("nan"), 1.0, float("inf")]}), {"a": [None, 1.0, None]})
+
     def test_guards(self):
         eng = demo_engine()
         srv = ThreadingHTTPServer(("127.0.0.1", 0), None)
