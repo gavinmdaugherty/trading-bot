@@ -3,36 +3,57 @@
 MemeBot - multi-chain memecoin paper-trading engine with a live dashboard.
 
     python memebot.py            real market data, simulated fills (paper trading)
-    python memebot.py --demo     synthetic data, to preview the dashboard offline
+    python memebot.py --demo     synthetic DEX, pump.fun and Fomo data, to preview offline
     python memebot.py --reset    wipe saved state and start over
+    python memebot.py --no-pump --no-fomo
+                                 switch individual watchers off
     python memebot.py --live --live-agents Bolt --live-usd 50
                                  ALSO trade real money on Solana with a live twin of Bolt
 
 Then open http://127.0.0.1:8000
 
+What it watches
+  * DexScreener: new and boosted tokens on Solana / Base / Ethereum / BSC
+  * pump.fun: every launch and every bonding-curve trade in real time (PumpPortal
+    websocket), plus graduations to PumpSwap the moment they happen
+  * Fomo (fomo.family): the tokens Fomo users are trading right now, via FOMO API
+    (set FOMO_API_KEY, free key at https://fomoapi.io)
+
 What it does
-  * Discovers new tokens on Solana / Base / Ethereum / BSC (DexScreener public API)
-  * Runs six strategy agents side by side, each with its own balance and rules
-  * Screens tokens with safety checks (RugCheck on Solana, honeypot.is on EVM)
-  * Fills paper trades with a realistic cost model: price impact from pool size,
-    DEX fee, latency slippage and token buy/sell tax
+  * Runs ten strategy agents side by side, each with its own balance and rules:
+    six DEX strategies, two pump.fun bonding-curve strategies, one that rides fresh
+    pump.fun graduates and one that follows Fomo's trending board
+  * Screens tokens: RugCheck on Solana, honeypot.is on EVM, and for pump.fun launches
+    checks computed live from the trade stream (creator selling, holder concentration,
+    creator allocation, a few wallets churning volume, dumping off the high)
+  * Fills paper trades with a realistic cost model: exact constant-product math on the
+    pump.fun curve, pool-size price impact on DEXes, fees, latency slippage, token tax
+  * Scales out: partial take-profit, then a break-even stop and a trailing stop
+  * Optional Telegram / Discord alerts for every entry and exit
   * Writes everything to state.json and serves the dashboard from the same process
 
 Without --live nothing here places real orders. With --live, the chosen agents trade
 real USDC on Solana (Jupiter) from a dedicated wallet; every other agent stays paper.
-Standard library only (Python 3.9+).
+Bonding-curve agents are always paper.
+Standard library only (Python 3.9+); live trading additionally needs `solders`.
 """
 import argparse
 import base64
+import hashlib
 import json
 import math
 import os
+import queue
 import random
+import socket
+import ssl
+import struct
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -42,6 +63,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CFG = dict(
     chains=["solana", "base", "ethereum", "bsc"],
     poll_seconds=30,
+    fast_seconds=2.0,            # pump.fun entries/exits run on this faster loop
     port=8000,
     state_file="state.json",
     stop_file="STOP",            # create this file to block all new entries
@@ -59,6 +81,25 @@ CFG = dict(
     cooldown_min=60,             # no re-entry into the same token for this long
     daily_loss_pct=15.0,         # an agent stops opening trades after losing this much in a day
     max_new_per_cycle=2,         # per agent
+    breakeven_pct=0.0,           # after a partial take-profit, close the rest if it falls back to here
+    sol_usd_fallback=150.0,      # used until the first SOL price arrives
+    # ---- pump.fun (PumpPortal websocket) ----
+    pump_ws="wss://pumpportal.fun/api/data",
+    pump_watch_secs=1800,        # follow each launch's trades for up to 30 minutes
+    pump_idle_secs=240,          # stop following a launch once it has gone this long without a trade
+    pump_watch_max=400,          # launches followed at once
+    pump_fee_pct=1.25,           # per side, protocol + creator fee on the curve
+    pump_extra_slip_pct=3.0,     # per side: other snipers land ahead of you
+    pump_max_impact=0.02,        # never put more SOL in than 2% of the curve's virtual SOL
+    pump_lost_secs=600,          # no price for this long: also look for the token on DEXes
+    pump_writeoff_secs=1800,     # no price at all for this long: close at the last known value
+    grad_window_min=120,         # a graduation counts as "fresh" for this long
+    # ---- Fomo (fomo.family) trending board, through FOMO API ----
+    fomo_api="https://api.fomoapi.io/v2/leaderboard/tokens/trending",
+    fomo_poll_seconds=120,       # the free tier allows 10 requests a minute; this uses 0.5
+    fomo_top=30,
+    # ---- alerts (Telegram / Discord, optional) ----
+    alert_tags=["EXEC", "FILL", "HALT"],
     # ---- live trading (Solana only, off unless you start with --live) ----
     live_usd=50.0,               # bankroll per live agent: the most it can ever deploy
     live_min_trade_usd=5.0,
@@ -72,12 +113,18 @@ CFG = dict(
     live_min_sol=0.02,           # SOL needed in the wallet for network fees
 )
 
-# Six strategy variants. Percent fields are percent; ages are minutes.
+# Strategy agents. Percent fields are percent; DEX ages are minutes; curve ages are seconds.
+#   venue="dex"   trades pools found on DexScreener (default)
+#   venue="curve" trades pump.fun launches on the bonding curve, from the live trade stream
+#   need="grad"   only tokens that graduated from pump.fun within grad_window_min
+#   need="fomo"   only tokens on Fomo's trending board (rank <= max_rank)
+#   tp1/tp1_frac  sell this fraction at tp1, then hold the rest with a break-even stop
 AGENTS = [
     dict(name="Atlas",  style="Steady momentum",
          min_liq=50_000, min_vol_h1=20_000, min_chg_h1=5,  max_chg_h1=80,  min_chg_m5=-2,
          min_age=60,  max_age=1440, min_buy_ratio=1.10, min_vol_liq=0.2,
-         tp=40,  sl=-20, trail_act=25, trail=12, max_hold=180, pos_pct=0.10, max_open=4),
+         tp=40, tp1=20, tp1_frac=0.5, sl=-20, trail_act=25, trail=12, max_hold=180,
+         pos_pct=0.10, max_open=4),
     dict(name="Bolt",   style="Fast scalp",
          min_liq=40_000, min_vol_h1=30_000, min_chg_h1=3,  max_chg_h1=60,  min_chg_m5=1,
          min_age=45,  max_age=720,  min_buy_ratio=1.20, min_vol_liq=0.4,
@@ -85,7 +132,8 @@ AGENTS = [
     dict(name="Cinder", style="Early runner",
          min_liq=30_000, min_vol_h1=25_000, min_chg_h1=15, max_chg_h1=250, min_chg_m5=0,
          min_age=20,  max_age=240,  min_buy_ratio=1.30, min_vol_liq=0.5,
-         tp=100, sl=-25, trail_act=40, trail=20, max_hold=240, pos_pct=0.08, max_open=4),
+         tp=100, tp1=40, tp1_frac=0.5, sl=-25, trail_act=40, trail=20, max_hold=240,
+         pos_pct=0.08, max_open=4),
     dict(name="Drift",  style="Established, calmer",
          min_liq=150_000, min_vol_h1=40_000, min_chg_h1=2, max_chg_h1=40,  min_chg_m5=-1,
          min_age=360, max_age=4320, min_buy_ratio=1.05, min_vol_liq=0.1,
@@ -97,10 +145,47 @@ AGENTS = [
     dict(name="Flux",   style="Volume breakout",
          min_liq=60_000, min_vol_h1=120_000, min_chg_h1=4, max_chg_h1=120, min_chg_m5=0,
          min_age=45,  max_age=1440, min_buy_ratio=1.15, min_vol_liq=1.0,
-         tp=35,  sl=-15, trail_act=20, trail=10, max_hold=120, pos_pct=0.10, max_open=4),
+         tp=35, tp1=18, tp1_frac=0.5, sl=-15, trail_act=20, trail=10, max_hold=120,
+         pos_pct=0.10, max_open=4),
+    dict(name="Spark",  style="pump.fun early momentum", venue="curve",
+         min_age_s=45, max_age_s=600, min_prog=8, max_prog=55,
+         min_buyers=20, min_uniq_5m=12, min_bs_5m=1.5, min_net_sol_5m=4.0,
+         max_buys_per_wallet=3.0, max_top_pct=6.0, max_top10_pct=30.0, max_dev_pct=5.0,
+         max_ath_drop=25, exit_dev_sell=True,
+         tp=60, tp1=30, tp1_frac=0.5, sl=-22, trail_act=35, trail=15, max_hold=20,
+         pos_pct=0.06, max_open=4, max_new_per_min=2),
+    dict(name="Crest",  style="pump.fun near graduation", venue="curve",
+         min_age_s=120, max_age_s=1800, min_prog=60, max_prog=93,
+         min_buyers=60, min_uniq_5m=20, min_bs_5m=1.3, min_net_sol_5m=8.0,
+         max_buys_per_wallet=3.0, max_top_pct=5.0, max_top10_pct=28.0, max_dev_pct=4.0,
+         max_ath_drop=15, exit_dev_sell=True,
+         tp=45, sl=-18, trail_act=25, trail=12, max_hold=45,
+         pos_pct=0.06, max_open=3, max_new_per_min=1),
+    dict(name="Grad",   style="Fresh pump.fun graduates", need="grad",
+         min_liq=15_000, min_vol_h1=15_000, min_chg_h1=-10, max_chg_h1=400, min_chg_m5=0,
+         min_age=0, max_age=180, min_buy_ratio=1.10, min_vol_liq=0.5,
+         tp=50, tp1=25, tp1_frac=0.5, sl=-20, trail_act=30, trail=15, max_hold=90,
+         pos_pct=0.08, max_open=4),
+    dict(name="Herd",   style="Fomo trending", need="fomo", max_rank=25,
+         min_liq=60_000, min_vol_h1=25_000, min_chg_h1=0, max_chg_h1=60, min_chg_m5=-1,
+         min_age=60, max_age=60 * 24 * 60, min_buy_ratio=1.05, min_vol_liq=0.15,
+         tp=30, tp1=15, tp1_frac=0.5, sl=-14, trail_act=18, trail=9, max_hold=240,
+         pos_pct=0.10, max_open=4),
 ]
 
 CHAIN_IDS = {"ethereum": 1, "bsc": 56, "base": 8453}
+CHAIN_ALIASES = {"solana": "solana", "sol": "solana", "base": "base", "ethereum": "ethereum",
+                 "eth": "ethereum", "mainnet": "ethereum", "bsc": "bsc", "bnb": "bsc",
+                 "bnb chain": "bsc", "bnbchain": "bsc", "binance": "bsc", "1": "ethereum",
+                 "56": "bsc", "8453": "base"}
+WSOL = "So11111111111111111111111111111111111111112"
+
+# pump.fun bonding curve: 1B supply, of which 793.1M are sold on a constant-product curve
+# that starts at 30 virtual SOL / 1.073B virtual tokens.
+PUMP_SUPPLY = 1_000_000_000.0
+PUMP_V_TOK0 = 1_073_000_000.0
+PUMP_REAL_TOK0 = 793_100_000.0
+PUMP_V_SOL0 = 30.0
 
 
 # --------------------------------------------------------------------------- #
@@ -114,11 +199,18 @@ def tkey(chain, addr):
     return f"{chain}:{addr if chain == 'solana' else addr.lower()}"
 
 
-def get_json(url, timeout=15):
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "memebot/1.0", "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+def get_json(url, timeout=15, headers=None):
+    h = {"User-Agent": "memebot/2.0", "Accept": "application/json"}
+    h.update(headers or {})
+    with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout) as r:
         return json.load(r)
+
+
+def post_json(url, body, timeout=15):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={
+        "User-Agent": "memebot/2.0", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
 
 
 def num(d, *path, default=0.0):
@@ -145,7 +237,8 @@ def norm_pair(p):
         chg_m5=num(p, "priceChange", "m5"), chg_h1=num(p, "priceChange", "h1"),
         chg_h24=num(p, "priceChange", "h24"),
         buys_h1=num(p, "txns", "h1", "buys"), sells_h1=num(p, "txns", "h1", "sells"),
-        fdv=num(p, "fdv"), created=created or None, pair=p.get("pairAddress"))
+        fdv=num(p, "fdv"), created=created or None, pair=p.get("pairAddress"),
+        dex=p.get("dexId") or "")
 
 
 def impact_pct(size_usd, liq_usd):
@@ -154,8 +247,638 @@ def impact_pct(size_usd, liq_usd):
     return min(60.0, 200.0 * size_usd / max(liq_usd, 1.0))
 
 
+def curve_buy(sol_in, vsol, vtok):
+    """Tokens out for sol_in (net of fees) on a constant-product curve."""
+    return vtok - vsol * vtok / (vsol + sol_in)
+
+
+def curve_sell(units, vsol, vtok):
+    """SOL out (before fees) for selling units into the curve."""
+    return vsol - vsol * vtok / (vtok + units)
+
+
+def curve_progress(vtok):
+    return max(0.0, min(100.0, (PUMP_V_TOK0 - vtok) / PUMP_REAL_TOK0 * 100.0))
+
+
+def short(addr):
+    return addr[:4] + "..." + addr[-4:] if len(addr) > 12 else addr
+
+
 # --------------------------------------------------------------------------- #
-# Data sources
+# Minimal websocket client (standard library only)
+# --------------------------------------------------------------------------- #
+class WebSocket:
+    """RFC 6455 client: text frames, fragmentation, ping/pong, close. Honours HTTPS_PROXY."""
+    GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(self, url, timeout=20):
+        u = urllib.parse.urlparse(url)
+        self.secure = u.scheme == "wss"
+        self.host = u.hostname
+        self.port = u.port or (443 if self.secure else 80)
+        self.path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+        self.timeout = timeout
+        self.sock = None
+        self._buf = b""
+        self._wlock = threading.Lock()
+
+    def _proxy(self):
+        if urllib.request.proxy_bypass_environment(self.host):
+            return None
+        names = ("HTTPS_PROXY", "https_proxy") if self.secure else ("HTTP_PROXY", "http_proxy")
+        env = next((os.environ[n] for n in names if os.environ.get(n)), None)
+        if not env:
+            return None
+        p = urllib.parse.urlparse(env if "://" in env else "http://" + env)
+        return p.hostname, p.port or 80
+
+    def _read_head(self):
+        while b"\r\n\r\n" not in self._buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("connection closed during handshake")
+            self._buf += chunk
+            if len(self._buf) > 65536:
+                raise ConnectionError("oversized handshake response")
+        head, self._buf = self._buf.split(b"\r\n\r\n", 1)
+        return head.decode("latin-1")
+
+    def connect(self):
+        px = self._proxy()
+        self.sock = socket.create_connection(px or (self.host, self.port), timeout=self.timeout)
+        self._buf = b""
+        if px:
+            self.sock.sendall(f"CONNECT {self.host}:{self.port} HTTP/1.1\r\n"
+                              f"Host: {self.host}:{self.port}\r\n\r\n".encode())
+            status = self._read_head().split("\r\n", 1)[0]
+            if " 200" not in status:
+                raise ConnectionError(f"proxy refused: {status[:80]}")
+        if self.secure:
+            self.sock = ssl.create_default_context().wrap_socket(self.sock, server_hostname=self.host)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET {self.path} HTTP/1.1\r\nHost: {self.host}\r\nUpgrade: websocket\r\n"
+                           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                           f"Sec-WebSocket-Version: 13\r\nUser-Agent: memebot/2.0\r\n\r\n").encode())
+        head = self._read_head()
+        lines = head.split("\r\n")
+        if " 101" not in lines[0]:
+            raise ConnectionError(f"websocket upgrade refused: {lines[0][:80]}")
+        accept = base64.b64encode(hashlib.sha1((key + self.GUID).encode()).digest()).decode()
+        hdrs = {ln.split(":", 1)[0].strip().lower(): ln.split(":", 1)[1].strip()
+                for ln in lines[1:] if ":" in ln}
+        if hdrs.get("sec-websocket-accept") != accept:
+            raise ConnectionError("bad websocket accept key")
+
+    def _exact(self, n):
+        while len(self._buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("websocket closed by server")
+            self._buf += chunk
+        out, self._buf = self._buf[:n], self._buf[n:]
+        return out
+
+    def _send(self, op, payload):
+        n = len(payload)
+        head = bytes([0x80 | op])
+        if n < 126:
+            head += bytes([0x80 | n])
+        elif n < 65536:
+            head += bytes([0x80 | 126]) + struct.pack(">H", n)
+        else:
+            head += bytes([0x80 | 127]) + struct.pack(">Q", n)
+        mask = os.urandom(4)
+        body = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        with self._wlock:
+            self.sock.sendall(head + mask + body)
+
+    def send(self, text):
+        self._send(0x1, text.encode())
+
+    def ping(self):
+        self._send(0x9, b"memebot")
+
+    def recv(self):
+        """Next complete text message. Raises socket.timeout when the line is quiet."""
+        parts, started = [], False
+        while True:
+            b1, b2 = self._exact(2)  # a timeout here is clean: nothing has been consumed
+            try:
+                n = b2 & 0x7F
+                if n == 126:
+                    n = struct.unpack(">H", self._exact(2))[0]
+                elif n == 127:
+                    n = struct.unpack(">Q", self._exact(8))[0]
+                mask = self._exact(4) if b2 & 0x80 else None
+                data = self._exact(n)
+            except socket.timeout:
+                raise ConnectionError("websocket stalled mid-frame")
+            if mask:
+                data = bytes(c ^ mask[i % 4] for i, c in enumerate(data))
+            op = b1 & 0x0F
+            if op == 0x8:
+                raise ConnectionError("websocket closed by server")
+            if op == 0x9:
+                self._send(0xA, data)
+                continue
+            if op == 0xA:
+                continue
+            if op in (0x1, 0x2):
+                parts, started = [data], True
+            elif op == 0x0 and started:
+                parts.append(data)
+            if b1 & 0x80 and started:
+                return b"".join(parts).decode("utf-8", "replace")
+
+    def close(self):
+        try:
+            self._send(0x8, b"")
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# pump.fun watcher
+# --------------------------------------------------------------------------- #
+class PumpWatcher:
+    """Follows pump.fun in real time through PumpPortal's free data websocket.
+
+    Every launch is tracked from its first second: curve reserves, buyers, sellers,
+    holder balances and whether the creator has sold. A launch is followed for
+    pump_watch_secs (longer while a position is open in it) and then dropped.
+    Graduations (migrations to PumpSwap) are queued for the engine.
+    """
+
+    def __init__(self, cfg, clock=time.time):
+        self.cfg, self.clock = cfg, clock
+        self.lock = threading.Lock()
+        self.tokens = {}
+        self.migrations = deque(maxlen=500)
+        self.events = deque(maxlen=200)
+        self.sub_q, self.unsub_q = set(), set()
+        self.sol_usd = cfg["sol_usd_fallback"]
+        self.connected = False
+        self.error = ""
+        self.last_msg = 0.0
+        self.seen = self.grads = self.msgs = 0
+
+    # ---- feed ---- #
+    def start(self):
+        threading.Thread(target=self._run, name="pump-feed", daemon=True).start()
+
+    def _run(self):
+        url = self.cfg["pump_ws"]
+        key = os.environ.get("PUMPPORTAL_API_KEY", "").strip()
+        if key:
+            url += ("&" if "?" in url else "?") + "api-key=" + urllib.parse.quote(key)
+        delay = 2
+        while True:
+            ws = WebSocket(url, timeout=20)
+            try:
+                ws.connect()
+                with self.lock:
+                    self.connected, self.error = True, ""
+                    resub = list(self.tokens)
+                    self.sub_q.clear()
+                    self.unsub_q.clear()
+                self.events.append(("PUMP", "pump.fun feed connected"))
+                ws.send(json.dumps({"method": "subscribeNewToken"}))
+                ws.send(json.dumps({"method": "subscribeMigration"}))
+                for i in range(0, len(resub), 100):
+                    ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": resub[i:i + 100]}))
+                delay, quiet = 2, 0
+                while True:
+                    self._flush(ws)
+                    try:
+                        raw = ws.recv()
+                    except socket.timeout:
+                        quiet += 1
+                        if quiet >= 3:
+                            raise ConnectionError("no data for 60s")
+                        ws.ping()
+                        continue
+                    quiet = 0
+                    try:
+                        msg = json.loads(raw)
+                    except ValueError:
+                        continue
+                    self.handle(msg)
+            except Exception as e:
+                with self.lock:
+                    self.connected, self.error = False, str(e)[:120]
+                self.events.append(("WARN", f"pump.fun feed: {str(e)[:100]}; reconnecting in {delay}s"))
+            finally:
+                ws.close()
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
+    def _flush(self, ws):
+        with self.lock:
+            subs, unsubs = self.sub_q - self.unsub_q, self.unsub_q - self.sub_q
+            self.sub_q.clear()
+            self.unsub_q.clear()
+        subs, unsubs = list(subs), list(unsubs)
+        for i in range(0, len(unsubs), 100):
+            ws.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": unsubs[i:i + 100]}))
+        for i in range(0, len(subs), 100):
+            ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": subs[i:i + 100]}))
+
+    # ---- message handling (also used by the demo feed and tests) ---- #
+    def handle(self, m):
+        if not isinstance(m, dict) or not m.get("mint"):
+            return
+        now = self.clock()
+        tx = str(m.get("txType") or "").lower()
+        with self.lock:
+            self.msgs += 1
+            self.last_msg = now
+            if tx == "create":
+                self._on_create(m, now)
+            elif tx in ("buy", "sell"):
+                if m.get("pool") in (None, "", "pump"):  # post-migration AMM trades are ignored
+                    self._on_trade(m, tx == "buy", now)
+            elif tx in ("migrate", "migration", "complete") or (not tx and "solAmount" not in m):
+                self._on_migrate(m)
+
+    def _new(self, mint, now, **kw):
+        t = dict(mint=mint, symbol="?", name="", creator="", created=now, vsol=0.0, vtok=0.0,
+                 ath=0.0, trades=deque(maxlen=3000), holders={}, buyers=set(), dev_init_pct=0.0,
+                 dev_sold=False, migrated=False, complete=False, last_trade=now, n_buys=0,
+                 n_sells=0, vol_sol=0.0, from_create=False)
+        t.update(kw)
+        self.tokens[mint] = t
+        self.sub_q.add(mint)
+        self.unsub_q.discard(mint)
+        return t
+
+    def _on_create(self, m, now):
+        mint = m["mint"]
+        dev = m.get("traderPublicKey") or ""
+        init = num(m, "initialBuy")
+        vsol, vtok = num(m, "vSolInBondingCurve"), num(m, "vTokensInBondingCurve")
+        t = self.tokens.get(mint)
+        if t and t["from_create"]:
+            return  # repeated after a reconnect
+        t = t or self._new(mint, now)
+        t.update(symbol=str(m.get("symbol") or "?")[:16], name=str(m.get("name") or "")[:40],
+                 creator=dev, created=now, vsol=vsol, vtok=vtok, from_create=True,
+                 dev_init_pct=init / PUMP_SUPPLY * 100.0, ath=vsol / vtok if vtok else 0.0)
+        if dev and init > 0:
+            t["holders"][dev] = init
+        self.seen += 1
+
+    def _on_trade(self, m, is_buy, now):
+        t = self.tokens.get(m["mint"])
+        if not t:
+            return
+        vsol, vtok = num(m, "vSolInBondingCurve"), num(m, "vTokensInBondingCurve")
+        if vsol > 0 and vtok > 0:
+            t["vsol"], t["vtok"] = vsol, vtok
+            t["ath"] = max(t["ath"], vsol / vtok)
+            if curve_progress(vtok) >= 99.9:
+                t["complete"] = True
+        sol = num(m, "solAmount")
+        trader = m.get("traderPublicKey") or ""
+        if "newTokenBalance" in m:
+            bal = num(m, "newTokenBalance")
+        else:
+            amt = num(m, "tokenAmount")
+            bal = t["holders"].get(trader, 0.0) + (amt if is_buy else -amt)
+        if bal > 0:
+            t["holders"][trader] = bal
+        else:
+            t["holders"].pop(trader, None)
+        t["trades"].append((now, is_buy, sol, trader))
+        t["last_trade"] = now
+        t["vol_sol"] += sol
+        if is_buy:
+            t["n_buys"] += 1
+            if trader != t["creator"]:
+                t["buyers"].add(trader)
+        else:
+            t["n_sells"] += 1
+            if trader and trader == t["creator"] and not t["dev_sold"]:
+                t["dev_sold"] = True
+                self.events.append(("RISK", f"pump.fun ${t['symbol']}: creator sold"))
+
+    def _on_migrate(self, m):
+        mint = m["mint"]
+        t = self.tokens.get(mint)
+        self.grads += 1
+        if t:
+            if t["migrated"]:
+                return
+            t["migrated"] = True
+            price_sol = t["vsol"] / t["vtok"] if t["vtok"] else 0.0
+            self.migrations.append(dict(mint=mint, symbol=t["symbol"], price_sol=price_sol,
+                                        vsol=t["vsol"]))
+        else:
+            self.migrations.append(dict(mint=mint, symbol=str(m.get("symbol") or "?")[:16],
+                                        price_sol=0.0, vsol=0.0))
+
+    # ---- queries for the engine ---- #
+    def _stats(self, t, now):
+        w = now - 300
+        b = s = 0
+        bsol = ssol = 0.0
+        uniq = set()
+        for ts, is_buy, sol, tr in reversed(t["trades"]):
+            if ts < w:
+                break
+            if is_buy:
+                b += 1
+                bsol += sol
+                uniq.add(tr)
+            else:
+                s += 1
+                ssol += sol
+        price_sol = t["vsol"] / t["vtok"] if t["vtok"] else 0.0
+        others = sorted((v for k, v in t["holders"].items() if k != t["creator"]), reverse=True)
+        top = others[0] / PUMP_SUPPLY * 100 if others else 0.0
+        top10 = sum(others[:10]) / PUMP_SUPPLY * 100
+        dev_pct = t["holders"].get(t["creator"], 0.0) / PUMP_SUPPLY * 100
+        usd = self.sol_usd
+        q = dict(chain="solana", addr=t["mint"], symbol=t["symbol"], name=t["name"], venue="curve",
+                 price=price_sol * usd, price_sol=price_sol, vsol=t["vsol"], vtok=t["vtok"],
+                 mcap=price_sol * PUMP_SUPPLY * usd, prog=curve_progress(t["vtok"]) if t["vtok"] else 0.0,
+                 age=now - t["created"], created=t["created"], last_trade=t["last_trade"],
+                 buys_5m=b, sells_5m=s, buy_sol_5m=bsol, sell_sol_5m=ssol, net_sol_5m=bsol - ssol,
+                 uniq_5m=len(uniq), buyers=len(t["buyers"]), holders=len(t["holders"]),
+                 top_pct=top, top10_pct=top10, dev_pct=dev_pct, dev_init_pct=t["dev_init_pct"],
+                 dev_sold=t["dev_sold"], migrated=t["migrated"], complete=t["complete"],
+                 from_create=t["from_create"], n_buys=t["n_buys"], n_sells=t["n_sells"],
+                 vol_sol=t["vol_sol"],
+                 ath_drop=(price_sol / t["ath"] - 1) * 100 if t["ath"] else 0.0)
+        q["score"] = (q["net_sol_5m"] + 0.25 * q["uniq_5m"] - (25 if q["dev_sold"] else 0)
+                      - 2 * max(0.0, top - 8) - 0.5 * max(0.0, -q["ath_drop"] - 20))
+        return q
+
+    def get(self, mint):
+        with self.lock:
+            t = self.tokens.get(mint)
+            return self._stats(t, self.clock()) if t else None
+
+    def candidates(self, now):
+        with self.lock:
+            return [self._stats(t, now) for t in self.tokens.values()
+                    if t["from_create"] and not t["migrated"] and not t["complete"]
+                    and t["vtok"] > 0 and t["n_buys"] >= 5 and now - t["last_trade"] < 60]
+
+    def top(self, now, n=12):
+        with self.lock:
+            qs = [self._stats(t, now) for t in self.tokens.values()
+                  if t["from_create"] and t["vtok"] > 0 and not t["migrated"]]
+        return sorted(qs, key=lambda q: -q["score"])[:n]
+
+    def follow(self, mint, symbol="?"):
+        """Make sure a token is followed (used when restarting with open curve positions)."""
+        with self.lock:
+            if mint not in self.tokens:
+                self._new(mint, self.clock(), symbol=symbol)
+
+    def prune(self, now, keep=()):
+        with self.lock:
+            c = self.cfg
+            for mint, t in list(self.tokens.items()):
+                if mint in keep:
+                    continue
+                age, idle = now - t["created"], now - t["last_trade"]
+                if (t["migrated"] or age > c["pump_watch_secs"]
+                        or (age > c["pump_idle_secs"] and idle > c["pump_idle_secs"])
+                        or (not t["from_create"] and idle > c["pump_idle_secs"])):
+                    del self.tokens[mint]
+                    self.unsub_q.add(mint)
+            extra = len(self.tokens) - c["pump_watch_max"]
+            if extra > 0:
+                drop = sorted((m for m in self.tokens if m not in keep),
+                              key=lambda m: self.tokens[m]["last_trade"])[:extra]
+                for mint in drop:
+                    del self.tokens[mint]
+                    self.unsub_q.add(mint)
+
+    def pop_events(self):
+        out = []
+        while self.events:
+            out.append(self.events.popleft())
+        return out
+
+    def pop_migrations(self):
+        with self.lock:
+            out = list(self.migrations)
+            self.migrations.clear()
+        return out
+
+    def status(self):
+        with self.lock:
+            return dict(connected=self.connected, error=self.error, seen=self.seen,
+                        grads=self.grads, watching=len(self.tokens), msgs=self.msgs,
+                        quiet=self.clock() - self.last_msg if self.last_msg else None)
+
+
+class DemoPump(PumpWatcher):
+    """Synthetic pump.fun launches, pushed through the same message handler as the real feed."""
+
+    def __init__(self, cfg, clock, seed=11):
+        super().__init__(cfg, clock)
+        self.rng = random.Random(seed)
+        self.sim = {}
+        self.n = 0
+        self.connected = True
+        self.wallets = [f"Wallet{i:05d}" for i in range(4000)]
+
+    def start(self):
+        pass
+
+    def tick(self, now):
+        r = self.rng
+        if r.random() < 0.35:
+            self._launch()
+        for mint, s in list(self.sim.items()):
+            self._step(mint, s, now)
+
+    def _msg(self, mint, s, **kw):
+        m = dict(mint=mint, vSolInBondingCurve=s["vsol"], vTokensInBondingCurve=s["vtok"],
+                 marketCapSol=s["vsol"] / s["vtok"] * PUMP_SUPPLY, pool="pump")
+        m.update(kw)
+        self.handle(m)
+
+    def _launch(self):
+        r = self.rng
+        self.n += 1
+        mint, dev = f"Demo{self.n:05d}pump", r.choice(self.wallets)
+        s = dict(vsol=PUMP_V_SOL0, vtok=PUMP_V_TOK0, dev=dev, bal={}, born=self.clock(),
+                 hype=r.expovariate(1.0), mom=r.gauss(-0.4, 0.6),
+                 cap=101.0 if r.random() < 0.04 else r.betavariate(1.3, 3.5) * 100,  # most launches stall
+                 rug_at=self.clock() + r.uniform(60, 900) if r.random() < 0.3 else None)
+        init_sol = r.choice([0, 0.3, 0.5, 1, 2, 4])
+        init = curve_buy(init_sol * 0.99, s["vsol"], s["vtok"]) if init_sol else 0.0
+        s["vsol"] += init_sol
+        s["vtok"] -= init
+        s["bal"][dev] = init
+        self.sim[mint] = s
+        self._msg(mint, s, txType="create", traderPublicKey=dev, symbol=f"PF{self.n}",
+                  name=f"Pump demo {self.n}", initialBuy=init, solAmount=init_sol)
+
+    def _step(self, mint, s, now):
+        r = self.rng
+        s["hype"] = s["hype"] * 0.985 + (r.uniform(0.5, 2.0) if r.random() < 0.02 else 0)
+        s["mom"] = s["mom"] * 0.95 - 0.02 + r.gauss(0, 0.25)
+        if curve_progress(s["vtok"]) > s["cap"]:  # past its ceiling: holders take profit
+            s["mom"] = min(s["mom"], -1.5)
+            s["hype"] *= 0.97
+        if s["rug_at"] and now >= s["rug_at"]:
+            s["rug_at"] = None
+            self._sell(mint, s, s["dev"], s["bal"].get(s["dev"], 0.0))
+            s["hype"] *= 0.2
+            s["mom"] = -2.5
+        for _ in range(min(25, int(r.expovariate(1.0) * s["hype"] * 3))):
+            if r.random() < 1 / (1 + math.exp(-s["mom"])):
+                floor = PUMP_V_TOK0 - PUMP_REAL_TOK0
+                sol = r.expovariate(1 / (0.15 + 0.2 * s["hype"]))
+                out = min(curve_buy(sol * 0.99, s["vsol"], s["vtok"]), s["vtok"] - floor)
+                w = r.choice(self.wallets)
+                s["vsol"] += sol
+                s["vtok"] -= out
+                s["bal"][w] = s["bal"].get(w, 0.0) + out
+                self._msg(mint, s, txType="buy", traderPublicKey=w, solAmount=sol,
+                          tokenAmount=out, newTokenBalance=s["bal"][w])
+                if s["vtok"] - floor < 1:
+                    self.handle(dict(mint=mint, txType="migrate", pool="pump-amm"))
+                    del self.sim[mint]
+                    return
+            else:
+                hs = [w for w, b in s["bal"].items() if b > 0 and w != s["dev"]]
+                if hs:
+                    w = r.choice(hs)
+                    self._sell(mint, s, w, s["bal"][w] * r.choice([0.25, 0.5, 1.0]))
+        if s["hype"] < 0.03 or now - s["born"] > 3600:
+            del self.sim[mint]
+
+    def _sell(self, mint, s, w, amt):
+        if amt <= 0:
+            return
+        sol = curve_sell(amt, s["vsol"], s["vtok"])
+        s["vsol"] -= sol
+        s["vtok"] += amt
+        s["bal"][w] = s["bal"].get(w, 0.0) - amt
+        self._msg(mint, s, txType="sell", traderPublicKey=w, solAmount=sol, tokenAmount=amt,
+                  newTokenBalance=max(0.0, s["bal"][w]))
+
+
+# --------------------------------------------------------------------------- #
+# Fomo trending board
+# --------------------------------------------------------------------------- #
+def parse_fomo(data, chains):
+    """Pull (chain, address, rank, symbol) out of a FOMO API leaderboard response.
+    Written defensively: accepts a bare list or the list under a few common keys."""
+    rows = data
+    for _ in range(2):
+        if isinstance(rows, dict):
+            rows = next((rows[k] for k in ("data", "tokens", "items", "results", "leaderboard")
+                         if isinstance(rows.get(k), (list, dict))), [])
+    out = []
+    for i, r in enumerate(rows if isinstance(rows, list) else []):
+        if not isinstance(r, dict):
+            continue
+        src = dict(r)
+        if isinstance(r.get("token"), dict):
+            src = dict(r["token"], **{k: v for k, v in r.items() if k != "token"})
+        addr = next((str(src[k]) for k in ("address", "tokenAddress", "token_address", "mint",
+                                           "contractAddress", "contract_address", "ca")
+                     if src.get(k)), "")
+        if not addr:
+            continue
+        net = str(src.get("network") or src.get("chain") or src.get("chainId")
+                  or src.get("blockchain") or "").strip().lower()
+        chain = CHAIN_ALIASES.get(net)
+        if not net and not addr.startswith("0x") and 32 <= len(addr) <= 44:
+            chain = "solana"
+        if chain not in chains:
+            continue
+        try:
+            rank = int(src.get("rank") or i + 1)
+        except (TypeError, ValueError):
+            rank = i + 1
+        out.append(dict(chain=chain, addr=addr, rank=rank,
+                        symbol=str(src.get("symbol") or src.get("ticker") or "?")[:16],
+                        holders=src.get("holders")))
+    return out
+
+
+class FomoFeed:
+    """Tokens Fomo (fomo.family) users are trading right now, from FOMO API's trending board.
+    FOMO API is an independent service, not run by Fomo; it needs FOMO_API_KEY."""
+
+    def __init__(self, cfg):
+        self.key = os.environ.get("FOMO_API_KEY", "").strip()
+        self.url = os.environ.get("FOMO_API_URL", cfg["fomo_api"]).strip()
+        self.cfg = cfg
+        self.enabled = bool(self.key)
+
+    def fetch(self):
+        sep = "&" if "?" in self.url else "?"
+        d = get_json(f"{self.url}{sep}limit={self.cfg['fomo_top']}",
+                     headers={"Authorization": f"Bearer {self.key}"})
+        return parse_fomo(d, self.cfg["chains"])
+
+
+class DemoFomo:
+    enabled = True
+
+    def __init__(self, src, seed=5):
+        self.src, self.rng = src, random.Random(seed)
+
+    def fetch(self):
+        toks = [t for t in self.src.tokens.values() if len(t["hist"]) > 5]
+        toks.sort(key=lambda t: -(t["hist"][-1] / t["hist"][0] + self.rng.uniform(0, 0.4)))
+        return [dict(chain=t["chain"], addr=t["addr"], rank=i + 1, symbol=t["symbol"], holders=None)
+                for i, t in enumerate(toks[:15])]
+
+
+# --------------------------------------------------------------------------- #
+# Alerts
+# --------------------------------------------------------------------------- #
+class Notifier:
+    """Optional push alerts. Telegram: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID.
+    Discord: DISCORD_WEBHOOK_URL. Sent from a background thread, never blocks trading."""
+
+    def __init__(self):
+        tok, chat = os.environ.get("TELEGRAM_BOT_TOKEN", ""), os.environ.get("TELEGRAM_CHAT_ID", "")
+        self.tg = (tok.strip(), chat.strip()) if tok.strip() and chat.strip() else None
+        self.dc = os.environ.get("DISCORD_WEBHOOK_URL", "").strip() or None
+        self.enabled = bool(self.tg or self.dc)
+        self.q = queue.Queue(maxsize=200)
+        if self.enabled:
+            threading.Thread(target=self._run, name="alerts", daemon=True).start()
+
+    def send(self, text):
+        if self.enabled:
+            try:
+                self.q.put_nowait(text)
+            except queue.Full:
+                pass
+
+    def _run(self):
+        while True:
+            text = self.q.get()
+            try:
+                if self.tg:
+                    post_json(f"https://api.telegram.org/bot{self.tg[0]}/sendMessage",
+                              {"chat_id": self.tg[1], "text": text, "disable_web_page_preview": True})
+                if self.dc:
+                    post_json(self.dc, {"content": text[:1900]})
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+
+# --------------------------------------------------------------------------- #
+# DEX data sources
 # --------------------------------------------------------------------------- #
 class LiveSource:
     API = "https://api.dexscreener.com"
@@ -189,6 +912,10 @@ class LiveSource:
             if k in wanted and (k not in best or p["liq"] > best[k]["liq"]):
                 best[k] = p
         return {wanted[k]: p for k, p in best.items()}
+
+    def sol_usd(self):
+        p = self.pairs("solana", [WSOL]).get(WSOL)
+        return p["price"] if p else None
 
     def safety(self, chain, addr):
         if chain == "solana":
@@ -255,6 +982,16 @@ class DemoSource:
             self.tokens[(chain, tok["addr"])] = tok
         return list(self.tokens)
 
+    def adopt(self, chain, addr, symbol, price, liq):
+        """A pump.fun graduate appears as a fresh DEX pool."""
+        r = self.rng
+        if (chain, addr) in self.tokens or price <= 0:
+            return
+        self.tokens[(chain, addr)] = dict(
+            chain=chain, addr=addr, symbol=symbol, price=price, liq=max(liq, 20e3), created=self.t,
+            drift=r.gauss(0.0, 0.006), vol=r.uniform(0.03, 0.08), rug=r.random() < 0.2,
+            hist=[price] * 61)
+
     def pairs(self, chain, addrs):
         out = {}
         for a in addrs:
@@ -271,8 +1008,11 @@ class DemoSource:
                           liq=tok["liq"], vol_h1=tok["liq"] * self.rng.uniform(0.1, 1.6),
                           vol_h24=tok["liq"] * 5, chg_m5=chg_m5, chg_h1=chg_h1, chg_h24=chg_h1,
                           buys_h1=buys, sells_h1=sells, fdv=tok["liq"] * 20,
-                          created=tok["created"], pair=a)
+                          created=tok["created"], pair=a, dex="demo")
         return out
+
+    def sol_usd(self):
+        return 150.0 * math.exp(0.03 * math.sin(self.t / 7200.0))
 
     def safety(self, chain, addr):
         tok = self.tokens[(chain, addr)]
@@ -321,7 +1061,7 @@ class SolanaLive:
 
     # ---- plumbing ----
     def _http(self, url, body=None, headers=None, timeout=20):
-        h = {"User-Agent": "memebot/1.0", "Accept": "application/json"}
+        h = {"User-Agent": "memebot/2.0", "Accept": "application/json"}
         h.update(headers or {})
         data = None
         if body is not None:
@@ -462,7 +1202,8 @@ class SolanaLive:
         except Exception as e:
             return dict(ok=False, stage="tx", err=str(e)[:160])
         if raw_now <= 0:
-            return dict(ok=True, got_usd=0.0, sig=None, note="wallet holds none of this token, closed at 0")
+            return dict(ok=True, got_usd=0.0, sig=None, sold_raw=0,
+                        note="wallet holds none of this token, closed at 0")
         amount = min(raw_now, raw_expected) if raw_expected else raw_now
         last = "unknown error"
         for bps in c["live_sell_slippage_bps"]:
@@ -477,7 +1218,7 @@ class SolanaLive:
                         raise
                     sig = str(e)[-90:]
                 usdc1 = self._changed(self.usdc, usdc0)
-                return dict(ok=True, got_usd=max(0.0, usdc1 - usdc0), sig=sig)
+                return dict(ok=True, got_usd=max(0.0, usdc1 - usdc0), sig=sig, sold_raw=amount)
             except Exception as e:
                 last = str(e)[:160]
         return dict(ok=False, stage="tx", err=last)
@@ -487,9 +1228,17 @@ class SolanaLive:
 # Engine
 # --------------------------------------------------------------------------- #
 class Engine:
-    def __init__(self, cfg, agents, src, demo=False, live=None, live_names=()):
+    def __init__(self, cfg, agents, src, demo=False, live=None, live_names=(),
+                 pump=None, fomo=None, notify=None):
         self.cfg, self.src, self.demo, self.live = cfg, src, demo, live
-        self.acfg = {a["name"]: a for a in agents}
+        self.pump, self.fomo, self.notify = pump, fomo, notify
+        self.acfg = {}
+        for a in agents:  # agents whose data feed is off are left out
+            if a.get("venue") == "curve" and not pump:
+                continue
+            if (a.get("need") == "grad" and not pump) or (a.get("need") == "fomo" and not fomo):
+                continue
+            self.acfg[a["name"]] = a
         for n in live_names:  # each live agent is a real-money twin of a paper agent
             twin = dict(self.acfg[n], name=f"{n} LIVE", style=f"Live twin of {n}", live=True)
             self.acfg[twin["name"]] = twin
@@ -504,12 +1253,18 @@ class Engine:
         self.errors = 0
         self.cycles = 0
         self.last_cycle = None
+        self.sol_usd, self.sol_t = cfg["sol_usd_fallback"], -1e12
+        self.fomo_t, self.fomo_board, self.fomo_err = -1e12, [], ""
+        self.curve_buys = {}
         self.state = self._load() or self._fresh()
         for name in self.acfg:
             self.state["agents"].setdefault(name, self._fresh_agent(name))
         for st in self.state["agents"].values():
             for pos in st["positions"].values():
-                self._track(pos["chain"], pos["addr"])
+                if pos.get("venue") == "curve" and self.pump:
+                    self.pump.follow(pos["addr"], pos["symbol"])
+                else:
+                    self._track(pos["chain"], pos["addr"])
         self._cache = self.snapshot()
 
     # ---- persistence ------------------------------------------------------ #
@@ -545,47 +1300,94 @@ class Engine:
         log = self.state["log"]
         log.append(dict(t=self.t, tag=tag, msg=msg))
         del log[:-400]
+        if self.notify and tag in self.cfg["alert_tags"]:
+            self.notify.send(f"MemeBot [{tag}] {msg}")
 
     def _err(self, msg):
         with self.lock:
             self.errors += 1
             self.emit("WARN", msg)
 
-    def _track(self, chain, addr):
+    def _track(self, chain, addr, tag=None):
+        """Add a token to the DEX universe. A tag (("grad", {...}) or ("fomo", {...})) marks why
+        it is interesting and lets it back in even if it was dropped before."""
         k = tkey(chain, addr)
-        if k in self.universe or k in self.dropped:
+        if tag:
+            self.dropped.discard(k)
+        if k in self.dropped:
             return False
-        self.universe[k] = dict(chain=chain, addr=addr, first=self.t, pair=None, miss=0)
-        return True
+        u = self.universe.get(k)
+        new = u is None
+        if new:
+            u = self.universe[k] = dict(chain=chain, addr=addr, first=self.t, pair=None, miss=0, tags={})
+        u.setdefault("tags", {})
+        if tag:
+            u["tags"][tag[0]] = tag[1]
+        return new
+
+    def _fresh_tag(self, u):
+        c, tags = self.cfg, u.get("tags") or {}
+        g, f = tags.get("grad"), tags.get("fomo")
+        return bool((g and self.t - g["t"] <= c["grad_window_min"] * 60)
+                    or (f and self.t - f["t"] <= 3 * c["fomo_poll_seconds"] + 60))
 
     def _roll_day(self, st):
         d = utcday(self.t)
         if st["day"] != d:
             st.update(day=d, day_pnl=0.0, capped=False)
 
-    def _value(self, pos, price, liq):
-        """What the position would net if sold now (after impact, fee, slippage, tax)."""
-        gross = pos["units"] * price
+    def _value(self, pos, units=None):
+        """What the position (or `units` of it) would net if sold now, after every cost."""
         c = self.cfg
-        cost = impact_pct(gross, liq) + c["dex_fee_pct"] + c["extra_slip_pct"] + pos["sell_tax"]
+        units = pos["units"] if units is None else units
+        if pos.get("venue") == "curve":
+            cost = (c["pump_fee_pct"] + c["pump_extra_slip_pct"]) / 100.0
+            vs, vt = pos.get("last_vsol") or 0.0, pos.get("last_vtok") or 0.0
+            if vs <= 0 or vt <= units:
+                return units * pos["last_price"] * (1 - cost)
+            # our own buy is still sitting in the curve, so sell against reserves that include it
+            mine = pos.get("curve_sol", 0.0) * units / pos["units"]
+            sol = curve_sell(units, vs + mine, vt - units)
+            return sol * self.sol_usd * (1 - cost)
+        gross = units * pos["last_price"]
+        cost = impact_pct(gross, pos["last_liq"]) + c["dex_fee_pct"] + c["extra_slip_pct"] + pos["sell_tax"]
         return gross * (1 - min(cost, 95.0) / 100.0)
 
     def _equity(self, st):
-        return st["cash"] + sum(self._value(p, p["last_price"], p["last_liq"])
-                                for p in st["positions"].values())
+        return st["cash"] + sum(self._value(p) for p in st["positions"].values())
+
+    def _held(self):
+        return {k for st in self.state["agents"].values() for k in st["positions"]}
 
     # ---- entry rules ---------------------------------------------------------- #
-    def _wants(self, name, p):
+    def _slot_ok(self, name, k, min_t):
         a, st, c = self.acfg[name], self.state["agents"][name], self.cfg
+        if k in st["positions"] or self.t - st["cool"].get(k, 0) < c["cooldown_min"] * 60:
+            return False
+        return len(st["positions"]) < a["max_open"] and not st["capped"] and st["cash"] >= min_t
+
+    def _wants(self, name, p):
+        a, c = self.acfg[name], self.cfg
+        if a.get("venue", "dex") != "dex":
+            return False
         live = a.get("live")
         if live and (p["chain"] != "solana" or self.live_halt or self.live is None):
             return False
         min_t = c["live_min_trade_usd"] if live else c["min_trade_usd"]
-        k = tkey(p["chain"], p["addr"])
-        if k in st["positions"] or self.t - st["cool"].get(k, 0) < c["cooldown_min"] * 60:
+        if not self._slot_ok(name, tkey(p["chain"], p["addr"]), min_t):
             return False
-        if len(st["positions"]) >= a["max_open"] or st["capped"] or st["cash"] < min_t:
+        if p.get("dex") == "pumpfun":  # still on the bonding curve: the curve agents handle these
             return False
+        need = a.get("need")
+        if need:
+            tag = (p.get("tags") or {}).get(need)
+            if not tag:
+                return False
+            if need == "grad" and self.t - tag["t"] > c["grad_window_min"] * 60:
+                return False
+            if need == "fomo" and (tag["rank"] > a.get("max_rank", 99)
+                                   or self.t - tag["t"] > 3 * c["fomo_poll_seconds"] + 60):
+                return False
         if not p["created"]:
             return False
         age = (self.t - p["created"]) / 60.0
@@ -597,9 +1399,39 @@ class Engine:
             return False
         if p["buys_h1"] / max(p["sells_h1"], 1.0) < a["min_buy_ratio"]:
             return False
-        if p["vol_h1"] / p["liq"] < a["min_vol_liq"]:
+        if p["vol_h1"] / max(p["liq"], 1.0) < a["min_vol_liq"]:
             return False
-        if p["fdv"] and p["fdv"] / p["liq"] > 300:  # valuation far beyond what the pool can support
+        if p["fdv"] and p["fdv"] / max(p["liq"], 1.0) > 300:  # valuation far beyond what the pool supports
+            return False
+        return True
+
+    def _wants_curve(self, name, q):
+        a, c = self.acfg[name], self.cfg
+        if a.get("venue") != "curve" or a.get("live"):
+            return False
+        if not self._slot_ok(name, tkey("solana", q["addr"]), c["min_trade_usd"]):
+            return False
+        if q["price"] <= 0 or q["migrated"] or q["complete"] or not q["from_create"]:
+            return False
+        if self.t - q["last_trade"] > 60:
+            return False
+        if not (a["min_age_s"] <= q["age"] <= a["max_age_s"]):
+            return False
+        if not (a["min_prog"] <= q["prog"] <= a["max_prog"]):
+            return False
+        if q["dev_sold"] or q["dev_pct"] > a["max_dev_pct"] or q["dev_init_pct"] > 2 * a["max_dev_pct"]:
+            return False
+        if q["top_pct"] > a["max_top_pct"] or q["top10_pct"] > a["max_top10_pct"]:
+            return False
+        if q["buyers"] < a["min_buyers"] or q["uniq_5m"] < a["min_uniq_5m"]:
+            return False
+        if q["buys_5m"] / max(q["sells_5m"], 1) < a["min_bs_5m"]:
+            return False
+        if q["buys_5m"] / max(q["uniq_5m"], 1) > a["max_buys_per_wallet"]:  # few wallets churning
+            return False
+        if q["net_sol_5m"] < a["min_net_sol_5m"]:
+            return False
+        if q["ath_drop"] < -a["max_ath_drop"]:  # already falling off its high
             return False
         return True
 
@@ -620,12 +1452,37 @@ class Engine:
         cost = impact_pct(size, p["liq"]) + c["dex_fee_pct"] + c["extra_slip_pct"]
         units = size * (1 - buy_tax / 100.0) / (p["price"] * (1 + cost / 100.0))
         k = tkey(p["chain"], p["addr"])
+        tags = p.get("tags") or {}
+        src = "grad" if a.get("need") == "grad" else ("fomo" if a.get("need") == "fomo" else "dex")
         st["cash"] -= size
         st["positions"][k] = dict(
-            chain=p["chain"], addr=p["addr"], symbol=p["symbol"], units=units, size=size,
+            chain=p["chain"], addr=p["addr"], symbol=p["symbol"], units=units, size=size, size0=size,
             ref_price=p["price"], peak=p["price"], opened=self.t, entry_liq=p["liq"],
-            sell_tax=sell_tax, last_price=p["price"], last_liq=p["liq"], miss=0)
+            sell_tax=sell_tax, last_price=p["price"], last_liq=p["liq"], miss=0, venue="dex", src=src,
+            fomo_rank=(tags.get("fomo") or {}).get("rank"))
         self.emit("EXEC", f"{name} BUY ${p['symbol']} ${size:.2f} on {p['chain']} @ {p['price']:.8g}")
+        return True
+
+    def _buy_curve(self, name, q):
+        a, st, c = self.acfg[name], self.state["agents"][name], self.cfg
+        size = min(st["cash"], max(c["min_trade_usd"], a["pos_pct"] * self._equity(st)),
+                   q["vsol"] * c["pump_max_impact"] * self.sol_usd)
+        if size < c["min_trade_usd"]:
+            return False
+        net = size / self.sol_usd * (1 - (c["pump_fee_pct"] + c["pump_extra_slip_pct"]) / 100.0)
+        units = curve_buy(net, q["vsol"], q["vtok"])
+        if units <= 0:
+            return False
+        k = tkey("solana", q["addr"])
+        st["cash"] -= size
+        st["positions"][k] = dict(
+            chain="solana", addr=q["addr"], symbol=q["symbol"], units=units, size=size, size0=size,
+            ref_price=q["price"], peak=q["price"], opened=self.t, entry_liq=None, sell_tax=0.0,
+            last_price=q["price"], last_liq=0.0, last_vsol=q["vsol"], last_vtok=q["vtok"],
+            curve_sol=net, miss=0, venue="curve", src="pump", last_seen=self.t)
+        self.curve_buys.setdefault(name, deque(maxlen=20)).append(self.t)
+        self.emit("EXEC", f"{name} BUY ${q['symbol']} ${size:.2f} on pump.fun, mcap ${q['mcap'] / 1000:.1f}k, "
+                          f"curve {q['prog']:.0f}%, {q['buyers']} buyers, +{q['net_sol_5m']:.1f} SOL/5m")
         return True
 
     def _live_fail(self, msg):
@@ -633,7 +1490,7 @@ class Engine:
         self.emit("WARN", msg)
         if self.live_fails >= self.cfg["live_max_fails"] and not self.live_halt:
             self.live_halt = True
-            self.emit("RISK", "LIVE trading halted after repeated failed transactions. "
+            self.emit("HALT", "LIVE trading halted after repeated failed transactions. "
                               "No new live entries. Check your open positions and restart to resume.")
 
     def _live_buy(self, name, p, size):
@@ -649,52 +1506,106 @@ class Engine:
         self.live_fails = 0
         spent, units = res["spent_usd"], res["raw"] / 10 ** res["decimals"]
         fill = spent / units
+        a = self.acfg[name]
         st["cash"] -= spent
         st["positions"][k] = dict(
-            chain=p["chain"], addr=p["addr"], symbol=p["symbol"], units=units, size=spent,
+            chain=p["chain"], addr=p["addr"], symbol=p["symbol"], units=units, size=spent, size0=spent,
             ref_price=fill, peak=fill, opened=self.t, entry_liq=p["liq"], sell_tax=0.0,
-            last_price=p["price"], last_liq=p["liq"], miss=0, live=True,
+            last_price=p["price"], last_liq=p["liq"], miss=0, live=True, venue="dex",
+            src="grad" if a.get("need") == "grad" else ("fomo" if a.get("need") == "fomo" else "dex"),
             raw=res["raw"], decimals=res["decimals"], sig=res["sig"])
         self.emit("EXEC", f"{name} BUY ${p['symbol']} ${spent:.2f} LIVE tx {str(res['sig'])[:10]}")
         return True
 
     # ---- exit rules ------------------------------------------------------------ #
-    def _sell(self, name, k, reason, writeoff=False):
+    def _sell(self, name, k, reason, writeoff=False, frac=1.0):
         st = self.state["agents"][name]
         pos = st["positions"][k]
+        full = frac >= 0.999
+        units = pos["units"] if full else pos["units"] * frac
+        sold_raw = None
         if pos.get("live"):
-            res = self.live.sell(pos["addr"], pos["raw"])
+            want = pos["raw"] if full else int(pos["raw"] * frac)
+            res = self.live.sell(pos["addr"], want)
             if not res["ok"]:
-                pos["pending_exit"] = reason
+                if full:
+                    pos["pending_exit"] = reason
                 pos["sell_fails"] = pos.get("sell_fails", 0) + 1
                 self._live_fail(f"{name} could not sell ${pos['symbol']}: {res['err']} (will retry)")
                 return
             self.live_fails = 0
             proceeds = res["got_usd"]
+            sold_raw = res.get("sold_raw", want)
             if res.get("note"):
                 self.emit("WARN", f"${pos['symbol']}: {res['note']}")
+                full = True  # nothing left in the wallet
         else:
-            proceeds = 0.0 if writeoff else self._value(pos, pos["last_price"], pos["last_liq"])
-        st["positions"].pop(k)
-        pnl = proceeds - pos["size"]
+            proceeds = 0.0 if writeoff else self._value(pos, units)
+        basis = pos["size"] if full else pos["size"] * frac
+        pnl = proceeds - basis
         st["cash"] += proceeds
         st["pnl"] += pnl
         st["day_pnl"] += pnl
+        size0 = pos.get("size0", pos["size"])
+        row = dict(t=self.t, agent=name, symbol=pos["symbol"], chain=pos["chain"],
+                   src=pos.get("src", "dex"), pnl=round(pnl, 2), ret=round(pnl / basis * 100, 1),
+                   reason=reason, held=round((self.t - pos["opened"]) / 60, 1), partial=not full)
+        st["trades"].append(row)
+        del st["trades"][:-300]
+        if not full:
+            if pos.get("curve_sol"):
+                pos["curve_sol"] *= 1 - frac
+            pos["units"] -= units
+            pos["size"] -= basis
+            if sold_raw is not None:
+                pos["raw"] = max(0, pos["raw"] - sold_raw)
+            pos["tp1_done"] = True
+            pos["realized"] = pos.get("realized", 0.0) + pnl
+            self.emit("FILL", f"{name} SOLD {frac * 100:.0f}% of ${pos['symbol']} {pnl:+.2f} ({reason})")
+            return
+        st["positions"].pop(k)
+        total = pnl + pos.get("realized", 0.0)
         st["cool"][k] = self.t
-        if pnl >= 0:
+        if total >= 0:
             st["wins"] += 1
         else:
             st["losses"] += 1
-        if pnl > 0 and (not st["best"] or pnl > st["best"]["pnl"]):
-            st["best"] = dict(pnl=pnl, symbol=pos["symbol"])
-        st["trades"].append(dict(t=self.t, agent=name, symbol=pos["symbol"], chain=pos["chain"],
-                                 pnl=round(pnl, 2), ret=round(pnl / pos["size"] * 100, 1),
-                                 reason=reason, held=round((self.t - pos["opened"]) / 60, 1)))
-        del st["trades"][:-300]
-        self.emit("FILL", f"{name} SOLD ${pos['symbol']} {pnl:+.2f} ({reason})")
+        if total > 0 and (not st["best"] or total > st["best"]["pnl"]):
+            st["best"] = dict(pnl=total, symbol=pos["symbol"])
+        extra = f", {total:+.2f} in total ({total / size0 * 100:+.1f}%)" if pos.get("realized") else ""
+        self.emit("FILL", f"{name} SOLD ${pos['symbol']} {pnl:+.2f} ({reason}){extra}")
+
+    def _check_exit(self, name, k, pos, price, liq=None, dev_sold=False):
+        a = self.acfg[name]
+        ret = (price / pos["ref_price"] - 1) * 100
+        peak_ret = (pos["peak"] / pos["ref_price"] - 1) * 100
+        held = (self.t - pos["opened"]) / 60.0
+        if dev_sold and a.get("exit_dev_sell"):
+            self._sell(name, k, "creator sold")
+        elif ret >= a["tp"]:
+            self._sell(name, k, "take-profit")
+        elif a.get("tp1") and not pos.get("tp1_done") and ret >= a["tp1"]:
+            self._sell(name, k, "partial take-profit", frac=a.get("tp1_frac", 0.5))
+        elif ret <= a["sl"]:
+            self._sell(name, k, "stop-loss")
+        elif pos.get("tp1_done") and ret <= self.cfg["breakeven_pct"]:
+            self._sell(name, k, "break-even stop")
+        elif peak_ret >= a["trail_act"] and price <= pos["peak"] * (1 - a["trail"] / 100):
+            self._sell(name, k, "trailing stop")
+        elif liq is not None and pos.get("entry_liq") and liq < pos["entry_liq"] * 0.5:
+            self._sell(name, k, "liquidity drop")
+        elif held >= a["max_hold"]:
+            self._sell(name, k, "time limit")
+
+    def _to_dex(self, name, pos, why):
+        """A curve position whose token graduated: from now on it is priced from its DEX pool."""
+        real_sol = max((pos.get("last_vsol") or PUMP_V_SOL0) - PUMP_V_SOL0, 1.0)
+        pos.update(venue="dex", entry_liq=None, miss=0,
+                   last_liq=max(pos.get("last_liq") or 0.0, 2 * real_sol * self.sol_usd))
+        pos.pop("curve_sol", None)
+        self.emit("PUMP", f"{name} ${pos['symbol']} {why}, now priced from its DEX pool")
 
     def _exits(self):
-        fresh_count = 0
         for name, st in self.state["agents"].items():
             a = self.acfg.get(name)
             if not a:
@@ -706,71 +1617,176 @@ class Engine:
                     continue
                 u = self.universe.get(k)
                 p = u["pair"] if u and u["miss"] == 0 else None
+                if pos.get("venue") == "curve":
+                    # handled on the fast loop; switch over only if the token turns up on a real DEX
+                    if p and p.get("dex") not in ("pumpfun", ""):
+                        self._to_dex(name, pos, "found on a DEX")
+                    else:
+                        continue
                 if not p:
                     pos["miss"] += 1
                     if pos["miss"] >= 10:
                         self._sell(name, k, "no price data for 10 cycles", writeoff=not pos.get("live"))
                     continue
-                fresh_count += 1
+                if pos.get("entry_liq") is None:
+                    pos["entry_liq"] = p["liq"]
                 pos.update(miss=0, last_price=p["price"], last_liq=p["liq"],
                            peak=max(pos["peak"], p["price"]))
-                ret = (p["price"] / pos["ref_price"] - 1) * 100
-                peak_ret = (pos["peak"] / pos["ref_price"] - 1) * 100
-                held = (self.t - pos["opened"]) / 60.0
-                if ret >= a["tp"]:
-                    self._sell(name, k, "take-profit")
-                elif ret <= a["sl"]:
-                    self._sell(name, k, "stop-loss")
-                elif peak_ret >= a["trail_act"] and p["price"] <= pos["peak"] * (1 - a["trail"] / 100):
-                    self._sell(name, k, "trailing stop")
-                elif p["liq"] < pos["entry_liq"] * 0.5:
-                    self._sell(name, k, "liquidity drop")
-                elif held >= a["max_hold"]:
-                    self._sell(name, k, "time limit")
+                self._check_exit(name, k, pos, p["price"], liq=p["liq"])
             cap = st["start"] * self.cfg["daily_loss_pct"] / 100.0
             if st["day_pnl"] <= -cap and not st["capped"]:
                 st["capped"] = True
                 self.emit("WARN", f"{name} hit its daily loss cap, no new entries until tomorrow")
 
     def _prune(self):
-        held = {k for st in self.state["agents"].values() for k in st["positions"]}
-        max_age = max(a["max_age"] for a in self.acfg.values()) * 60 + 3600
+        held = self._held()
+        max_age = max([a["max_age"] for a in self.acfg.values()
+                       if a.get("venue", "dex") == "dex" and not a.get("need")] or [1440]) * 60 + 3600
         for k in list(self.universe):
             if k in held:
                 continue
             u = self.universe[k]
             p = u["pair"]
-            if u["miss"] >= 3 or (p and p["created"] and self.t - p["created"] > max_age):
+            fresh = self._fresh_tag(u)
+            if u["miss"] >= 3 or (not fresh and p and p["created"] and self.t - p["created"] > max_age):
                 del self.universe[k]
                 self.dropped.add(k)
         extra = len(self.universe) - self.cfg["universe_max"]
         if extra > 0:
-            for k in sorted((k for k in self.universe if k not in held),
+            for k in sorted((k for k in self.universe if k not in held and not self._fresh_tag(self.universe[k])),
                             key=lambda k: self.universe[k]["first"])[:extra]:
                 del self.universe[k]
                 self.dropped.add(k)
         if len(self.dropped) > 5000:
             self.dropped.clear()
 
+    # ---- pump.fun fast loop ------------------------------------------------------ #
+    def fast(self):
+        """Curve exits and entries from the live pump.fun stream (every couple of seconds)."""
+        if not self.pump:
+            return
+        with self.lock:
+            if not self.demo:
+                self.t = time.time()
+            self.pump.sol_usd = self.sol_usd
+            for tag, msg in self.pump.pop_events():
+                self.emit(tag, msg)
+            for g in self.pump.pop_migrations():
+                self._on_grad(g)
+            self._curve_exits()
+            held = {pos["addr"] for st in self.state["agents"].values()
+                    for pos in st["positions"].values() if pos.get("venue") == "curve"}
+            self.pump.prune(self.t, keep=held)
+            if not self.paused and not os.path.exists(self.cfg["stop_file"]):
+                self._curve_entries()
+            if not self.demo:
+                self._cache = self.snapshot()
+
+    def _on_grad(self, g):
+        k = tkey("solana", g["mint"])
+        self._track("solana", g["mint"], tag=("grad", {"t": self.t}))
+        price, liq = g["price_sol"] * self.sol_usd, 2 * max(g["vsol"] - PUMP_V_SOL0, 1.0) * self.sol_usd
+        if hasattr(self.src, "adopt"):
+            self.src.adopt("solana", g["mint"], g["symbol"], price, liq)
+        held = False
+        for name, st in self.state["agents"].items():
+            pos = st["positions"].get(k)
+            if pos and pos.get("venue") == "curve":
+                held = True
+                self._to_dex(name, pos, "graduated from pump.fun")
+        if not held:
+            self.emit("PUMP", f"${g['symbol']} graduated from pump.fun"
+                              + (f" at ${price * PUMP_SUPPLY / 1000:.0f}k mcap" if price else ""))
+
+    def _curve_exits(self):
+        c = self.cfg
+        for name, st in self.state["agents"].items():
+            if name not in self.acfg:
+                continue
+            self._roll_day(st)
+            for k, pos in list(st["positions"].items()):
+                if pos.get("venue") != "curve":
+                    continue
+                q = self.pump.get(pos["addr"])
+                if not q or q["price"] <= 0:
+                    gone = self.t - pos.get("last_seen", pos["opened"])
+                    if gone > c["pump_lost_secs"]:
+                        self._track("solana", pos["addr"])  # maybe it graduated while we weren't looking
+                    if gone > c["pump_writeoff_secs"]:
+                        self._sell(name, k, "no pump.fun data")
+                    continue
+                pos.update(last_price=q["price"], last_vsol=q["vsol"], last_vtok=q["vtok"],
+                           peak=max(pos["peak"], q["price"]), last_seen=self.t)
+                if q["migrated"]:
+                    continue  # the migration event switches it to DEX pricing
+                self._check_exit(name, k, pos, q["price"], dev_sold=q["dev_sold"])
+
+    def _curve_entries(self):
+        names = [n for n, a in self.acfg.items() if a.get("venue") == "curve"]
+        if not names:
+            return
+        cands = sorted(self.pump.candidates(self.t), key=lambda q: -q["score"])
+        for q in cands:
+            for name in names:
+                recent = [t for t in self.curve_buys.get(name, ()) if self.t - t < 60]
+                if len(recent) >= self.acfg[name].get("max_new_per_min", 2):
+                    continue
+                if self._wants_curve(name, q):
+                    self._buy_curve(name, q)
+
     # ---- one full cycle -------------------------------------------------------- #
     def cycle(self):
         c = self.cfg
-        self.t = self.t + 60.0 if self.demo else time.time()
+        if self.demo:
+            for _ in range(12):  # each demo cycle is one simulated minute, pump.fun in 5s steps
+                self.t += 5.0
+                if self.pump:
+                    self.pump.tick(self.t)
+                    self.fast()
+        else:
+            self.t = time.time()
         self.src.tick(self.t)
         if self.live:
             try:
                 self.wallet = self.live.wallet()
             except Exception as e:
                 self._err(f"wallet check failed: {str(e)[:100]}")
+        if self.t - self.sol_t > 300:
+            try:
+                px = self.src.sol_usd()
+                if px and px > 0:
+                    self.sol_usd = px
+                self.sol_t = self.t
+            except Exception as e:
+                self.sol_t = self.t - 240  # try again in a minute
+                self._err(f"SOL price fetch failed: {str(e)[:80]}")
 
-        # 1) network: discover + refresh (lock not held)
+        # 1) network: discover + Fomo + refresh (lock not held)
         try:
             found = self.src.discover(c["chains"])
         except Exception as e:
             found = []
             self._err(f"discovery failed: {e}")
+        board = None
+        if self.fomo and self.t - self.fomo_t >= c["fomo_poll_seconds"]:
+            self.fomo_t = self.t
+            try:
+                board = self.fomo.fetch()
+                self.fomo_err = ""
+            except Exception as e:
+                self.fomo_err = str(e)[:120]
+                self._err(f"Fomo trending fetch failed: {self.fomo_err}")
         with self.lock:
             new = sum(self._track(ch, ad) for ch, ad in found)
+            if board is not None:
+                fresh_names = [b["symbol"] for b in board[:5]
+                               if tkey(b["chain"], b["addr"]) not in self.universe]
+                for b in board:
+                    self._track(b["chain"], b["addr"], tag=("fomo", {"rank": b["rank"], "t": self.t}))
+                self.fomo_board = board
+                self.emit("FOMO", f"Fomo trending: {len(board)} tokens"
+                                  + (f", new in top 5: {', '.join('$' + s for s in fresh_names)}"
+                                     if fresh_names else ""))
             todo = {}
             for u in self.universe.values():
                 todo.setdefault(u["chain"], []).append(u["addr"])
@@ -790,15 +1806,20 @@ class Engine:
             for k, u in self.universe.items():
                 p = fresh.get(k)
                 if p:
+                    p["tags"] = u.setdefault("tags", {})
                     u["pair"], u["miss"] = p, 0
                 else:
                     u["miss"] += 1
             live = [u["pair"] for u in self.universe.values() if u["miss"] == 0 and u["pair"]]
-            min_liq = min(a["min_liq"] for a in self.acfg.values())
+            dex_agents = [a for a in self.acfg.values() if a.get("venue", "dex") == "dex"]
+            min_liq = min([a["min_liq"] for a in dex_agents] or [0])
             self.state["scanned"] = len(live)
+            ps = self.pump.status() if self.pump else None
             self.emit("SCAN", f"{len(live)} pairs tracked, "
                               f"{sum(1 for p in live if p['liq'] >= min_liq)} with liq > "
-                              f"${min_liq / 1000:.0f}k, {new} new")
+                              f"${min_liq / 1000:.0f}k, {new} new"
+                              + (f"; pump.fun: {ps['watching']} launches followed, "
+                                 f"{ps['seen']} seen, {ps['grads']} graduated" if ps else ""))
             self._exits()
             self._prune()
             entries_open = not self.paused and not os.path.exists(c["stop_file"])
@@ -819,6 +1840,9 @@ class Engine:
                 except Exception as e:
                     sf = dict(ok=None, note=f"check failed: {str(e)[:60]}", buy_tax=None, sell_tax=None)
                 self.safety[tkey(p["chain"], p["addr"])] = dict(sf, t=self.t, logged=False)
+            if len(self.safety) > 3000:
+                for k in sorted(self.safety, key=lambda k: self.safety[k]["t"])[:1000]:
+                    del self.safety[k]
 
         # 4) entries + bookkeeping
         with self.lock:
@@ -848,7 +1872,7 @@ class Engine:
                                   ("" if sf["ok"] else ", proceeding (paper)"))
                     if self._buy(name, p, sf):
                         bought[name] += 1
-            total = sum(self._equity(st) for st in self.state["agents"].values())
+            total = sum(self._equity(st) for n, st in self.state["agents"].items() if n in self.acfg)
             eq = self.state["equity"]
             eq.append([self.t, round(total, 2)])
             del eq[:-6000]
@@ -871,9 +1895,11 @@ class Engine:
             S, agents, positions, trades = self.state, [], [], []
             total = start = wins = losses = 0
             best = None
+            all_rows = []
             for name, st in S["agents"].items():
                 if name not in self.acfg:
                     continue
+                a = self.acfg[name]
                 eq = self._equity(st)
                 total += eq
                 start += st["start"]
@@ -881,24 +1907,57 @@ class Engine:
                 losses += st["losses"]
                 if st["best"] and (not best or st["best"]["pnl"] > best["pnl"]):
                     best = dict(st["best"], agent=name)
-                agents.append(dict(name=name, style=self.acfg[name]["style"], equity=eq,
-                                   live=bool(self.acfg[name].get("live")),
+                feed = "pump" if a.get("venue") == "curve" else a.get("need") or "dex"
+                agents.append(dict(name=name, style=a["style"], equity=eq, feed=feed,
+                                   live=bool(a.get("live")),
                                    pnl=eq - st["start"], pnl_pct=(eq / st["start"] - 1) * 100,
                                    wins=st["wins"], losses=st["losses"], open=len(st["positions"]),
                                    capped=st["capped"]))
                 for pos in st["positions"].values():
-                    val = self._value(pos, pos["last_price"], pos["last_liq"])
                     positions.append(dict(
                         agent=name, symbol=pos["symbol"], chain=pos["chain"], size=pos["size"],
-                        value=val, ret=(pos["last_price"] / pos["ref_price"] - 1) * 100,
-                        held=(self.t - pos["opened"]) / 60))
+                        value=self._value(pos), ret=(pos["last_price"] / pos["ref_price"] - 1) * 100,
+                        held=(self.t - pos["opened"]) / 60, src=pos.get("src", "dex"),
+                        venue=pos.get("venue", "dex"), scaled=bool(pos.get("tp1_done"))))
                 trades.extend(st["trades"][-25:])
+                all_rows.extend(st["trades"])
             trades.sort(key=lambda x: -x["t"])
+            gw = sum(r["pnl"] for r in all_rows if r["pnl"] > 0)
+            gl = -sum(r["pnl"] for r in all_rows if r["pnl"] < 0)
+            by_src = {}
+            for r in all_rows:
+                by_src[r.get("src", "dex")] = by_src.get(r.get("src", "dex"), 0.0) + r["pnl"]
             eqs = S["equity"]
+            peak = dd = 0.0
+            for _, v in eqs:
+                peak = max(peak, v)
+                if peak:
+                    dd = max(dd, (peak - v) / peak * 100)
             stride = max(1, len(eqs) // 500)
             series = eqs[::stride]
             if eqs and series[-1] is not eqs[-1]:
                 series.append(eqs[-1])
+            pump = None
+            if self.pump:
+                ps = self.pump.status()
+                hot = [dict(symbol=q["symbol"], addr=q["addr"], age=q["age"], mcap=q["mcap"],
+                            prog=q["prog"], buyers=q["buyers"], buys=q["buys_5m"], sells=q["sells_5m"],
+                            net=q["net_sol_5m"], top=q["top_pct"], dev_sold=q["dev_sold"],
+                            held=any(tkey("solana", q["addr"]) in st["positions"]
+                                     for st in S["agents"].values()))
+                       for q in self.pump.top(self.t, 12)]
+                pump = dict(ps, hot=hot, sol_usd=self.sol_usd, demo=self.demo)
+            fomo = None
+            if self.fomo:
+                rows = []
+                for b in self.fomo_board[:15]:
+                    u = self.universe.get(tkey(b["chain"], b["addr"]))
+                    p = u["pair"] if u and u["miss"] == 0 else None
+                    rows.append(dict(rank=b["rank"], symbol=(p or b)["symbol"], chain=b["chain"],
+                                     chg_h1=p["chg_h1"] if p else None, liq=p["liq"] if p else None,
+                                     held=tkey(b["chain"], b["addr"]) in self._held()))
+                fomo = dict(board=rows, error=self.fomo_err,
+                            age=(self.t - self.fomo_t) if self.fomo_t > 0 else None)
             return dict(
                 mode="demo" if self.demo else ("live" if self.live else "paper"),
                 wallet=self.wallet, halted=self.live_halt, paused=self.paused,
@@ -906,9 +1965,11 @@ class Engine:
                 started=S["started"], cycles=self.cycles, errors=self.errors,
                 tracked=S["scanned"], total=total, start=start, pnl=total - start,
                 pnl_pct=((total / start - 1) * 100) if start else 0, wins=wins, losses=losses,
+                pf=(gw / gl) if gl else None, dd=dd, by_src=by_src,
                 best=best, agents=sorted(agents, key=lambda a: -a["equity"]),
                 positions=sorted(positions, key=lambda x: -x["size"]), trades=trades[:30],
-                log=S["log"][-70:][::-1], equity=series)
+                log=S["log"][-80:][::-1], equity=series, pump=pump, fomo=fomo,
+                fomo_off=self.fomo is None)
 
 
 # --------------------------------------------------------------------------- #
@@ -922,6 +1983,7 @@ HTML = r"""<!doctype html>
 :root{
   --bg:#12080b; --bg2:#1c0d12; --panel:#1b1115; --line:#3a2229; --text:#f3e8ea; --mute:#a68f95;
   --up:#5eead4; --down:#ff8d8d; --amber:#ffc58a; --blue:#8ab4ff; --violet:#c4a2ff; --warn:#ffb86b;
+  --pump:#7dffb0; --fomo:#ff8fd8;
   --mono:ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,monospace;
   --sans:"Inter","Segoe UI",system-ui,-apple-system,Helvetica,Arial,sans-serif;
 }
@@ -930,8 +1992,8 @@ html{background:var(--bg)}
 body{font-family:var(--sans);color:var(--text);min-height:100vh;padding:20px 22px 36px;
   background:radial-gradient(1100px 520px at 85% -10%,#3a1220 0,transparent 70%),
              radial-gradient(900px 500px at -10% 0,#1f0f2a 0,transparent 65%),var(--bg);
-  max-width:1280px;margin:0 auto}
-header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:18px}
+  max-width:1320px;margin:0 auto}
+header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px}
 .logo{width:46px;height:46px;border-radius:15px;background:linear-gradient(145deg,#fff,#c9c3cc);
   display:grid;place-items:center;box-shadow:0 6px 22px #0008}
 .logo i{width:6px;height:15px;background:#1a1216;border-radius:4px;margin:0 4px;display:inline-block}
@@ -940,8 +2002,9 @@ h1{font-size:30px;font-weight:700;letter-spacing:-.02em;line-height:1}
 .spacer{flex:1}
 .pill{display:flex;align-items:center;gap:8px;padding:9px 14px;border:1px solid var(--line);
   border-radius:999px;background:#ffffff08;font-size:13px;color:var(--text)}
-.dot{width:9px;height:9px;border-radius:50%;background:var(--up);box-shadow:0 0 10px var(--up)}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--up);box-shadow:0 0 10px var(--up);flex:none}
 .dot.off{background:var(--warn);box-shadow:0 0 10px var(--warn)}
+.dot.dead{background:#6b5a5f;box-shadow:none}
 .dot.live{background:#ff5d5d;box-shadow:0 0 10px #ff5d5d}
 .banner.live{border-color:#7a2f2f;background:#3a1416;color:#ffc9c9}
 .agent.livecard{border-color:#ff7a7a66}
@@ -953,17 +2016,18 @@ button.pill:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
 .grid{display:grid;gap:14px}
 .stats{grid-template-columns:repeat(4,1fr)}
 .mid{grid-template-columns:1.25fr 1fr;margin-top:14px}
+.feeds{grid-template-columns:1.35fr 1fr;margin-top:14px}
 .card{background:linear-gradient(180deg,#ffffff07,#ffffff03);border:1px solid var(--line);
   border-radius:18px;padding:16px 18px;min-width:0}
 .label{color:var(--mute);font-size:12.5px;margin-bottom:8px}
 .big{font-size:34px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
 .small{color:var(--mute);font-size:12.5px;margin-top:6px}
-.up{color:var(--up)} .down{color:var(--down)}
+.up{color:var(--up)} .down{color:var(--down)} .mute{color:var(--mute)}
 .bar{border-left:3px solid var(--up);padding-left:14px}
 .bar.neg{border-left-color:var(--down)}
 .donutwrap{display:flex;align-items:center;gap:16px}
 .donutwrap svg{flex:none}
-.wl{font-size:13px;line-height:1.7;color:var(--mute)}
+.wl{font-size:13px;line-height:1.6;color:var(--mute)}
 .chartcard{height:380px;display:flex;flex-direction:column}
 .chartcard canvas{flex:1;width:100%;min-height:0}
 .row{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:8px}
@@ -971,8 +2035,9 @@ button.pill:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
 .log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tag{display:inline-block;min-width:54px}
 .t-SCAN{color:var(--blue)} .t-EXEC{color:var(--amber)} .t-FILL{color:var(--up)}
-.t-RISK{color:var(--violet)} .t-WARN{color:var(--warn)}
-.agents{grid-template-columns:repeat(6,1fr);margin-top:14px}
+.t-RISK{color:var(--violet)} .t-WARN{color:var(--warn)} .t-HALT{color:#ff5d5d}
+.t-PUMP{color:var(--pump)} .t-FOMO{color:var(--fomo)}
+.agents{grid-template-columns:repeat(5,1fr);margin-top:14px}
 .agent{position:relative;overflow:hidden}
 .agent .nm{font-weight:650;font-size:16px}
 .agent .st{color:var(--mute);font-size:12px;margin-top:2px;min-height:15px}
@@ -983,15 +2048,22 @@ button.pill:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
 .agent.lead{border-color:var(--up)}
 .crown{position:absolute;right:14px;top:14px;font-size:11px;color:var(--bg);background:var(--up);
   border-radius:99px;padding:2px 8px;font-weight:650}
+.badge{display:inline-block;font-size:10.5px;font-weight:650;border-radius:6px;padding:1px 6px;
+  border:1px solid currentColor;line-height:1.5;vertical-align:1px}
+.b-dex{color:var(--blue)} .b-pump{color:var(--pump)} .b-grad{color:var(--amber)} .b-fomo{color:var(--fomo)}
+.b-bad{color:var(--down)} .b-warn{color:var(--warn)} .b-mine{color:var(--up)}
 .tables{grid-template-columns:1fr 1fr;margin-top:14px}
 table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
 th{color:var(--mute);font-weight:500;text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
 td{padding:7px 8px;border-bottom:1px solid #ffffff0c;white-space:nowrap}
-.tw{overflow:auto;max-height:300px}
-.empty{color:var(--mute);font-size:13px;padding:18px 4px}
+.tw{overflow:auto;max-height:330px}
+.empty{color:var(--mute);font-size:13px;padding:18px 4px;line-height:1.5}
+.prog{display:inline-block;width:64px;height:6px;border-radius:6px;background:#ffffff14;vertical-align:middle;
+  margin-right:6px;overflow:hidden}
+.prog b{display:block;height:100%;background:var(--pump);border-radius:6px}
 @media (max-width:1100px){.agents{grid-template-columns:repeat(3,1fr)}.stats{grid-template-columns:repeat(2,1fr)}
-  .mid,.tables{grid-template-columns:1fr}}
-@media (max-width:560px){.agents{grid-template-columns:repeat(2,1fr)}.big{font-size:28px}}
+  .mid,.tables,.feeds{grid-template-columns:1fr}}
+@media (max-width:560px){body{padding:16px}.agents{grid-template-columns:repeat(2,1fr)}.big{font-size:28px}}
 </style></head>
 <body>
 <header>
@@ -999,6 +2071,8 @@ td{padding:7px 8px;border-bottom:1px solid #ffffff0c;white-space:nowrap}
   <div><h1>MemeBot</h1><div class="sub" id="sub">connecting...</div></div>
   <div class="spacer"></div>
   <div class="pill" id="cyc">0 cycles</div>
+  <div class="pill" title="pump.fun live feed"><span class="dot dead" id="pdot"></span><span id="pfeed">pump.fun</span></div>
+  <div class="pill" title="Fomo trending board"><span class="dot dead" id="fdot"></span><span id="ffeed">Fomo</span></div>
   <button class="pill" id="pause" type="button">Pause entries</button>
   <div class="pill"><span class="dot" id="dot"></span><span id="mode">PAPER</span></div>
 </header>
@@ -1023,6 +2097,11 @@ td{padding:7px 8px;border-bottom:1px solid #ffffff0c;white-space:nowrap}
   <div class="card"><div class="row"><div class="label" style="margin:0">Activity log</div><div class="small" id="logn" style="margin:0"></div></div><div class="log" id="log"></div></div>
 </section>
 
+<section class="grid feeds">
+  <div class="card"><div class="row"><div class="label" style="margin:0">pump.fun live: hottest launches on the curve</div><div class="small" id="pstat" style="margin:0"></div></div><div class="tw" id="pump"></div></div>
+  <div class="card"><div class="row"><div class="label" style="margin:0">Fomo trending</div><div class="small" id="fstat" style="margin:0"></div></div><div class="tw" id="fomo"></div></div>
+</section>
+
 <section class="grid agents" id="agents"></section>
 
 <section class="grid tables">
@@ -1035,10 +2114,14 @@ const $=s=>document.querySelector(s);
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const money=(n,d=2)=>(n<0?"-":"")+"$"+Math.abs(n).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});
 const smoney=(n,d=2)=>(n<0?"-":"+")+"$"+Math.abs(n).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});
+const kmoney=n=>n>=1e6?"$"+(n/1e6).toFixed(2)+"M":(n>=1e3?"$"+(n/1e3).toFixed(1)+"k":"$"+n.toFixed(0));
 const pct=n=>(n>=0?"+":"")+n.toFixed(1)+"%";
 const cls=n=>n>=0?"up":"down";
-const COLORS=["#ffb48a","#ffc58a","#8ab4ff","#5eead4","#c4a2ff","#ff8fb1"];
+const COLORS=["#ffb48a","#ffc58a","#8ab4ff","#5eead4","#c4a2ff","#ff8fb1","#7dffb0","#ffe08a","#9ad0ff","#ff8fd8"];
+const SRC={dex:"DEX",pump:"pump",grad:"grad",fomo:"Fomo"};
+const badge=s=>`<span class="badge b-${esc(s)}">${esc(SRC[s]||s)}</span>`;
 const hhmm=t=>new Date(t*1000).toTimeString().slice(0,8);
+const dur=s=>s<60?Math.round(s)+"s":(s<3600?Math.round(s/60)+"m":(s/3600).toFixed(1)+"h");
 let last=null;
 
 function drawChart(series){
@@ -1062,6 +2145,35 @@ function drawChart(series){
   const lx=X(vs.length-1),ly=Y(vs[vs.length-1]); x.beginPath(); x.arc(lx,ly,4.5,0,7); x.fillStyle=col; x.fill();
 }
 
+function renderPump(p){
+  const dot=$("#pdot");
+  if(!p){dot.className="dot dead";$("#pfeed").textContent="pump.fun off";$("#pstat").textContent="";
+    $("#pump").innerHTML='<div class="empty">The pump.fun watcher is off (started with --no-pump).</div>';return}
+  dot.className="dot"+(p.connected?"":" off");
+  $("#pfeed").textContent=p.connected?"pump.fun live":"pump.fun reconnecting";
+  $("#pstat").textContent=`${p.seen} launches, ${p.grads} graduated, ${p.watching} followed, SOL ${money(p.sol_usd)}`;
+  if(!p.hot.length){$("#pump").innerHTML=`<div class="empty">${p.connected?"Waiting for launches with real buying...":"Connecting to PumpPortal... "+esc(p.error||"")}</div>`;return}
+  $("#pump").innerHTML=`<table><tr><th>Token</th><th>Age</th><th>MCap</th><th>Curve</th><th>Buyers</th><th>B/S 5m</th><th>Net 5m</th><th></th></tr>`+
+    p.hot.map(q=>`<tr><td>$${esc(q.symbol)}</td><td>${dur(q.age)}</td><td>${kmoney(q.mcap)}</td>
+      <td><span class="prog"><b style="width:${Math.min(100,q.prog).toFixed(0)}%"></b></span>${q.prog.toFixed(0)}%</td>
+      <td>${q.buyers}</td><td>${q.buys}/${q.sells}</td><td class="${cls(q.net)}">${q.net>=0?"+":""}${q.net.toFixed(1)} SOL</td>
+      <td>${q.held?'<span class="badge b-mine">held</span> ':""}${q.dev_sold?'<span class="badge b-bad">dev sold</span> ':""}${q.top>8?`<span class="badge b-warn">top ${q.top.toFixed(0)}%</span>`:""}</td></tr>`).join("")+"</table>";
+}
+
+function renderFomo(f,off){
+  const dot=$("#fdot");
+  if(!f){dot.className="dot dead";$("#ffeed").textContent="Fomo off";$("#fstat").textContent="";
+    $("#fomo").innerHTML=off?'<div class="empty">Set <b>FOMO_API_KEY</b> to watch Fomo\'s trending board (free key at fomoapi.io), then restart.</div>':"";return}
+  dot.className="dot"+(f.error?" off":"");
+  $("#ffeed").textContent=f.error?"Fomo error":"Fomo on";
+  $("#fstat").textContent=f.error?f.error.slice(0,60):(f.age!=null?"updated "+dur(f.age)+" ago":"");
+  if(!f.board.length){$("#fomo").innerHTML='<div class="empty">Waiting for the first trending board...</div>';return}
+  $("#fomo").innerHTML=`<table><tr><th>#</th><th>Token</th><th>Chain</th><th>1h</th><th>Liq</th><th></th></tr>`+
+    f.board.map(b=>`<tr><td>${b.rank}</td><td>$${esc(b.symbol)}</td><td>${esc(b.chain)}</td>
+      <td class="${b.chg_h1==null?"mute":cls(b.chg_h1)}">${b.chg_h1==null?"-":pct(b.chg_h1)}</td>
+      <td>${b.liq==null?"-":kmoney(b.liq)}</td><td>${b.held?'<span class="badge b-mine">held</span>':""}</td></tr>`).join("")+"</table>";
+}
+
 function render(s){
   last=s;
   const demo=s.mode==="demo";
@@ -1070,11 +2182,11 @@ function render(s){
     (isLive?"Live agents trade real funds on Solana. All other agents are paper":"Paper trading on live market data. No real orders are placed");
   $("#mode").textContent=demo?"DEMO":(held?"ENTRIES PAUSED":(isLive?"LIVE":"PAPER"));
   $("#dot").className="dot"+(held?" off":(isLive?" live":""));
-  $("#cyc").textContent=s.cycles+" cycles, "+s.tracked+" tokens tracked";
+  $("#cyc").textContent=s.cycles+" cycles, "+s.tracked+" DEX tokens";
   $("#pause").textContent=s.paused?"Resume entries":"Pause entries";
   const b=$("#banner");
   b.className="banner";
-  if(demo){b.style.display="block";b.textContent="Simulated data. These prices are random and say nothing about real markets."}
+  if(demo){b.style.display="block";b.textContent="Simulated data. These prices and launches are random and say nothing about real markets."}
   else if(isLive){b.style.display="block";b.className="banner live";
     b.textContent=(s.halted?"LIVE TRADING HALTED after repeated failed transactions. Check open positions and restart. ":"Real funds at risk. ")+
       (s.wallet?"Wallet "+s.wallet.pub+": "+money(s.wallet.usdc)+" USDC, "+s.wallet.sol.toFixed(4)+" SOL.":"Reading wallet balance...")}
@@ -1084,34 +2196,37 @@ function render(s){
   $("#bal").textContent=money(s.total);
   $("#balsub").textContent="started at "+money(s.start,2)+", split across "+s.agents.length+" agents";
   $("#pnl").textContent=smoney(s.pnl); $("#pnl").className="big "+cls(s.pnl);
-  $("#pnlsub").textContent=pct(s.pnl_pct)+" since start";
+  const srcs=Object.entries(s.by_src||{}).map(([k,v])=>`${SRC[k]||k} ${smoney(v,0)}`).join(", ");
+  $("#pnlsub").textContent=pct(s.pnl_pct)+" since start"+(srcs?" · closed: "+srcs:"");
   $("#pnlcard").className="card bar"+(s.pnl<0?" neg":""); $("#balcard").className="card bar"+(s.pnl<0?" neg":"");
   if(s.best){$("#best").textContent=smoney(s.best.pnl); $("#best").className="big up"; $("#bestsub").textContent="$"+s.best.symbol+" by "+s.best.agent}
   else{$("#best").textContent="none yet"; $("#best").className="big"; $("#bestsub").textContent="waiting for a winning close"}
   const n=s.wins+s.losses, wr=n?s.wins/n:0;
   $("#wrtxt").textContent=n?Math.round(wr*100)+"%":"-";
   $("#ring").setAttribute("stroke-dasharray",(wr*163.4)+" 999");
-  $("#wl").innerHTML=n?`${s.wins} wins<br>${s.losses} losses`:"no closed trades yet";
+  $("#wl").innerHTML=n?`${s.wins} wins, ${s.losses} losses<br>profit factor ${s.pf==null?"∞":s.pf.toFixed(2)}<br>max drawdown ${s.dd.toFixed(1)}%`:"no closed trades yet";
 
   drawChart(s.equity);
   if(s.equity.length>1){const a=s.equity[0][0],z=s.equity[s.equity.length-1][0];$("#range").textContent=hhmm(a)+" to "+hhmm(z)}
   $("#logn").textContent=s.log.length+" recent events";
   $("#log").innerHTML=s.log.map(e=>`<div><span style="color:#a68f95">${hhmm(e.t)}</span> <span class="tag t-${esc(e.tag)}">[${esc(e.tag)}]</span> ${esc(e.msg)}</div>`).join("");
 
+  renderPump(s.pump); renderFomo(s.fomo,s.fomo_off);
+
   const mx=Math.max(...s.agents.map(a=>a.equity),1);
   $("#agents").innerHTML=s.agents.map((a,i)=>{
     const lead=i===0&&(a.wins+a.losses>0);
     return `<div class="card agent${lead?" lead":""}${a.live?" livecard":""}">${lead?'<span class="crown">leading</span>':""}
-      <div class="nm">${esc(a.name)}</div><div class="st">${esc(a.style)}</div>
+      <div class="nm">${esc(a.name)}</div><div class="st">${badge(a.feed)} ${esc(a.style)}</div>
       <div class="eq">${money(a.equity)}</div>
       <div class="meta"><span class="${cls(a.pnl)}">${smoney(a.pnl)} (${pct(a.pnl_pct)})</span><br>${a.wins}W / ${a.losses}L, ${a.open} open${a.capped?"<br>daily cap hit":""}</div>
-      <div class="meter"><b style="width:${Math.max(4,a.equity/mx*100)}%;background:${COLORS[i%6]}"></b></div></div>`}).join("");
+      <div class="meter"><b style="width:${Math.max(4,a.equity/mx*100)}%;background:${COLORS[i%COLORS.length]}"></b></div></div>`}).join("");
 
-  $("#pos").innerHTML=s.positions.length?`<table><tr><th>Agent</th><th>Token</th><th>Chain</th><th>Size</th><th>Now</th><th>Move</th><th>Held</th></tr>`+
-    s.positions.map(p=>`<tr><td>${esc(p.agent)}</td><td>$${esc(p.symbol)}</td><td>${esc(p.chain)}</td><td>${money(p.size)}</td><td>${money(p.value)}</td><td class="${cls(p.ret)}">${pct(p.ret)}</td><td>${Math.round(p.held)}m</td></tr>`).join("")+"</table>"
+  $("#pos").innerHTML=s.positions.length?`<table><tr><th>Agent</th><th>Token</th><th>Feed</th><th>Size</th><th>Now</th><th>Move</th><th>Held</th></tr>`+
+    s.positions.map(p=>`<tr><td>${esc(p.agent)}</td><td>$${esc(p.symbol)}${p.scaled?' <span class="badge b-mine">½ out</span>':""}</td><td>${badge(p.src)} <span class="mute">${p.venue==="curve"?"curve":esc(p.chain)}</span></td><td>${money(p.size)}</td><td>${money(p.value)}</td><td class="${cls(p.ret)}">${pct(p.ret)}</td><td>${Math.round(p.held)}m</td></tr>`).join("")+"</table>"
     :'<div class="empty">No open positions. Entries appear here once a token passes an agent\'s filters and the safety checks.</div>';
   $("#trd").innerHTML=s.trades.length?`<table><tr><th>Time</th><th>Agent</th><th>Token</th><th>P&amp;L</th><th>Return</th><th>Exit</th></tr>`+
-    s.trades.map(t=>`<tr><td>${hhmm(t.t)}</td><td>${esc(t.agent)}</td><td>$${esc(t.symbol)}</td><td class="${cls(t.pnl)}">${smoney(t.pnl)}</td><td class="${cls(t.ret)}">${pct(t.ret)}</td><td>${esc(t.reason)}</td></tr>`).join("")+"</table>"
+    s.trades.map(t=>`<tr><td>${hhmm(t.t)}</td><td>${esc(t.agent)}</td><td>${badge(t.src||"dex")} $${esc(t.symbol)}</td><td class="${cls(t.pnl)}">${smoney(t.pnl)}</td><td class="${cls(t.ret)}">${pct(t.ret)}</td><td>${esc(t.reason)}</td></tr>`).join("")+"</table>"
     :'<div class="empty">No closed trades yet. Results show here after the first exit.</div>';
 }
 
@@ -1119,27 +2234,36 @@ async function poll(){
   try{const r=await fetch("/state.json",{cache:"no-store"}); render(await r.json())}
   catch(e){$("#sub").textContent="Lost connection to the bot. Is memebot.py still running?"}
 }
-$("#pause").addEventListener("click",async()=>{await fetch("/api/pause",{method:"POST"}); poll()});
+$("#pause").addEventListener("click",async()=>{await fetch("/api/pause",{method:"POST",headers:{"X-MemeBot":"1"}}); poll()});
 window.addEventListener("resize",()=>last&&drawChart(last.equity));
-poll(); setInterval(poll,3000);
+poll(); setInterval(poll,2000);
 </script>
 </body></html>
 """
 
 
-def make_handler(engine):
+def make_handler(engine, port):
+    allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, body, ctype):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Security-Policy",
                              "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'")
             self.end_headers()
             self.wfile.write(body)
 
+        def _host_ok(self):
+            # blocks DNS-rebinding: a page on another site cannot read or drive the bot
+            return self.headers.get("Host", "") in allowed_hosts
+
         def do_GET(self):
+            if not self._host_ok():
+                return self._send(403, b"forbidden", "text/plain")
             path = self.path.split("?")[0]
             if path == "/state.json":
                 self._send(200, json.dumps(engine.latest()).encode(), "application/json")
@@ -1149,6 +2273,9 @@ def make_handler(engine):
                 self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
+            # the custom header forces a CORS preflight, so other websites cannot POST here
+            if not self._host_ok() or self.headers.get("X-MemeBot") != "1":
+                return self._send(403, b"forbidden", "text/plain")
             if self.path == "/api/pause":
                 engine.paused = not engine.paused
                 self._send(200, json.dumps({"paused": engine.paused}).encode(), "application/json")
@@ -1167,12 +2294,15 @@ def make_handler(engine):
 def start_live(args):
     """All the checks that must pass before any real order can be placed."""
     names = [n.strip() for n in args.live_agents.split(",") if n.strip()]
-    valid = {a["name"] for a in AGENTS}
+    valid = {a["name"] for a in AGENTS if a.get("venue", "dex") == "dex"
+             and not (a.get("need") == "fomo" and args.no_fomo)
+             and not (a.get("need") == "grad" and args.no_pump)}
     if not names:
         raise SystemExit("Choose which agent trades live, for example:  --live --live-agents Bolt")
     bad = [n for n in names if n not in valid]
     if bad:
-        raise SystemExit(f"Unknown agent(s): {', '.join(bad)}. Choose from: {', '.join(sorted(valid))}")
+        raise SystemExit(f"Agent(s) that cannot trade live: {', '.join(bad)}. Choose from: "
+                         f"{', '.join(sorted(valid))} (bonding-curve agents are paper only)")
     CFG["live_usd"] = args.live_usd
     ex = SolanaLive(CFG)
     try:
@@ -1209,6 +2339,8 @@ def main():
     ap.add_argument("--reset", action="store_true", help="delete saved state first")
     ap.add_argument("--port", type=int, default=CFG["port"])
     ap.add_argument("--poll", type=float, default=None, help="seconds between cycles")
+    ap.add_argument("--no-pump", action="store_true", help="do not watch pump.fun")
+    ap.add_argument("--no-fomo", action="store_true", help="do not watch Fomo's trending board")
     ap.add_argument("--live", action="store_true", help="enable REAL trading on Solana (see --live-agents)")
     ap.add_argument("--live-agents", default="", help="comma-separated agents to mirror with real money, e.g. Bolt")
     ap.add_argument("--live-usd", type=float, default=CFG["live_usd"],
@@ -1240,12 +2372,38 @@ def main():
 
     poll = args.poll if args.poll is not None else (1.0 if args.demo else CFG["poll_seconds"])
     src = DemoSource() if args.demo else LiveSource()
-    engine = Engine(CFG, AGENTS, src, demo=args.demo, live=live, live_names=live_names)
+    pump = fomo = None
+    if not args.no_pump:
+        pump = DemoPump(CFG, clock=time.time) if args.demo else PumpWatcher(CFG)
+    if not args.no_fomo:
+        fomo = DemoFomo(src) if args.demo else FomoFeed(CFG)
+        if not fomo.enabled:
+            print("Fomo watcher off: set FOMO_API_KEY (free key at https://fomoapi.io) to follow "
+                  "Fomo's trending board.")
+            fomo = None
+    notify = Notifier()
+    engine = Engine(CFG, AGENTS, src, demo=args.demo, live=live, live_names=live_names,
+                    pump=pump, fomo=fomo, notify=notify)
+    if pump and args.demo:
+        pump.clock = lambda: engine.t
 
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(engine))
+    srv = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(engine, args.port))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+    if pump and not args.demo:
+        pump.start()
+
+        def fast_loop():
+            while True:
+                try:
+                    engine.fast()
+                except Exception as e:
+                    engine._err(f"pump.fun loop error: {e}")
+                time.sleep(CFG["fast_seconds"])
+        threading.Thread(target=fast_loop, name="fast", daemon=True).start()
     mode = "DEMO" if args.demo else ("LIVE + PAPER" if live else "PAPER")
-    print(f"MemeBot running ({mode} mode). Dashboard: http://127.0.0.1:{args.port}   (Ctrl+C to stop)")
+    feeds = ", ".join(["DexScreener"] + (["pump.fun"] if pump else []) + (["Fomo"] if fomo else []))
+    print(f"MemeBot running ({mode} mode, watching {feeds}). Dashboard: http://127.0.0.1:{args.port}"
+          f"   (Ctrl+C to stop)" + ("\nAlerts on." if notify.enabled else ""))
 
     try:
         while True:

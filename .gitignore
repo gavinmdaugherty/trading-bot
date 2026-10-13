@@ -1,0 +1,6 @@
+state.json
+state.json.tmp
+STOP
+__pycache__/
+*.pyc
+.env
