@@ -272,6 +272,17 @@ def curve_sell(units, vsol, vtok):
     return vsol - vsol * vtok / (vtok + units)
 
 
+def curve_reserves(vsol, vtok):
+    """pump.fun's virtual reserves keep vsol * vtok constant, so either one gives the other.
+    Some feed messages carry only one of them."""
+    k = PUMP_V_SOL0 * PUMP_V_TOK0
+    if vtok > 0 and vsol <= 0:
+        vsol = k / vtok
+    elif vsol > 0 and vtok <= 0:
+        vtok = k / vsol
+    return vsol, vtok
+
+
 def curve_progress(vtok):
     return max(0.0, min(100.0, (PUMP_V_TOK0 - vtok) / PUMP_REAL_TOK0 * 100.0))
 
@@ -640,7 +651,10 @@ class PumpWatcher:
         mint = m["mint"]
         dev = m.get("traderPublicKey") or ""
         init = num(m, "initialBuy")
-        vsol, vtok = num(m, "vSolInBondingCurve"), num(m, "vTokensInBondingCurve")
+        vsol, vtok = curve_reserves(num(m, "vSolInBondingCurve"), num(m, "vTokensInBondingCurve"))
+        if vsol <= 0:
+            vsol, vtok = PUMP_V_SOL0, PUMP_V_TOK0 - num(m, "initialBuy")
+            vsol, vtok = curve_reserves(0.0, vtok)
         t = self.tokens.get(mint)
         if t and t["from_create"]:
             return  # repeated after a reconnect
@@ -666,7 +680,7 @@ class PumpWatcher:
         if not t:
             return
         c = self.cfg
-        vsol, vtok = num(m, "vSolInBondingCurve"), num(m, "vTokensInBondingCurve")
+        vsol, vtok = curve_reserves(num(m, "vSolInBondingCurve"), num(m, "vTokensInBondingCurve"))
         amt = num(m, "tokenAmount")
         if t["seen_trades"] == 0 and t["from_create"] and vtok > 0 and t["vtok"] > 0 and amt > 0:
             # Trades in the launch block land before our subscription does. The curve gives them
@@ -709,7 +723,9 @@ class PumpWatcher:
             t["n_sells"] += 1
             if trader and trader == t["creator"] and not t["dev_sold"]:
                 t["dev_sold"] = True
-                self.events.append(("RISK", f"pump.fun ${t['symbol']}: creator sold"))
+                if len(t["buyers"]) >= 25:  # most creators sell; only worth a log line on a launch people bought
+                    self.events.append(("RISK", f"pump.fun ${t['symbol']}: creator sold "
+                                                f"({len(t['buyers'])} buyers, curve {curve_progress(t['vtok']):.0f}%)"))
 
     def _on_migrate(self, m):
         mint = m["mint"]
@@ -2370,8 +2386,9 @@ class Engine:
             self.state["scanned"] = len(live)
             ps = self.pump.status() if self.pump else None
             self.emit("SCAN", f"{len(live)} pairs tracked, "
-                              f"{sum(1 for p in live if p['liq'] >= min_liq)} with liq > "
-                              f"${min_liq / 1000:.0f}k, {new} new"
+                              + (f"{sum(1 for p in live if p['liq'] >= min_liq)} with liq > "
+                                 f"${min_liq / 1000:.0f}k, " if dex_agents else "")
+                              + f"{new} new"
                               + (f"; pump.fun: {ps['watching']} launches followed, "
                                  f"{ps['seen']} seen, {ps['grads']} graduated" if ps else ""))
             self._exits()

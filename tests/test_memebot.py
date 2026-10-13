@@ -70,7 +70,7 @@ class Watcher(unittest.TestCase):
         self.create()
         self.trade("sell", "DEV", 1.0, 0, 30.0, m.PUMP_V_TOK0)
         self.assertTrue(self.w.get("M1")["dev_sold"])
-        self.assertEqual(self.w.pop_events()[0][0], "RISK")
+        self.assertEqual(self.w.pop_events(), [])  # nobody bought it: flagged, but not worth a log line
         self.w.handle(dict(mint="M1", txType="migrate", pool="pump-amm"))
         migs = self.w.pop_migrations()
         self.assertEqual([g["mint"] for g in migs], ["M1"])
