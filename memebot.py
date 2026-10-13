@@ -2333,7 +2333,24 @@ def start_live(args):
     return ex, names
 
 
+def load_env_file(path=None):
+    """Read KEY=VALUE lines from a .env file next to this script (kept out of git by .gitignore).
+    Variables already set in the environment win."""
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip().removeprefix("export ").strip()
+            os.environ.setdefault(k, v.strip().strip('"').strip("'"))
+
+
 def main():
+    load_env_file()
     ap = argparse.ArgumentParser(description="MemeBot paper-trading engine + dashboard")
     ap.add_argument("--demo", action="store_true", help="synthetic market, runs offline")
     ap.add_argument("--reset", action="store_true", help="delete saved state first")
