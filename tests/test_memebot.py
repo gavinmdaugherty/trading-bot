@@ -378,6 +378,15 @@ class LiveSpark(unittest.TestCase):
         self.assertEqual([c[0] for c in self.live.calls], ["buy", "sell", "close"])
         self.assertAlmostEqual(st["cash"], 16.0)
 
+    def test_no_route_yet_retries_in_20s(self):
+        self.live.buy = lambda *a, **k: dict(ok=False, stage="quote", err="no route")
+        self.assertFalse(self.eng._buy_curve("Spark LIVE", self.q()))
+        k = m.tkey("solana", "MINT1")
+        self.assertEqual(self.eng._slot_reason("Spark LIVE", k, 5), "cooldown")
+        self.eng.t += 21
+        self.assertIsNone(self.eng._slot_reason("Spark LIVE", k, 5))
+        self.assertFalse(self.eng.live_halt)
+
     def test_live_blocked_when_wallet_sol_low(self):
         self.eng.wallet = dict(pub="x", usdc=15.0, sol=0.001)
         self.assertEqual(self.eng._live_reason("Spark LIVE"), "wallet SOL too low for fees")

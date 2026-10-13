@@ -203,6 +203,14 @@ RISK = {
                  max_top_pct=8.0, max_top10_pct=38.0, max_dev_pct=8.0, max_bundle_pct=20.0,
                  max_sniper_pct=30.0, max_creator_launches=2, min_socials=0, max_ath_drop=40,
                  max_new_per_min=4),
+    # trenching: buy launches seconds old as long as real buyers are piling in. Hard rug
+    # checks stay on; exits are tighter because most of these die fast.
+    "degen": dict(min_age_s=8, max_age_s=900, min_prog=2, max_prog=75, min_real_sol=0.5,
+                  min_buyers=6, min_uniq_5m=5, min_holders=6, min_bs_5m=1.2, min_net_sol_5m=0.8,
+                  min_buys_60s=4, max_buys_per_wallet=5.0, max_same_amt=0.5, max_whale=0.7,
+                  max_top_pct=10.0, max_top10_pct=45.0, max_dev_pct=10.0, max_bundle_pct=25.0,
+                  max_sniper_pct=40.0, max_creator_launches=2, min_socials=0, max_ath_drop=35,
+                  tp=100, tp1=40, sl=-25, trail_act=35, trail=18, max_hold=10, max_new_per_min=5),
 }
 # Common quick-buy amounts in SOL: many traders using the same button is normal, not a bot farm.
 PRESET_BUYS = (0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5, 10)
@@ -2030,7 +2038,9 @@ class Engine:
             if res.get("stage") == "tx":
                 self._live_fail(f"{name} buy ${q['symbol']} failed: {res['err']}")
             else:
-                self.emit("RISK", f"{name} skipped ${q['symbol']}: {res['err']}")
+                # no route yet is normal for a seconds-old launch: try again in 20s, not in an hour
+                st["cool"][k] = self.t - c["cooldown_min"] * 60 + 20
+                self.emit("RISK", f"{name} skipped ${q['symbol']} for now: {res['err']}")
             return False
         self.live_fails = 0
         spent, units = res["spent_usd"], res["raw"] / 10 ** res["decimals"]
@@ -3078,8 +3088,9 @@ def main():
                     help="save the first 300 raw pump.fun feed messages to pump_debug.jsonl")
     ap.add_argument("--live", action="store_true", help="enable REAL trading on Solana (see --live-agents)")
     ap.add_argument("--live-agents", default="", help="comma-separated agents to mirror with real money, e.g. Bolt")
-    ap.add_argument("--risk", choices=sorted(RISK), default="medium",
-                    help="how picky Spark is: low (strictest), medium (default), high (degen, more rugs)")
+    ap.add_argument("--risk", choices=["low", "medium", "high", "degen"], default="medium",
+                    help="how picky Spark is: low (strictest), medium (default), high, degen (trenching: "
+                         "seconds-old launches, most of them die)")
     ap.add_argument("--live-only", action="store_true",
                     help="with --live: run only the live agents, so the dashboard shows just your real money")
     ap.add_argument("--live-usd", type=float, default=CFG["live_usd"],
