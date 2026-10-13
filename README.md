@@ -17,6 +17,8 @@ Then open http://127.0.0.1:8000.
 | pump.fun | Every launch and every bonding-curve trade in real time, plus graduations to PumpSwap, over the free [PumpPortal](https://pumpportal.fun) websocket | none (`PUMPPORTAL_API_KEY` optional) |
 | Fomo (fomo.family) | The tokens Fomo users are trading right now, from the trending board on [FOMO API](https://fomoapi.io), an independent API for Fomo data | `FOMO_API_KEY` (free tier) |
 
+pump.fun also has a second, independent source: the bot can read pump.fun's own events straight from the chain over a Solana RPC websocket. This turns on by itself if PumpPortal sends launches but no trades. Use `--pump-rpc` to turn it on from the start; it also sees bundled launch-block buys directly. The free public RPC may throttle it, so a free [Helius](https://helius.dev) key works better: put `SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=...` in `.env`.
+
 Use `--no-pump` or `--no-fomo` to turn a feed off. If `FOMO_API_KEY` isn't set, the Fomo watcher stays off and the bot tells you at startup.
 
 ## The agents
@@ -97,3 +99,16 @@ The tests cover:
 
 - PumpPortal and FOMO API are third-party services. Their message formats can change, so the parsers are written defensively. If a feed goes quiet, check the activity log.
 - Paper results are optimistic for pump.fun. Real snipers and bots are faster than a 2-second loop.
+
+## Troubleshooting
+
+All settings can go in a `.env` file next to `memebot.py`, one `NAME=value` per line.
+
+| You see | Do this |
+|---|---|
+| "No wallet key found" | Create `.env` containing `MEMEBOT_SOLANA_KEY=...` |
+| "Jupiter is not answering" at startup | Get a free key at portal.jup.ag and add `JUPITER_API_KEY=...` to `.env` |
+| pump.fun shows launches but 0 trades | The bot switches to the on-chain feed on its own. If that also fails, add a Helius `SOLANA_RPC_URL`, or start with `--pump-debug` and share `pump_debug.jsonl` |
+| "DexScreener error" light | Your network or firewall is blocking api.dexscreener.com |
+| An agent isn't buying | Its card lists the top reasons, for example "too young (40), bundled launch (3)" |
+

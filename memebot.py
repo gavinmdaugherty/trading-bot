@@ -97,7 +97,7 @@ CFG = dict(
     bundle_window_s=3.0,         # buys this close to the launch count as bundled with it
     sniper_window_s=20.0,        # buyers in the first 20s count as snipers
     meta_min_buys=12,            # fetch a launch's metadata (socials) once it has this many buys
-    ipfs_fallback="https://dweb.link/ipfs/",
+    ipfs_fallback=["https://dweb.link/ipfs/", "https://gateway.pinata.cloud/ipfs/"],
     # ---- Fomo (fomo.family) trending board, through FOMO API ----
     fomo_api="https://api.fomoapi.io/v2/leaderboard/tokens/trending",
     fomo_poll_seconds=120,       # the free tier allows 10 requests a minute; this uses 0.5
@@ -276,6 +276,18 @@ def curve_progress(vtok):
     return max(0.0, min(100.0, (PUMP_V_TOK0 - vtok) / PUMP_REAL_TOK0 * 100.0))
 
 
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def b58encode(b):
+    n = int.from_bytes(b, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = B58[r] + out
+    return "1" * (len(b) - len(b.lstrip(b"\0"))) + out
+
+
 def short(addr):
     return addr[:4] + "..." + addr[-4:] if len(addr) > 12 else addr
 
@@ -445,11 +457,19 @@ class PumpWatcher:
         self.error = ""
         self.last_msg = 0.0
         self.seen = self.grads = self.msgs = 0
+        self.kinds = {}          # message type -> count, for diagnosing the feed
+        self.server_msgs = []    # distinct non-trade messages from PumpPortal (errors, notices)
+        self.connected_t = None
+        self.debug_left = 300 if cfg.get("pump_debug") else 0
+        self.recent = set()      # trades already counted (both feeds can deliver the same one)
+        self.recent_q = deque()
+        self.rpc = None
 
     # ---- feed ---- #
     def start(self):
         threading.Thread(target=self._run, name="pump-feed", daemon=True).start()
-        threading.Thread(target=self._meta_loop, name="pump-meta", daemon=True).start()
+        for i in range(3):
+            threading.Thread(target=self._meta_loop, name=f"pump-meta{i}", daemon=True).start()
 
     def _run(self):
         url = self.cfg["pump_ws"]
@@ -463,6 +483,7 @@ class PumpWatcher:
                 ws.connect()
                 with self.lock:
                     self.connected, self.error = True, ""
+                    self.connected_t = time.time()
                     resub = list(self.tokens)
                     self.sub_q.clear()
                     self.unsub_q.clear()
@@ -483,6 +504,10 @@ class PumpWatcher:
                         ws.ping()
                         continue
                     quiet = 0
+                    if self.debug_left > 0:
+                        self.debug_left -= 1
+                        with open("pump_debug.jsonl", "a", encoding="utf-8") as f:
+                            f.write(raw.strip() + "\n")
                     try:
                         msg = json.loads(raw)
                     except ValueError:
@@ -508,6 +533,12 @@ class PumpWatcher:
         for i in range(0, len(subs), 100):
             ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": subs[i:i + 100]}))
 
+    def start_rpc(self):
+        """Also read pump.fun straight from the chain (see RpcPumpFeed)."""
+        if self.rpc is None:
+            self.rpc = RpcPumpFeed(self)
+            self.rpc.start()
+
     # ---- metadata (socials) ---- #
     def _meta_loop(self):
         while True:
@@ -527,7 +558,8 @@ class PumpWatcher:
     def _fetch_meta(self, uri):
         urls = [uri]
         if "/ipfs/" in uri:
-            urls.append(self.cfg["ipfs_fallback"] + uri.split("/ipfs/", 1)[1])
+            cid = uri.split("/ipfs/", 1)[1]
+            urls += [g + cid for g in self.cfg["ipfs_fallback"] if not uri.startswith(g)]
         for u in urls:
             try:
                 d = get_json(u, timeout=6)
@@ -555,19 +587,39 @@ class PumpWatcher:
                         self.tokens[other]["dup_social"] = True
 
     # ---- message handling (also used by the demo feed and tests) ---- #
+    AMM_POOLS = ("pump-amm", "pumpswap", "pump-swap", "raydium", "raydium-cpmm", "meteora", "launchlab")
+
     def handle(self, m):
-        if not isinstance(m, dict) or not m.get("mint"):
+        if not isinstance(m, dict):
+            return
+        if not m.get("mint"):  # subscription confirmations, errors, notices
+            text = str(m.get("message") or m.get("errors") or m.get("error") or m)[:160]
+            with self.lock:
+                self.kinds["(notice)"] = self.kinds.get("(notice)", 0) + 1
+                if text not in self.server_msgs and len(self.server_msgs) < 20:
+                    self.server_msgs.append(text)
+                    self.events.append(("PUMP", f"PumpPortal says: {text}"))
             return
         now = self.clock()
         tx = str(m.get("txType") or "").lower()
         with self.lock:
             self.msgs += 1
             self.last_msg = now
+            self.kinds[tx or "(none)"] = self.kinds.get(tx or "(none)", 0) + 1
             if tx == "create":
                 self._on_create(m, now)
             elif tx in ("buy", "sell"):
-                if m.get("pool") in (None, "", "pump"):  # post-migration AMM trades are ignored
-                    self._on_trade(m, tx == "buy", now)
+                if str(m.get("pool") or "").lower() in self.AMM_POOLS:  # post-migration trades are ignored
+                    return
+                if m.get("signature"):
+                    key = (m["signature"], m["mint"], m.get("traderPublicKey"), tx, round(num(m, "tokenAmount")))
+                    if key in self.recent:
+                        return
+                    self.recent.add(key)
+                    self.recent_q.append(key)
+                    if len(self.recent_q) > 200000:
+                        self.recent.discard(self.recent_q.popleft())
+                self._on_trade(m, tx == "buy", now)
             elif tx in ("migrate", "migration", "complete") or (not tx and "solAmount" not in m):
                 self._on_migrate(m)
 
@@ -722,7 +774,8 @@ class PumpWatcher:
                  same_amt=(max(sizes.values()) / b) if b >= 6 else 0.0,
                  whale=(big / bsol) if bsol > 0 else 0.0, copycat=copycat,
                  creator_launches=t["creator_launches"], meta_state=t["meta_state"],
-                 socials=meta.get("socials", 0), dup_social=t["dup_social"],
+                 socials=meta.get("socials", 0), meta_failed=bool(meta.get("failed")),
+                 dup_social=t["dup_social"],
                  ath_drop=(price_sol / t["ath"] - 1) * 100 if t["ath"] else 0.0)
         q["score"] = (q["net_sol_5m"] + 0.25 * q["uniq_5m"] - (25 if q["dev_sold"] else 0)
                       - 2 * max(0.0, top - 8) - 0.5 * max(0.0, -q["ath_drop"] - 20)
@@ -793,9 +846,165 @@ class PumpWatcher:
 
     def status(self):
         with self.lock:
+            trades = self.kinds.get("buy", 0) + self.kinds.get("sell", 0)
             return dict(connected=self.connected, error=self.error, seen=self.seen,
-                        grads=self.grads, watching=len(self.tokens), msgs=self.msgs,
+                        grads=self.grads, watching=len(self.tokens), msgs=self.msgs, trades=trades,
+                        kinds=dict(self.kinds), notices=list(self.server_msgs[-3:]),
+                        connected_for=(time.time() - self.connected_t) if self.connected and self.connected_t else 0,
+                        rpc=None if self.rpc is None else dict(connected=self.rpc.connected,
+                                                               error=self.rpc.error, events=self.rpc.events),
                         quiet=self.clock() - self.last_msg if self.last_msg else None)
+
+
+class RpcPumpFeed:
+    """pump.fun trades read straight from the chain: a Solana RPC websocket `logsSubscribe` on the
+    pump.fun program, decoding its Anchor events (TradeEvent, CreateEvent, CompleteEvent).
+
+    It needs no third party besides an RPC node and sees launch-block (bundled) buys that a
+    per-token subscription misses. Events are converted to PumpPortal-shaped messages and fed
+    to the same PumpWatcher.handle(), which de-duplicates trades seen on both feeds.
+    """
+    PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+    TRADE = hashlib.sha256(b"event:TradeEvent").digest()[:8]
+    CREATE = hashlib.sha256(b"event:CreateEvent").digest()[:8]
+    COMPLETE = hashlib.sha256(b"event:CompleteEvent").digest()[:8]
+
+    def __init__(self, watcher):
+        self.w = watcher
+        self.connected = False
+        self.error = ""
+        self.events = 0
+
+    @staticmethod
+    def ws_url():
+        url = os.environ.get("SOLANA_WSS_URL", "").strip()
+        if url:
+            return url
+        rpc = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
+        return "wss://" + rpc[8:] if rpc.startswith("https://") else (
+            "ws://" + rpc[7:] if rpc.startswith("http://") else rpc)
+
+    def start(self):
+        threading.Thread(target=self._run, name="pump-rpc", daemon=True).start()
+
+    def _run(self):
+        delay = 2
+        while True:
+            ws = WebSocket(self.ws_url(), timeout=30)
+            try:
+                ws.connect()
+                ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
+                                    "params": [{"mentions": [self.PROGRAM]}, {"commitment": "processed"}]}))
+                self.connected, self.error, delay, quiet = True, "", 2, 0
+                self.w.events.append(("PUMP", "on-chain pump.fun feed connected"))
+                while True:
+                    try:
+                        raw = ws.recv()
+                    except socket.timeout:
+                        quiet += 1
+                        if quiet >= 2:
+                            raise ConnectionError("no data for 60s")
+                        ws.ping()
+                        continue
+                    quiet = 0
+                    try:
+                        msg = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if msg.get("error"):
+                        raise ConnectionError(f"RPC refused the subscription: {str(msg['error'])[:100]}")
+                    self.on_notification(msg)
+            except Exception as e:
+                self.connected, self.error = False, str(e)[:120]
+                self.w.events.append(("WARN", f"on-chain pump.fun feed: {str(e)[:100]}; retrying in {delay}s"))
+            finally:
+                ws.close()
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
+    def on_notification(self, msg):
+        value = ((msg.get("params") or {}).get("result") or {}).get("value") or {}
+        if not value or value.get("err") is not None:
+            return  # failed transactions changed nothing
+        sig = value.get("signature") or ""
+        evs = []
+        for line in value.get("logs") or []:
+            if line.startswith("Program data: "):
+                try:
+                    ev = self.decode(base64.b64decode(line[14:]))
+                except Exception:
+                    continue
+                if ev:
+                    evs.append(ev)
+        create = next((e for e in evs if e["kind"] == "create"), None)
+        for i, ev in enumerate(evs):
+            self.events += 1
+            if ev["kind"] == "create":
+                # the creator's first buy is a TradeEvent in the same transaction
+                dev = next((e for e in evs if e["kind"] == "trade" and e["mint"] == ev["mint"]
+                            and e["user"] == ev["user"] and e["is_buy"]), None)
+                m = dict(txType="create", mint=ev["mint"], traderPublicKey=ev["user"], name=ev["name"],
+                         symbol=ev["symbol"], uri=ev["uri"], signature=sig, pool="pump",
+                         initialBuy=dev["tokens"] if dev else 0.0, solAmount=dev["sol"] if dev else 0.0,
+                         vSolInBondingCurve=dev["vsol"] if dev else PUMP_V_SOL0,
+                         vTokensInBondingCurve=dev["vtok"] if dev else PUMP_V_TOK0)
+                self.w.handle(m)
+            elif ev["kind"] == "trade":
+                if create and ev["mint"] == create["mint"] and ev["user"] == create["user"] and ev["is_buy"]:
+                    continue  # already counted as the creator's initial buy
+                self.w.handle(dict(txType="buy" if ev["is_buy"] else "sell", mint=ev["mint"],
+                                   traderPublicKey=ev["user"], solAmount=ev["sol"], tokenAmount=ev["tokens"],
+                                   vSolInBondingCurve=ev["vsol"], vTokensInBondingCurve=ev["vtok"],
+                                   signature=sig, pool="pump"))
+            elif ev["kind"] == "complete":
+                self.w.handle(dict(txType="complete", mint=ev["mint"], signature=sig))
+
+    @classmethod
+    def decode(cls, data):
+        disc, r = data[:8], _Reader(data[8:])
+        if disc == cls.TRADE:
+            mint, sol, tok, is_buy, user = r.key(), r.u64(), r.u64(), r.u8(), r.key()
+            r.u64()  # timestamp
+            vsol, vtok = r.u64(), r.u64()
+            return dict(kind="trade", mint=mint, sol=sol / 1e9, tokens=tok / 1e6, is_buy=bool(is_buy),
+                        user=user, vsol=vsol / 1e9, vtok=vtok / 1e6)
+        if disc == cls.CREATE:
+            name, symbol, uri = r.string(), r.string(), r.string()
+            mint, _curve, user = r.key(), r.key(), r.key()
+            return dict(kind="create", name=name[:40], symbol=symbol[:16], uri=uri, mint=mint, user=user)
+        if disc == cls.COMPLETE:
+            user, mint = r.key(), r.key()
+            return dict(kind="complete", mint=mint, user=user)
+        return None
+
+
+class _Reader:
+    """Little-endian Borsh reader for Anchor event data."""
+
+    def __init__(self, b):
+        self.b, self.i = b, 0
+
+    def take(self, n):
+        if self.i + n > len(self.b):
+            raise ValueError("event data too short")
+        out = self.b[self.i:self.i + n]
+        self.i += n
+        return out
+
+    def u8(self):
+        return self.take(1)[0]
+
+    def u64(self):
+        return struct.unpack("<Q", self.take(8))[0]
+
+    def key(self):
+        return b58encode(self.take(32))
+
+    def string(self):
+        n = struct.unpack("<I", self.take(4))[0]
+        if n > 1000:
+            raise ValueError("implausible string length")
+        return self.take(n).decode("utf-8", "replace")
 
 
 class DemoPump(PumpWatcher):
@@ -1228,7 +1437,10 @@ class SolanaLive:
                 detail = e.read()[:150].decode("utf-8", "replace")
             except Exception:
                 detail = ""
-            raise RuntimeError(f"HTTP {e.code} from {host} {detail}".strip())
+            hint = (" (Jupiter's free endpoint refused: get a free key at portal.jup.ag and add "
+                    "JUPITER_API_KEY=... to .env)" if "lite-api.jup.ag" in host and e.code in (401, 403, 404, 410, 429)
+                    else "")
+            raise RuntimeError(f"HTTP {e.code} from {host} {detail}{hint}".strip())
         except urllib.error.URLError as e:
             raise RuntimeError(f"network error: {e.reason}")
 
@@ -1272,6 +1484,12 @@ class SolanaLive:
                 if info["mint"] != self.USDC and int(info["tokenAmount"]["amount"]) > 0:
                     out.append((info["mint"], info["tokenAmount"]["uiAmountString"]))
         return out
+
+    def check_route(self):
+        """A tiny USDC -> SOL quote, to prove Jupiter answers before any real order."""
+        q = self._quote(self.USDC, WSOL, 1_000_000, 50)
+        if int(q.get("outAmount", 0)) <= 0:
+            raise RuntimeError("Jupiter returned an empty quote")
 
     # ---- swaps ----
     def _quote(self, in_mint, out_mint, amount, slippage_bps):
@@ -1435,6 +1653,7 @@ class Engine:
         self.fomo_t, self.fomo_board, self.fomo_err = -1e12, [], ""
         self.curve_buys = {}
         self.dex_err, self.dex_ok_t = "", None
+        self.pump_warned = False
         self.blocks = {}          # agent -> (tokens checked, {reason it didn't buy: count})
         self.phase, self.phase_t, self.next_at = "starting up", time.time(), None
         self.state = self._load() or self._fresh()
@@ -1683,7 +1902,7 @@ class Engine:
         if a.get("min_socials"):  # checked last: it needs a metadata lookup
             if q["meta_state"] != 2:
                 return "checking socials"
-            if q["socials"] < a["min_socials"]:
+            if q["socials"] < a["min_socials"] and not q.get("meta_failed"):  # unreachable metadata isn't held against it
                 return "no socials"
         return None
 
@@ -1969,6 +2188,13 @@ class Engine:
                 self.emit(tag, msg)
             for g in self.pump.pop_migrations():
                 self._on_grad(g)
+            ps = self.pump.status()
+            if (not self.demo and not self.pump_warned and self.pump.rpc is None
+                    and ps["connected_for"] > 90 and ps["seen"] >= 10 and ps["trades"] == 0):
+                self.pump_warned = True
+                self.emit("WARN", f"pump.fun: {ps['seen']} launches from PumpPortal but no trades (message types "
+                                  f"{ps['kinds']}). Switching on the on-chain feed through your Solana RPC.")
+                self.pump.start_rpc()
             self._curve_exits()
             held = {pos["addr"] for st in self.state["agents"].values()
                     for pos in st["positions"].values() if pos.get("venue") == "curve"}
@@ -1991,7 +2217,8 @@ class Engine:
                 held = True
                 self._to_dex(name, pos, "graduated from pump.fun")
         if not held:
-            self.emit("PUMP", f"${g['symbol']} graduated from pump.fun"
+            name = f"${g['symbol']}" if g["symbol"] != "?" else f"token {short(g['mint'])}"
+            self.emit("PUMP", f"{name} graduated from pump.fun"
                               + (f" at ${price * PUMP_SUPPLY / 1000:.0f}k mcap" if price else ""))
 
     def _curve_exits(self):
@@ -2500,7 +2727,7 @@ function drawChart(series){
   const up=vs[vs.length-1]>=vs[0], col=up?"#5eead4":"#ff8d8d";
   x.strokeStyle="#ffffff10"; x.lineWidth=1;
   for(let i=0;i<4;i++){const y=22+i*(h-44)/3; x.beginPath(); x.moveTo(0,y); x.lineTo(w,y); x.stroke();
-    x.fillStyle="#a68f95"; x.fillText(money(hi-(hi-lo)*i/3,0),8,y-4)}
+    x.fillStyle="#a68f95"; x.fillText(money(hi-(hi-lo)*i/3,hi-lo<30?2:0),8,y-4)}
   const g=x.createLinearGradient(0,0,0,h); g.addColorStop(0,col+"55"); g.addColorStop(1,col+"00");
   x.beginPath(); x.moveTo(X(0),Y(vs[0])); vs.forEach((v,i)=>x.lineTo(X(i),Y(v)));
   x.lineTo(X(vs.length-1),h); x.lineTo(X(0),h); x.closePath(); x.fillStyle=g; x.fill();
@@ -2509,13 +2736,15 @@ function drawChart(series){
   const lx=X(vs.length-1),ly=Y(vs[vs.length-1]); x.beginPath(); x.arc(lx,ly,4.5,0,7); x.fillStyle=col; x.fill();
 }
 
+let demo_mode=false;
 function renderPump(p){
   const dot=$("#pdot");
   if(!p){dot.className="dot dead";$("#pfeed").textContent="pump.fun off";$("#pstat").textContent="";
     setHTML("#pump",'<div class="empty">The pump.fun watcher is off (started with --no-pump).</div>');return}
-  dot.className="dot"+(p.connected?"":" off");
-  $("#pfeed").textContent=p.connected?"pump.fun live":"pump.fun reconnecting";
-  $("#pstat").textContent=`${p.seen} launches, ${p.grads} graduated, ${p.watching} followed, SOL ${money(p.sol_usd)}`;
+  const ok=p.connected||(p.rpc&&p.rpc.connected);
+  dot.className="dot"+(ok?(p.trades||demo_mode?"":" off"):" off");
+  $("#pfeed").textContent=!ok?"pump.fun reconnecting":(p.trades||demo_mode?"pump.fun live":"pump.fun: no trades yet")+(p.rpc&&p.rpc.connected?" (on-chain)":"");
+  $("#pstat").textContent=`${p.seen} launches, ${p.trades==null?"":p.trades+" trades, "}${p.grads} graduated, ${p.watching} followed, SOL ${money(p.sol_usd)}`;
   if(!p.hot.length){setHTML("#pump",`<div class="empty">${p.connected?"Waiting for launches with real buying...":"Connecting to PumpPortal... "+esc(p.error||"")}</div>`);return}
   const flags=q=>[q.held?'<span class="badge b-mine">held</span>':"",q.dev_sold?'<span class="badge b-bad">dev sold</span>':"",
     q.bundle>8?`<span class="badge b-bad">bundle ${q.bundle.toFixed(0)}%</span>`:"",q.serial?'<span class="badge b-bad">serial dev</span>':"",
@@ -2560,6 +2789,10 @@ function render(s){
     b.textContent=(s.halted?"LIVE TRADING HALTED after repeated failed transactions. Check open positions and restart. ":"Real funds at risk. ")+
       (s.wallet?"Wallet "+s.wallet.pub+": "+money(s.wallet.usdc)+" USDC, "+s.wallet.sol.toFixed(4)+" SOL.":"Reading wallet balance...")}
   else if(s.dex&&s.dex.error&&!demo){b.style.display="block";b.textContent="Market data problem: "+s.dex.error+". The bot keeps retrying; check your internet connection or firewall."}
+  else if(s.pump&&!demo&&s.pump.seen>=10&&!s.pump.trades&&(s.pump.connected_for>90||s.pump.rpc)){b.style.display="block";
+    b.textContent="pump.fun: launches are arriving but no trades yet, so Spark and Crest can't buy. "+
+      (s.pump.rpc?(s.pump.rpc.connected?"The on-chain feed is connected and should fill this in.":"On-chain feed: "+(s.pump.rpc.error||"connecting...")+" A free Helius RPC (SOLANA_RPC_URL in .env) usually fixes this."):"")+
+      (s.pump.notices&&s.pump.notices.length?" PumpPortal says: "+s.pump.notices.join(" | "):"")}
   else if(s.pump&&!s.pump.connected&&s.pump.error&&!demo){b.style.display="block";b.textContent="pump.fun feed not connected: "+s.pump.error+". Retrying automatically."}
   else b.style.display="none";
 
@@ -2582,7 +2815,7 @@ function render(s){
   $("#logn").textContent=s.log.length+" recent events";
   setHTML("#log",s.log.map(e=>`<div><span style="color:#a68f95">${hhmm(e.t)}</span> <span class="tag t-${esc(e.tag)}">[${esc(e.tag)}]</span> ${esc(e.msg)}</div>`).join(""));
 
-  renderPump(s.pump); renderFomo(s.fomo,s.fomo_off);
+  demo_mode=demo; renderPump(s.pump); renderFomo(s.fomo,s.fomo_off);
   const d=s.dex||{}; $("#ddot").className="dot"+(d.error?" off":(d.ok_t||demo?"":" dead"));
   $("#dfeed").textContent=d.error?"DexScreener error":(d.ok_t||demo?"DexScreener ok":"DexScreener...");
 
@@ -2729,6 +2962,12 @@ def start_live(args):
     if sol < CFG["live_min_sol"]:
         raise SystemExit(f"\nThe wallet holds {sol:.4f} SOL; at least {CFG['live_min_sol']} is needed for network fees.")
     try:
+        ex.check_route()
+        print(f"  jupiter       ok ({ex.jup})")
+    except Exception as e:
+        raise SystemExit(f"\nJupiter (the swap router) is not answering: {e}\n"
+                         "Get a free API key at https://portal.jup.ag, add JUPITER_API_KEY=<key> to .env, and start again.")
+    try:
         extra = ex.holdings()
         if extra:
             print("  note          the wallet already holds other tokens, which the bot will NOT manage:")
@@ -2774,6 +3013,11 @@ def main():
     ap.add_argument("--poll", type=float, default=None, help="seconds between cycles")
     ap.add_argument("--no-pump", action="store_true", help="do not watch pump.fun")
     ap.add_argument("--no-fomo", action="store_true", help="do not watch Fomo's trending board")
+    ap.add_argument("--pump-rpc", action="store_true",
+                    help="also read pump.fun straight from the chain through your Solana RPC websocket "
+                         "(turns on by itself if PumpPortal sends no trades)")
+    ap.add_argument("--pump-debug", action="store_true",
+                    help="save the first 300 raw pump.fun feed messages to pump_debug.jsonl")
     ap.add_argument("--live", action="store_true", help="enable REAL trading on Solana (see --live-agents)")
     ap.add_argument("--live-agents", default="", help="comma-separated agents to mirror with real money, e.g. Bolt")
     ap.add_argument("--live-usd", type=float, default=CFG["live_usd"],
@@ -2806,6 +3050,7 @@ def main():
     poll = args.poll if args.poll is not None else (1.0 if args.demo else CFG["poll_seconds"])
     src = DemoSource() if args.demo else LiveSource()
     pump = fomo = None
+    CFG["pump_debug"] = args.pump_debug
     if not args.no_pump:
         pump = DemoPump(CFG, clock=time.time) if args.demo else PumpWatcher(CFG)
     if not args.no_fomo:
@@ -2824,6 +3069,8 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     if pump and not args.demo:
         pump.start()
+        if args.pump_rpc:
+            pump.start_rpc()
 
         def fast_loop():
             while True:

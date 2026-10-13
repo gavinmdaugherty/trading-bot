@@ -410,6 +410,99 @@ class CloseEmpty(unittest.TestCase):
         self.assertIsNone(ex.close_empty(m.SolanaLive.USDC))
 
 
+class OnChainFeed(unittest.TestCase):
+    """pump.fun Anchor events, encoded the way the program logs them."""
+
+    @staticmethod
+    def key(n):
+        return bytes([n]) * 32
+
+    def trade(self, mint, user, sol, tok, is_buy, vsol, vtok):
+        return (m.RpcPumpFeed.TRADE + self.key(mint) + struct.pack("<QQB", int(sol * 1e9), int(tok * 1e6), is_buy)
+                + self.key(user) + struct.pack("<qQQ", 0, int(vsol * 1e9), int(vtok * 1e6)) + bytes(64))
+
+    def create(self, mint, user, sym):
+        s = lambda x: struct.pack("<I", len(x)) + x.encode()
+        return (m.RpcPumpFeed.CREATE + s("Name") + s(sym) + s("https://ipfs.io/ipfs/abc")
+                + self.key(mint) + self.key(9) + self.key(user) + bytes(40))
+
+    def note(self, sig, *events, err=None):
+        logs = ["Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]"]
+        logs += ["Program data: " + base64.b64encode(e).decode() for e in events]
+        return {"params": {"result": {"value": {"signature": sig, "err": err, "logs": logs}}}}
+
+    def test_base58(self):
+        self.assertEqual(m.b58encode(bytes(32)), "1" * 32)
+        self.assertEqual(m.b58encode(bytes([0, 0, 1])), "112")
+        try:
+            from solders.pubkey import Pubkey
+        except ImportError:
+            return
+        raw = bytes(range(32))
+        self.assertEqual(m.b58encode(raw), str(Pubkey.from_bytes(raw)))
+
+    def test_create_trades_bundle_and_dedupe(self):
+        now = [1000.0]
+        w = m.PumpWatcher(m.CFG, clock=lambda: now[0])
+        feed = m.RpcPumpFeed(w)
+        mint, dev = m.b58encode(self.key(1)), m.b58encode(self.key(2))
+        # launch transaction: create + the creator's buy + a bundled buy in the same transaction
+        feed.on_notification(self.note("SIG1", self.create(1, 2, "MOON"),
+                                       self.trade(1, 2, 1.0, 30e6, 1, 31.0, 1043e6),
+                                       self.trade(1, 3, 2.0, 55e6, 1, 33.0, 988e6)))
+        q = w.get(mint)
+        self.assertEqual(q["symbol"], "MOON")
+        self.assertAlmostEqual(q["dev_init_pct"], 3.0)
+        self.assertAlmostEqual(q["bundle_pct"], 5.5)   # seen directly on-chain, in the launch block
+        self.assertEqual((q["buyers"], q["n_buys"]), (1, 1))
+        self.assertEqual(w.tokens[mint]["creator"], dev)
+        # a failed transaction changes nothing
+        feed.on_notification(self.note("SIG2", self.trade(1, 4, 5.0, 100e6, 1, 38.0, 888e6), err={"x": 1}))
+        self.assertEqual(w.get(mint)["n_buys"], 1)
+        # the same trade from PumpPortal and from the chain counts once
+        now[0] += 30
+        feed.on_notification(self.note("SIG3", self.trade(1, 5, 1.0, 20e6, 1, 34.0, 968e6)))
+        w.handle(dict(txType="buy", mint=mint, traderPublicKey=m.b58encode(self.key(5)), solAmount=1.0,
+                      tokenAmount=20e6, vSolInBondingCurve=34.0, vTokensInBondingCurve=968e6, signature="SIG3"))
+        self.assertEqual(w.get(mint)["n_buys"], 2)
+        # the creator selling is caught
+        feed.on_notification(self.note("SIG4", self.trade(1, 2, 0.9, 30e6, 0, 33.1, 998e6)))
+        self.assertTrue(w.get(mint)["dev_sold"])
+        # graduation
+        feed.on_notification(self.note("SIG5", m.RpcPumpFeed.COMPLETE + self.key(7) + self.key(1) + self.key(9) + bytes(8)))
+        self.assertEqual([g["mint"] for g in w.pop_migrations()], [mint])
+
+    def test_ignores_garbage(self):
+        w = m.PumpWatcher(m.CFG, clock=lambda: 0.0)
+        feed = m.RpcPumpFeed(w)
+        feed.on_notification({"params": {"result": {"value": {"signature": "S", "err": None,
+                              "logs": ["Program data: !!notbase64", "Program data: " + base64.b64encode(m.RpcPumpFeed.TRADE + b"short").decode(),
+                                       "Program log: hi"]}}}})
+        feed.on_notification({"jsonrpc": "2.0", "result": 5, "id": 1})
+        self.assertEqual(w.tokens, {})
+
+    def test_ws_url(self):
+        old = {k: os.environ.pop(k, None) for k in ("SOLANA_WSS_URL", "SOLANA_RPC_URL")}
+        try:
+            self.assertEqual(m.RpcPumpFeed.ws_url(), "wss://api.mainnet-beta.solana.com")
+            os.environ["SOLANA_RPC_URL"] = "https://mainnet.helius-rpc.com/?api-key=K"
+            self.assertEqual(m.RpcPumpFeed.ws_url(), "wss://mainnet.helius-rpc.com/?api-key=K")
+            os.environ["SOLANA_WSS_URL"] = "wss://x.example"
+            self.assertEqual(m.RpcPumpFeed.ws_url(), "wss://x.example")
+        finally:
+            for k in ("SOLANA_WSS_URL", "SOLANA_RPC_URL"):
+                os.environ.pop(k, None)
+                if old[k] is not None:
+                    os.environ[k] = old[k]
+
+    def test_notices_are_recorded(self):
+        w = m.PumpWatcher(m.CFG, clock=lambda: 0.0)
+        w.handle({"message": "Successfully subscribed to keys."})
+        w.handle({"errors": "API key required for token trades"})
+        self.assertEqual(w.status()["notices"][-1], "API key required for token trades")
+        self.assertEqual(w.status()["kinds"]["(notice)"], 2)
+
+
 class Dashboard(unittest.TestCase):
     def test_nan_is_sanitised(self):
         self.assertEqual(m.finite({"a": [float("nan"), 1.0, float("inf")]}), {"a": [None, 1.0, None]})
