@@ -1625,7 +1625,7 @@ class SolanaLive:
 # --------------------------------------------------------------------------- #
 class Engine:
     def __init__(self, cfg, agents, src, demo=False, live=None, live_names=(),
-                 pump=None, fomo=None, notify=None):
+                 pump=None, fomo=None, notify=None, live_only=False):
         self.cfg, self.src, self.demo, self.live = cfg, src, demo, live
         self.pump, self.fomo, self.notify = pump, fomo, notify
         self.acfg = {}
@@ -1638,6 +1638,8 @@ class Engine:
         for n in live_names:  # each live agent is a real-money twin of a paper agent
             twin = dict(self.acfg[n], name=f"{n} LIVE", style=f"Live twin of {n}", live=True)
             self.acfg[twin["name"]] = twin
+        if live_only and live_names:  # real money only: the paper agents sit this run out
+            self.acfg = {n: a for n, a in self.acfg.items() if a.get("live")}
         self.live_halt = False
         self.live_fails = 0
         self.wallet = None
@@ -1657,6 +1659,10 @@ class Engine:
         self.blocks = {}          # agent -> (tokens checked, {reason it didn't buy: count})
         self.phase, self.phase_t, self.next_at = "starting up", time.time(), None
         self.state = self._load() or self._fresh()
+        lineup = sorted(self.acfg)
+        if self.state.get("lineup") != lineup:  # a different set of agents: restart the balance chart
+            self.state["equity"] = []
+            self.state["lineup"] = lineup
         for name in self.acfg:
             self.state["agents"].setdefault(name, self._fresh_agent(name))
         for st in self.state["agents"].values():
@@ -2541,6 +2547,7 @@ class Engine:
                 best=best, agents=sorted(agents, key=lambda a: -a["equity"]),
                 positions=sorted(positions, key=lambda x: -x["size"]), trades=trades[:30],
                 log=S["log"][-80:][::-1], equity=series, pump=pump, fomo=fomo,
+                real_only=bool(agents) and all(a["live"] for a in agents),
                 fomo_off=self.fomo is None, dex=dict(error=self.dex_err, ok_t=self.dex_ok_t), phase=self.phase, phase_t=self.phase_t,
                 next_at=self.next_at, updated=time.time(), poll=self.cfg["poll_seconds"])
 
@@ -2668,7 +2675,7 @@ td{padding:7px 8px;border-bottom:1px solid #ffffff0c;white-space:nowrap}
 <div class="banner" id="banner"></div>
 
 <section class="grid stats">
-  <div class="card bar" id="balcard"><div class="label">Balance</div><div class="big" id="bal">-</div><div class="small" id="balsub"></div></div>
+  <div class="card bar" id="balcard"><div class="label" id="ballabel">Balance</div><div class="big" id="bal">-</div><div class="small" id="balsub"></div></div>
   <div class="card bar" id="pnlcard"><div class="label">Total P&amp;L</div><div class="big" id="pnl">-</div><div class="small" id="pnlsub"></div></div>
   <div class="card"><div class="label">Largest win</div><div class="big" id="best">-</div><div class="small" id="bestsub"></div></div>
   <div class="card"><div class="label">Win rate</div>
@@ -2797,7 +2804,9 @@ function render(s){
   else b.style.display="none";
 
   $("#bal").textContent=money(s.total);
-  $("#balsub").textContent="started at "+money(s.start,2)+", split across "+s.agents.length+" agents";
+  $("#ballabel").textContent=s.real_only?"Real balance (USDC)":"Balance";
+  $("#balsub").textContent=s.real_only?"started with "+money(s.start,2)+" real USDC, traded by "+s.agents.map(a=>a.name).join(", ")
+    :"started at "+money(s.start,2)+", split across "+s.agents.length+" agents"+(s.mode==="live"?" (paper and live)":"");
   $("#pnl").textContent=smoney(s.pnl); $("#pnl").className="big "+cls(s.pnl);
   const srcs=Object.entries(s.by_src||{}).map(([k,v])=>`${SRC[k]||k} ${smoney(v,0)}`).join(", ");
   $("#pnlsub").textContent=pct(s.pnl_pct)+" since start"+(srcs?" · closed: "+srcs:"");
@@ -3020,10 +3029,14 @@ def main():
                     help="save the first 300 raw pump.fun feed messages to pump_debug.jsonl")
     ap.add_argument("--live", action="store_true", help="enable REAL trading on Solana (see --live-agents)")
     ap.add_argument("--live-agents", default="", help="comma-separated agents to mirror with real money, e.g. Bolt")
+    ap.add_argument("--live-only", action="store_true",
+                    help="with --live: run only the live agents, so the dashboard shows just your real money")
     ap.add_argument("--live-usd", type=float, default=CFG["live_usd"],
                     help="USDC bankroll per live agent: the most each can ever deploy")
     args = ap.parse_args()
 
+    if args.live_only and not args.live:
+        raise SystemExit("--live-only needs --live (it hides the paper agents and shows only real money)")
     if args.live and args.demo:
         raise SystemExit("--live cannot be combined with --demo")
     if args.reset and os.path.exists(CFG["state_file"]):
@@ -3061,6 +3074,7 @@ def main():
             fomo = None
     notify = Notifier()
     engine = Engine(CFG, AGENTS, src, demo=args.demo, live=live, live_names=live_names,
+                    live_only=args.live_only,
                     pump=pump, fomo=fomo, notify=notify)
     if pump and args.demo:
         pump.clock = lambda: engine.t
