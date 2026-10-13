@@ -397,6 +397,24 @@ class LiveSpark(unittest.TestCase):
         self.assertTrue(st["capped"])
         self.assertEqual(self.eng._slot_reason("Spark LIVE", "x", 5), "daily loss cap hit")
 
+    def test_degen_profit_lock_at_1_3x(self):
+        a = self.eng.acfg["Spark LIVE"]
+        a.update(m.RISK["degen"])
+        self.assertTrue(self.eng._buy_curve("Spark LIVE", self.q()))
+        k = m.tkey("solana", "MINT1")
+        st = self.eng.state["agents"]["Spark LIVE"]
+        pos = st["positions"][k]
+        ref = pos["ref_price"]
+        pos["peak"] = ref * 1.25
+        self.eng._check_exit("Spark LIVE", k, pos, ref * 1.10)   # never reached +33%: no lock yet
+        self.assertIn(k, st["positions"])
+        pos["peak"] = ref * 1.36
+        self.eng._check_exit("Spark LIVE", k, pos, ref * 1.32)   # above the floor: keep riding
+        self.assertIn(k, st["positions"])
+        self.eng._check_exit("Spark LIVE", k, pos, ref * 1.29)   # fell back to 1.3x: sell
+        self.assertNotIn(k, st["positions"])
+        self.assertEqual(st["trades"][-1]["reason"], "profit lock 1.3x")
+
     def test_live_blocked_when_wallet_sol_low(self):
         self.eng.wallet = dict(pub="x", usdc=15.0, sol=0.001)
         self.assertEqual(self.eng._live_reason("Spark LIVE"), "wallet SOL too low for fees")

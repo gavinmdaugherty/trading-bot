@@ -210,7 +210,8 @@ RISK = {
                   min_buys_60s=4, max_buys_per_wallet=5.0, max_same_amt=0.5, max_whale=0.7,
                   max_top_pct=10.0, max_top10_pct=45.0, max_dev_pct=10.0, max_bundle_pct=25.0,
                   max_sniper_pct=40.0, max_creator_launches=2, min_socials=0, max_ath_drop=35,
-                  tp=100, tp1=40, sl=-25, trail_act=35, trail=18, max_hold=10, max_new_per_min=5),
+                  tp=100, tp1=40, sl=-25, trail_act=35, trail=18, max_hold=10, max_new_per_min=5,
+                  lock_at=33, lock_floor=30),   # once +33%, never give back below 1.3x
 }
 # Common quick-buy amounts in SOL: many traders using the same button is normal, not a bot farm.
 PRESET_BUYS = (0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5, 10)
@@ -2172,6 +2173,8 @@ class Engine:
             self._sell(name, k, "stop-loss")
         elif pos.get("tp1_done") and ret <= self.cfg["breakeven_pct"]:
             self._sell(name, k, "break-even stop")
+        elif a.get("lock_at") and peak_ret >= a["lock_at"] and ret <= a["lock_floor"]:
+            self._sell(name, k, f"profit lock {1 + a['lock_floor'] / 100:.1f}x")
         elif peak_ret >= a["trail_act"] and price <= pos["peak"] * (1 - a["trail"] / 100):
             self._sell(name, k, "trailing stop")
         elif liq is not None and pos.get("entry_liq") and liq < pos["entry_liq"] * 0.5:
@@ -3094,9 +3097,9 @@ def main():
                     help="save the first 300 raw pump.fun feed messages to pump_debug.jsonl")
     ap.add_argument("--live", action="store_true", help="enable REAL trading on Solana (see --live-agents)")
     ap.add_argument("--live-agents", default="", help="comma-separated agents to mirror with real money, e.g. Bolt")
-    ap.add_argument("--risk", choices=["low", "medium", "high", "degen"], default="medium",
-                    help="how picky Spark is: low (strictest), medium (default), high, degen (trenching: "
-                         "seconds-old launches, most of them die)")
+    ap.add_argument("--risk", choices=["low", "medium", "high", "degen"], default="degen",
+                    help="how picky Spark is: low (strictest), medium, high, degen (default; trenching: "
+                         "seconds-old launches, profit locked at 1.3x once a trade reaches +33%%)")
     ap.add_argument("--daily-loss", type=float, default=CFG["daily_loss_pct"],
                     help="stop an agent opening trades after it loses this %% of its bankroll in a day "
                          "(default 0 = no daily cap)")

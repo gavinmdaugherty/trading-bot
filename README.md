@@ -45,7 +45,7 @@ Before a pump.fun entry, these checks are computed live from the trade stream. E
 | Bot activity | Many identical-size buys, a few wallets churning volume, or one whale making most of the move |
 | Momentum | Thin curve, too few holders, fading buys over the last minute, dumping off the high |
 
-`--risk low|medium|high|degen` sets how picky Spark is (default `medium`). `degen` is for trenching: it buys launches from 8 seconds old with real buying, and exits faster. `low` uses the strictest settings, and `high` lets through younger, thinner launches. Every level keeps the hard rug checks: creator selling, bundled supply, serial launchers, copycat tickers and reused socials. Common quick-buy sizes (0.1, 0.5, 1 SOL and so on) don't count as bot buys.
+`--risk low|medium|high|degen` sets how picky Spark is (default `degen`). `degen` is for trenching: it buys launches from 8 seconds old with real buying and exits faster. Once a trade is up 33%, it sells if the price falls back to 1.3x, so it can't give back that profit. `low` uses the strictest settings, and `high` lets through younger, thinner launches. Every level keeps the hard rug checks: creator selling, bundled supply, serial launchers, copycat tickers and reused socials. Common quick-buy sizes (0.1, 0.5, 1 SOL and so on) don't count as bot buys.
 
 If the creator sells while an agent holds the token, the curve agents exit at once. A curve position that graduates moves over to DEX pricing automatically.
 
