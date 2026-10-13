@@ -1043,8 +1043,9 @@ class SolanaLive:
         self._VT = VersionedTransaction
         secret = os.environ.get("MEMEBOT_SOLANA_KEY", "").strip()
         if not secret:
-            raise SystemExit("Set the MEMEBOT_SOLANA_KEY environment variable to the private key of a "
-                             "dedicated bot wallet (see the setup steps).")
+            raise SystemExit("No wallet key found. Put a file named .env next to memebot.py containing\n"
+                             "    MEMEBOT_SOLANA_KEY=<private key of a dedicated bot wallet>\n"
+                             "or set the MEMEBOT_SOLANA_KEY environment variable.")
         try:
             self.kp = (Keypair.from_bytes(bytes(json.loads(secret))) if secret.startswith("[")
                        else Keypair.from_base58_string(secret))
@@ -2336,10 +2337,13 @@ def start_live(args):
 def load_env_file(path=None):
     """Read KEY=VALUE lines from a .env file next to this script (kept out of git by .gitignore).
     Variables already set in the environment win."""
-    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if not os.path.exists(path):
+    if path is None:  # Windows often saves a downloaded .env as "env" or ".env.txt"
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = next((os.path.join(here, n) for n in (".env", ".env.txt", "env", "env.txt")
+                     if os.path.exists(os.path.join(here, n))), None)
+    if not path or not os.path.exists(path):
         return
-    with open(path) as f:
+    with open(path, encoding="utf-8-sig") as f:  # tolerate a BOM from Notepad
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
