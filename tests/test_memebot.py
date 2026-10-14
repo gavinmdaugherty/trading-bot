@@ -1592,7 +1592,10 @@ class WhoTrades(unittest.TestCase):
         self.assertEqual(names(m.trading_agents(m.AGENTS)), ["Spark"])
         self.assertEqual(names(m.trading_agents(m.AGENTS, live_names=["Bolt"])), ["Bolt", "Spark"])
         self.assertEqual(len(m.trading_agents(m.AGENTS, paper_agents=True)), len(m.AGENTS))
-        self.assertEqual(len(m.trading_agents(m.AGENTS, pump=False)), len(m.AGENTS))   # nothing to scout
+        no_pump = m.trading_agents(m.AGENTS, pump=False)                                 # nothing to scout or follow
+        self.assertEqual(len(no_pump), len(m.AGENTS) - 1)
+        self.assertNotIn("Hawk", names(no_pump))
+        self.assertIn("Hawk", names(m.trading_agents(m.AGENTS, watchlist=True)))
 
 
 class DataFiles(unittest.TestCase):
@@ -1656,6 +1659,125 @@ class MemoryPage(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+class Watchlist(unittest.TestCase):
+    A = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"
+    B = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
+
+    def test_parse(self):
+        text = (f"# comment\ncopy {self.A} good trader\nsnipe {self.B}\ncopy {self.B}\n"
+                "snipe notawallet\nwatch something\n")
+        w, bad = m.parse_watchlist(text)
+        self.assertEqual(w[self.A], dict(mode="copy", label="good trader"))
+        self.assertEqual(w[self.B]["mode"], "both")                 # listed twice: both
+        self.assertEqual(len(bad), 2)
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "watchlist.txt")
+        self.assertEqual(m.load_watchlist(path), ({}, []))
+        with open(path) as f:
+            self.assertIn("snipe <wallet>", f.read())               # a starter file with instructions
+
+    def engine(self, live=None, watch=None, **cfg):
+        c = dict(m.CFG, demo_watch=watch or {"COPYME": dict(mode="copy", label="pal"),
+                                             "DEVX": dict(mode="snipe", label="dev")}, **cfg)
+        src = m.DemoSource()
+        pump = m.DemoPump(c, clock=time.time)
+        names = [a for a in m.AGENTS if a["name"] in ("Spark", "Hawk")]
+        eng = m.Engine(c, names, src, demo=True, pump=pump, live=live, live_names=["Hawk"] if live else ())
+        pump.clock = lambda: eng.t
+        eng.wallet = dict(pub="x", usdc=15.0, sol=0.05)
+        eng._load_watch()
+        return eng
+
+    def create(self, eng, mint, dev):
+        eng.pump.handle(dict(txType="create", mint=mint, traderPublicKey=dev, symbol=mint, name=mint, initialBuy=20e6,
+                             solAmount=0.6, vSolInBondingCurve=30.6, vTokensInBondingCurve=m.PUMP_V_TOK0 - 20e6, pool="pump"))
+
+    def trade(self, eng, mint, side, who, sol, bal, amt=0.0):
+        eng.pump.handle(dict(txType=side, mint=mint, traderPublicKey=who, solAmount=sol, tokenAmount=amt,
+                             newTokenBalance=bal, vSolInBondingCurve=33.0, vTokensInBondingCurve=980e6, pool="pump"))
+
+    def test_snipes_a_watched_creators_launch(self):
+        eng = self.engine()
+        self.create(eng, "SNIPED", "DEVX")
+        eng._follow_pass()
+        pos = eng.state["agents"]["Hawk"]["positions"].get(m.tkey("solana", "SNIPED"))
+        self.assertIsNotNone(pos)
+        self.assertEqual(pos["follow"], "DEVX")
+        self.assertAlmostEqual(pos["size"], m.CFG["follow_usd"] if m.CFG["follow_usd"] >= m.CFG["min_trade_usd"]
+                               else m.CFG["min_trade_usd"])
+        self.assertIn("bought", eng.follow_log[-1]["note"])
+
+    def test_copies_buys_and_sells(self):
+        eng = self.engine()
+        self.create(eng, "C1", "SOMEDEV")
+        self.trade(eng, "C1", "buy", "COPYME", 0.5, 10e6)
+        self.trade(eng, "C1", "buy", "COPYME", 0.01, 10.2e6)        # dust: ignored
+        eng._follow_pass()
+        k = m.tkey("solana", "C1")
+        st = eng.state["agents"]["Hawk"]
+        self.assertIn(k, st["positions"])
+        self.assertEqual(len(eng.follow_log), 1)
+        units = st["positions"][k]["units"]
+        self.trade(eng, "C1", "sell", "COPYME", 0.2, 5.1e6, amt=5.1e6)  # sold half
+        eng._follow_pass()
+        self.assertAlmostEqual(st["positions"][k]["units"], units * (1 - 5.1 / 10.2), places=3)
+        self.trade(eng, "C1", "sell", "COPYME", 0.2, 0, amt=5.1e6)      # sold the rest
+        eng._follow_pass()
+        self.assertNotIn(k, st["positions"])
+        self.assertIn("copied pal selling", st["trades"][-1]["reason"])
+
+    def test_copies_a_coin_it_was_not_following(self):
+        eng = self.engine()
+        self.trade(eng, "OLDCOIN", "buy", "COPYME", 0.5, 10e6)          # no create seen for this one
+        eng._follow_pass()
+        self.assertIn(m.tkey("solana", "OLDCOIN"), eng.state["agents"]["Hawk"]["positions"])
+
+    def test_red_flags_skip_unless_unchecked(self):
+        eng = self.engine()
+        self.create(eng, "BUND", "SOMEDEV")
+        with eng.pump.lock:
+            eng.pump.tokens["BUND"]["unseen_first"] = 400e6                 # 40% bundled
+        self.trade(eng, "BUND", "buy", "COPYME", 0.5, 10e6)
+        eng._follow_pass()
+        self.assertNotIn(m.tkey("solana", "BUND"), eng.state["agents"]["Hawk"]["positions"])
+        self.assertIn("bundled launch", eng.follow_log[-1]["note"])
+        eng2 = self.engine(follow_checks=False)
+        self.create(eng2, "BUND", "SOMEDEV")
+        with eng2.pump.lock:
+            eng2.pump.tokens["BUND"]["unseen_first"] = 400e6
+        self.trade(eng2, "BUND", "buy", "COPYME", 0.5, 10e6)
+        eng2._follow_pass()
+        self.assertIn(m.tkey("solana", "BUND"), eng2.state["agents"]["Hawk"]["positions"])
+
+    def test_hourly_cap(self):
+        eng = self.engine(follow_max_per_hour=2)
+        eng.acfg["Hawk"]["max_open"] = 10
+        for i in range(3):
+            self.create(eng, f"H{i}", "SOMEDEV")
+            self.trade(eng, f"H{i}", "buy", "COPYME", 0.5, 10e6)
+        eng._follow_pass()
+        self.assertEqual(len(eng.state["agents"]["Hawk"]["positions"]), 2)
+        self.assertIn("hourly cap", eng.follow_log[-1]["note"])
+
+    def test_live_hawk_uses_the_real_money_path(self):
+        live = FakeLive()
+        eng = self.engine(live=live, live_usd=15.0)
+        self.create(eng, "LV", "DEVX")
+        eng._follow_pass()
+        self.assertEqual(live.calls[0][0], "buy")
+        pos = eng.state["agents"]["Hawk LIVE"]["positions"][m.tkey("solana", "LV")]
+        self.assertTrue(pos["live"] and pos["follow"] == "DEVX")
+        snap = eng.snapshot()
+        self.assertEqual(len(snap["follow"]["wallets"]), 2)
+        self.assertTrue(snap["follow"]["on"])
+
+    def test_spark_does_not_trade_the_watchlist_path(self):
+        eng = self.engine()
+        self.create(eng, "SNIPED", "DEVX")
+        eng._follow_pass()
+        self.assertEqual(eng.state["agents"]["Spark"]["positions"], {})
 
 
 if __name__ == "__main__":

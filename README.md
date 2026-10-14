@@ -79,6 +79,26 @@ If the creator sells while an agent holds the token, the curve agents exit at on
 
 **Live pump.fun trading:** `--live --live-agents Spark --live-usd 15` makes Spark trade real USDC. Jupiter routes each buy to the bonding curve, with a 10% slippage cap, and a buy is refused if the route price is more than 10% above the curve price. After a full sell, the bot closes the empty token account to get its rent (about 0.002 SOL) back. With a small bankroll it skips partial take-profits that would be below the $5 minimum order.
 
+## Hawk: snipe and copy wallets
+
+List wallets in `watchlist.txt` (next to `memebot.py`; Spark creates it with instructions on first start), one per line:
+
+```
+snipe <wallet> [name]   buy the moment this wallet launches a new pump.fun coin
+copy  <wallet> [name]   buy when this wallet buys a pump.fun coin, sell when it sells
+both  <wallet> [name]   both
+```
+
+Saved changes apply within 10 seconds. How Hawk trades the list:
+- It acts on the fast loop the moment the trade lands on-chain. A wallet's partial sells are copied as the same fraction.
+- Each buy is `follow_usd` ($5), at most `follow_max_per_hour` (10) an hour, with up to 3 positions open.
+- Buys under 0.05 SOL by a copied wallet are ignored.
+- It skips launches with red flags: the creator already sold, a bundle over 30%, a creator who rugged before (unless that creator is the one you're sniping), known rug wallets in early, or a scout veto. `--follow-unchecked` turns these checks off.
+- Its own exits still apply as a safety net: −30% stop, a profit lock once up 50%, a trailing stop, and a 2-hour limit.
+- Hawk paper-trades whenever the watchlist has wallets. For real money: `--live --live-agents Spark,Hawk` (`--live-usd` is per agent). Add `--direct`, since brand-new launches usually have no Jupiter route yet.
+- The dashboard's Watchlist panel shows each wallet with what Hawk copied and skipped, and why.
+- Copying covers pump.fun bonding-curve trades, which is what the on-chain feed sees. Trades after a coin graduates aren't copied, but Hawk still sells on its own exits.
+
 ## Spark learns as it goes
 
 Spark trains a small model on what actually happens to pump.fun launches:

@@ -146,6 +146,12 @@ CFG = dict(
     pumpportal_trade="https://pumpportal.fun/api/trade-local",
     live_direct_priority_sol=0.0003,   # priority fee per direct transaction, in SOL
     live_direct_max_fails=3,     # direct route errors in a row before it is switched off for the run
+    # ---- watchlist (Hawk): snipe chosen creators' launches, copy chosen wallets' trades ----
+    watchlist_file="watchlist.txt",
+    follow_usd=5.0,              # per Hawk buy (live orders are at least live_min_trade_usd)
+    follow_max_per_hour=10,      # most Hawk buys an hour, whatever the watchlist does
+    follow_min_sol=0.05,         # ignore a copied wallet's buys smaller than this (dust, tests)
+    follow_checks=True,          # skip launches with red flags (bundles, a rugger creator, a scout veto)
     # ---- automatic stop: real results far worse than practice ----
     bench_min=10,                # real trades needed before the comparison counts
     bench_window=20,             # compare the latest this-many real trades
@@ -207,6 +213,11 @@ AGENTS = [
          max_ath_drop=15, exit_dev_sell=True,
          tp=45, sl=-18, trail_act=25, trail=12, max_hold=45,
          pos_pct=0.06, max_open=3, max_new_per_min=1),
+    # Hawk trades the watchlist (watchlist.txt): it buys the moment a chosen creator launches, and
+    # copies chosen wallets' pump.fun buys and sells. Its own exits still apply as a safety net.
+    dict(name="Hawk",   style="Snipes and copies your watchlist", venue="curve", need="follow",
+         exit_dev_sell=True, tp=200, sl=-30, trail_act=50, trail=25, max_hold=120, lock_at=50, lock_floor=25,
+         pos_pct=0.05, max_open=3),
     dict(name="Grad",   style="Fresh pump.fun graduates", need="grad",
          min_liq=15_000, min_vol_h1=15_000, min_chg_h1=-10, max_chg_h1=400, min_chg_m5=0,
          min_age=0, max_age=180, min_buy_ratio=1.10, min_vol_liq=0.5,
@@ -753,6 +764,8 @@ class PumpWatcher:
         self.want_rpc = False
         self.memory = None
         self.wake = threading.Event()   # set on every launch or trade, so Spark decides as data lands
+        self.follow = {}                 # watchlist: wallet -> "snipe" | "copy" | "both"
+        self.follow_events = deque(maxlen=500)
         self.traders = {}        # wallet -> [last mint traded, launches traded]: veterans vs fresh wallets
         self.dev_q = deque(maxlen=200)
         self.dev_cache = {}      # creator wallet -> (wallet age in hours, transactions seen)
@@ -1029,9 +1042,14 @@ class PumpWatcher:
         if dev and init > 0:
             t["holders"][dev] = init
         self.seen += 1
+        if self.follow.get(dev) in ("snipe", "both"):
+            self.follow_events.append(dict(kind="snipe", mint=mint, wallet=dev, t=now, sol=num(m, "solAmount")))
 
     def _on_trade(self, m, is_buy, now):
         t = self.tokens.get(m["mint"])
+        copier = self.follow.get(m.get("traderPublicKey") or "") in ("copy", "both")
+        if not t and copier and is_buy:   # a copied wallet buying a coin we were not following: follow it now
+            t = self._new(m["mint"], now)
         if not t:
             return
         c = self.cfg
@@ -1062,6 +1080,13 @@ class PumpWatcher:
                 seen[0], seen[1] = t["mint"], seen[1] + 1
         prev = t["holders"].get(trader, 0.0)
         new_bal = num(m, "newTokenBalance", default=prev + (amt if is_buy else -amt))
+        if copier:
+            if is_buy and sol >= self.cfg["follow_min_sol"]:
+                self.follow_events.append(dict(kind="buy", mint=t["mint"], wallet=trader, t=now, sol=sol))
+            elif not is_buy:
+                sold = amt if amt > 0 else max(0.0, prev - new_bal)
+                frac = 1.0 if prev <= 0 or new_bal <= 0 else min(1.0, sold / prev)
+                self.follow_events.append(dict(kind="sell", mint=t["mint"], wallet=trader, t=now, sol=sol, frac=frac))
         if not is_buy and prev >= 0.01 * PUMP_SUPPLY:  # a 1%+ holder selling
             t["whale_sells"].append((now, amt if amt > 0 else max(0.0, prev - new_bal)))
         elif is_buy and prev >= 0.01 * PUMP_SUPPLY:  # ...or an existing one buying back: nets it out
@@ -1183,9 +1208,9 @@ class PumpWatcher:
             c_rugs = c_wins = smart = rugw = smart_now = 0
             th_lift = th_heat = 0.0
         vets = sum(1 for tr in uniq if self.traders.get(tr, (None, 0))[1] >= 3)
-        whale_sold = max(0.0, sum(a for ts, a in t["whale_sells"] if ts >= w)) / PUMP_SUPPLY * 100  # net
+        whale_sold = min(100.0, max(0.0, sum(a for ts, a in t["whale_sells"] if ts >= w)) / PUMP_SUPPLY * 100)  # net
         usd = self.sol_usd
-        q = dict(chain="solana", addr=t["mint"], symbol=t["symbol"], name=t["name"], venue="curve",
+        q = dict(chain="solana", addr=t["mint"], symbol=t["symbol"], name=t["name"], venue="curve", creator=t["creator"],
                  price=price_sol * usd, price_sol=price_sol, vsol=t["vsol"], vtok=t["vtok"],
                  real_sol=max(0.0, t["vsol"] - PUMP_V_SOL0) if t["vsol"] else 0.0,
                  mcap=price_sol * PUMP_SUPPLY * usd, prog=curve_progress(t["vtok"]) if t["vtok"] else 0.0,
@@ -1287,6 +1312,12 @@ class PumpWatcher:
         out = []
         while self.events:
             out.append(self.events.popleft())
+        return out
+
+    def pop_follow(self):
+        with self.lock:
+            out = list(self.follow_events)
+            self.follow_events.clear()
         return out
 
     def pop_migrations(self):
@@ -2889,6 +2920,10 @@ class Engine:
         self.on_desk = None             # the launch Spark is weighing right now
         self.trend_t = -1e12
         self.snap_t = 0.0
+        self.watch, self.watch_bad, self.watch_t = {}, [], -1e12
+        self.follow_log = deque(maxlen=60)      # what Hawk saw its wallets do, and what it did
+        self.follow_stats = {}                  # wallet -> dict(seen=, copied=, skipped=, last=)
+        self.follow_buys = {}                   # agent -> buy times, for the hourly cap
         self.report_t = 0.0
         self.blocks = {}          # agent -> (tokens checked, {reason it didn't buy: count})
         self.phase, self.phase_t, self.next_at = "starting up", time.time(), None
@@ -3296,12 +3331,12 @@ class Engine:
             return self.learner.best_exit(curve_stage(q["prog"]))
         return "base"
 
-    def _buy_curve(self, name, q):
+    def _buy_curve(self, name, q, size=None):
         a, st, c = self.acfg[name], self.state["agents"][name], self.cfg
         live = a.get("live")
         min_t = c["live_min_trade_usd"] if live else c["min_trade_usd"]
-        size = min(st["cash"], max(min_t, a["pos_pct"] * self._equity(st)),
-                   q["vsol"] * c["pump_max_impact"] * self.sol_usd)
+        want = size if size is not None else max(min_t, a["pos_pct"] * self._equity(st))
+        size = min(st["cash"], max(min_t, want), q["vsol"] * c["pump_max_impact"] * self.sol_usd)
         if live:
             size = min(size, c["live_max_trade_usd"])
         if size < min_t:
@@ -3654,6 +3689,7 @@ class Engine:
                                   f"{ps['kinds']}). Switching on the on-chain feed through your Solana RPC.")
                 self.pump.start_rpc()
             self._curve_exits()
+            self._follow_pass()
             if self.learner:
                 self._shadow_tick()
             held = {pos["addr"] for st in self.state["agents"].values()
@@ -3751,6 +3787,106 @@ class Engine:
                                             use=L.best_exit(stage) if pick else None)
             self.shadowed[m] = (self.t, count + 1)
 
+    # ---- watchlist (Hawk) -------------------------------------------------------- #
+    def _load_watch(self):
+        """Re-read watchlist.txt every 10 seconds, so edits apply without a restart."""
+        if self.t - self.watch_t < 10:
+            return
+        self.watch_t = self.t
+        if self.demo:
+            watch, bad = self.cfg.get("demo_watch") or {}, []
+        else:
+            watch, bad = load_watchlist(self.cfg["watchlist_file"])
+        if watch != self.watch:
+            added = [w["label"] for a, w in watch.items() if a not in self.watch]
+            if added and self.watch_t > 0:
+                self.emit("RISK", "watchlist: now following " + ", ".join(added))
+        self.watch, self.watch_bad = watch, bad
+        with self.pump.lock:
+            self.pump.follow = {a: w["mode"] for a, w in watch.items()}
+
+    def _follow_reason(self, q, ev):
+        """Red flags that stop a watchlist buy (unless follow_checks is off)."""
+        if q["migrated"] or q["complete"]:
+            return "already graduated"
+        if not self.cfg["follow_checks"]:
+            return None
+        if ev["kind"] == "buy" and q["dev_sold"]:
+            return "creator already sold"
+        if q["bundle_pct"] > 30:
+            return f"bundled launch ({q['bundle_pct']:.0f}%)"
+        if q.get("creator_rugs", 0) >= 1 and self.watch.get(q.get("creator") or "") is None:
+            return "creator rugged before"
+        if q.get("rugger_early", 0) >= 3:
+            return "known rug wallets bought early"
+        if self.scouts:
+            self.scouts.review(q, count=False)
+            if q.get("scout_veto"):
+                return f"scout veto ({q['scout_veto'][0]}: {q['scout_veto'][1]})"
+        return None
+
+    def _follow_note(self, ev, sym, what, did):
+        w = self.watch.get(ev["wallet"]) or dict(label=short(ev["wallet"]))
+        stt = self.follow_stats.setdefault(ev["wallet"], dict(seen=0, copied=0, skipped=0, last=None))
+        stt["seen"] += 1
+        stt["copied" if did else "skipped"] += 1
+        stt["last"] = self.t
+        self.follow_log.append(dict(t=self.t, label=w["label"], wallet=ev["wallet"], kind=ev["kind"], symbol=sym,
+                                    did=did, note=what))
+
+    def _follow_pass(self):
+        """Act on what the watchlist wallets just did: a snipe target launched, a copied wallet bought
+        or sold. Runs on the fast loop, so it reacts within a moment of the trade landing."""
+        names = [n for n, a in self.acfg.items() if a.get("need") == "follow"]
+        self._load_watch()
+        events = self.pump.pop_follow()
+        if not names or not events:
+            return
+        c = self.cfg
+        for ev in events:
+            q = self.pump.get(ev["mint"])
+            sym = q["symbol"] if q and q["symbol"] != "?" else short(ev["mint"])
+            who = (self.watch.get(ev["wallet"]) or dict(label=short(ev["wallet"])))["label"]
+            if ev["kind"] == "sell":
+                done = False
+                for name in names:
+                    st = self.state["agents"][name]
+                    k = tkey("solana", ev["mint"])
+                    pos = st["positions"].get(k)
+                    if pos and pos.get("follow") == ev["wallet"]:
+                        frac = 1.0 if ev["frac"] >= 0.9 else ev["frac"]
+                        if frac >= 0.05:
+                            self._sell(name, k, f"copied {who} selling", frac=frac)
+                            done = True
+                if done:
+                    self._follow_note(ev, sym, f"sold {ev['frac'] * 100:.0f}% of ${sym}: we sold too", True)
+                continue
+            if not q or q["price"] <= 0:
+                continue
+            verb = "launched" if ev["kind"] == "snipe" else f"bought {ev['sol']:.2f} SOL of"
+            red = self._follow_reason(q, ev)
+            bought, whys = [], [red] if red else []
+            for name in ([] if red else names):   # each Hawk (paper and live) decides for itself
+                st, k = self.state["agents"][name], tkey("solana", ev["mint"])
+                recent = self.follow_buys.setdefault(name, deque(maxlen=200))
+                why = (self._live_reason(name) or self._slot_reason(
+                    name, k, c["live_min_trade_usd"] if self.acfg[name].get("live") else c["min_trade_usd"]))
+                if not why and sum(1 for t in recent if self.t - t < 3600) >= c["follow_max_per_hour"]:
+                    why = f"hourly cap ({c['follow_max_per_hour']} buys)"
+                if not why and not self._buy_curve(name, q, size=c["follow_usd"]):
+                    why = "order not placed"
+                if why:
+                    whys.append(f"{name}: {why}" if len(names) > 1 else why)
+                    continue
+                recent.append(self.t)
+                st["positions"][k]["follow"] = ev["wallet"]
+                bought.append(name)
+                self.emit("EXEC", f"{name}: {who} {verb} ${sym}, copied")
+            if bought:
+                self._follow_note(ev, sym, f"{verb} ${sym}: bought ({', '.join(bought)})", True)
+            else:
+                self._follow_note(ev, sym, f"{verb} ${sym}: skipped, {'; '.join(whys) or 'no Hawk could buy'}", False)
+
     def _vbook_room(self, a, mint):
         """Could Spark have bought this launch right now? Same limits as a real position."""
         if mint in self.vbook or self.t - self.vcool.get(mint, -1e12) < self.cfg["cooldown_min"] * 60:
@@ -3814,7 +3950,7 @@ class Engine:
                 del self.vbook[m_]
 
     def _curve_entries(self):
-        names = [n for n, a in self.acfg.items() if a.get("venue") == "curve"]
+        names = [n for n, a in self.acfg.items() if a.get("venue") == "curve" and a.get("need") != "follow"]
         if not names:
             return
         cands = sorted(self.pump.candidates(self.t), key=lambda q: -q["score"])
@@ -4204,6 +4340,12 @@ class Engine:
                 memory=self.memory.summary() if self.memory else None,
                 brain=self.brain.status() if self.brain else None,
                 themes=self.memory.hot_themes(self.t, 6) if self.memory else [],
+                follow=dict(wallets=[dict(addr=a, label=w["label"], mode=w["mode"], **self.follow_stats.get(
+                                     a, dict(seen=0, copied=0, skipped=0, last=None))) for a, w in self.watch.items()],
+                            log=list(self.follow_log)[::-1][:25], bad=self.watch_bad,
+                            file=os.path.basename(self.cfg["watchlist_file"]),
+                            on=any(a.get("need") == "follow" for a in self.acfg.values()))
+                if self.pump else None,
                 scouts=dict(squad=self.scouts.summary(None if self.demo else self.pump.dev_stats),
                             desk=list(self.desk)[::-1], now=self.on_desk)
                 if self.scouts else None,
@@ -4639,6 +4781,8 @@ td:first-child{font-weight:600}
 
 <section class="card squad" id="squad" style="display:none"></section>
 
+<section class="card squad" id="watch" style="display:none"></section>
+
 <section class="grid mid">
   <div class="card chartcard"><div class="row"><div class="label" style="margin:0">Balance history</div><div class="small" id="range" style="margin:0"></div></div><canvas id="chart"></canvas></div>
   <div class="card"><div class="row"><div class="label" style="margin:0">Activity log</div><div class="small" id="logn" style="margin:0"></div></div><div class="log" id="log"></div></div>
@@ -4806,6 +4950,22 @@ function renderSquad(S){
       ${calls?`<h3 style="margin-top:14px">Recent calls</h3><div class="calls">${calls}</div>`:""}</div>
     <div><h3>Scout squad · reporting to Spark</h3><div class="scouts">${squad}</div></div>`);
 }
+// Hawk: the wallets on the watchlist and what it did about them
+function renderWatch(F){
+  const el=$("#watch");
+  if(!F){el.style.display="none";return}
+  el.style.display="grid";
+  const mode={snipe:"snipes launches",copy:"copies trades",both:"snipes + copies"};
+  const rows=F.wallets.length?`<table><tr><th>Wallet</th><th>Mode</th><th>Seen</th><th>Copied</th><th>Skipped</th><th>Last</th></tr>`+
+    F.wallets.map(w=>`<tr><td><a href="https://solscan.io/account/${esc(w.addr)}" target="_blank" rel="noopener" style="color:var(--text)">${esc(w.label)}</a></td>
+      <td class="mute">${mode[w.mode]||esc(w.mode)}</td><td>${w.seen}</td><td class="up">${w.copied}</td><td class="mute">${w.skipped}</td>
+      <td class="mute">${w.last?hhmm(w.last):"-"}</td></tr>`).join("")+"</table>"
+    :`<div class="empty">No wallets yet. Open <b>${esc(F.file)}</b> next to memebot.py and add lines like<br><code>copy &lt;wallet&gt; name</code> or <code>snipe &lt;wallet&gt; name</code>. Changes apply within 10 seconds.</div>`;
+  const bad=(F.bad||[]).length?`<div class="small" style="color:var(--down)">${F.bad.map(esc).join("<br>")}</div>`:"";
+  const log=(F.log||[]).map(e=>`<div><span class="mute">${hhmm(e.t)}</span> <b>${esc(e.label)}</b> <span class="${e.did?"up":"mute"}">${esc(e.note)}</span></div>`).join("");
+  setHTML("#watch",`<div><h3>Watchlist · Hawk ${F.on?"":'<span class="mute" style="text-transform:none;letter-spacing:0">(Hawk is off: add wallets, then restart)</span>'}</h3>${rows}${bad}</div>
+    <div><h3>What they did</h3><div class="calls" style="max-height:260px;margin-top:0">${log||'<span class="mute small">Nothing yet. Hawk acts the moment a wallet on the list launches, buys or sells.</span>'}</div></div>`);
+}
 function brainTxt(B,T){
   let out="";
   if(T&&T.length)out+=`<br><span class="t">Hot themes</span> `+T.map(t=>esc(t[0])).join(", ");
@@ -4914,7 +5074,7 @@ function render(s){
   $("#logn").textContent=s.log.length+" recent events";
   renderLog(s.log);
 
-  demo_mode=demo; renderPump(s.pump); renderFomo(s.fomo,s.fomo_off); renderTape(s); renderSpot(s); renderSquad(s.scouts);
+  demo_mode=demo; renderPump(s.pump); renderFomo(s.fomo,s.fomo_off); renderTape(s); renderSpot(s); renderSquad(s.scouts); renderWatch(s.follow);
   const d=s.dex||{}; $("#ddot").className="dot"+(d.error?" off":(d.ok_t||demo?"":" dead"));
   $("#dfeed").textContent=d.error?"DexScreener error":(d.ok_t||demo?"DexScreener ok":"DexScreener...");
 
@@ -5261,7 +5421,60 @@ def start_live(args):
     return ex, names
 
 
-DATA_KEYS = ("state_file", "learn_file", "memory_file", "report_file", "stop_file")
+DATA_KEYS = ("state_file", "learn_file", "memory_file", "report_file", "stop_file", "watchlist_file")
+
+WATCHLIST_TEMPLATE = """# Spark watchlist: Hawk trades the wallets listed here. One wallet per line:
+#
+#   snipe <wallet> [name]   buy the moment this wallet launches a new pump.fun coin
+#   copy  <wallet> [name]   buy when this wallet buys a pump.fun coin, sell when it sells
+#   both  <wallet> [name]   both of the above
+#
+# Example (remove the # to use it):
+#   copy  9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM  good-trader
+#
+# Lines starting with # are ignored. Saved changes apply within 10 seconds, no restart needed.
+# Hawk trades with real money only when started with --live --live-agents Spark,Hawk.
+"""
+B58_CHARS = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+
+def parse_watchlist(text, strict=True):
+    """(wallets, problems). wallets: address -> dict(mode="snipe"|"copy"|"both", label)."""
+    out, bad = {}, []
+    for i, line in enumerate(text.splitlines(), 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        mode = parts[0].lower()
+        if mode not in ("snipe", "copy", "both") or len(parts) < 2:
+            bad.append(f"line {i}: start with snipe, copy or both, then the wallet")
+            continue
+        addr = parts[1]
+        if strict and not (32 <= len(addr) <= 44 and set(addr) <= B58_CHARS):
+            bad.append(f"line {i}: {addr[:12]}... is not a Solana wallet address")
+            continue
+        old = out.get(addr)
+        if old and old["mode"] != mode:
+            mode = "both"
+        out[addr] = dict(mode=mode, label=" ".join(parts[2:])[:24] or (addr[:4] + "…" + addr[-4:]))
+    return out, bad
+
+
+def load_watchlist(path, create=True):
+    if not os.path.exists(path):
+        if create:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(WATCHLIST_TEMPLATE)
+            except OSError:
+                pass
+        return {}, []
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            return parse_watchlist(f.read())
+    except OSError as e:
+        return {}, [f"could not read {path}: {e}"]
 
 
 def anchor_data_files(cfg, here=None, cwd=None):
@@ -5287,12 +5500,15 @@ def anchor_data_files(cfg, here=None, cwd=None):
     return notes
 
 
-def trading_agents(agents, paper_agents=False, live_names=(), pump=True):
-    """Who trades this run. By default only Spark (plus any live agents); the others are its scouts.
-    Without pump.fun there is nothing to scout, so everyone trades as before."""
-    if paper_agents or not pump:
+def trading_agents(agents, paper_agents=False, live_names=(), pump=True, watchlist=False):
+    """Who trades this run. By default only Spark (plus any live agents, and Hawk when the watchlist
+    has wallets); the others are its scouts. Without pump.fun there is nothing to scout or follow,
+    so the DEX agents trade as before."""
+    if not pump:
+        return [a for a in agents if a.get("need") != "follow"]
+    if paper_agents:
         return agents
-    keep = {"Spark", *live_names}
+    keep = {"Spark", *live_names} | ({"Hawk"} if watchlist else set())
     return [a for a in agents if a["name"] in keep]
 
 
@@ -5353,6 +5569,9 @@ def main():
     ap.add_argument("--paper-agents", action="store_true",
                     help="let the other agents paper-trade as well, as before. By default they work as Spark's "
                          "scouts and only Spark (and any --live-agents) trades")
+    ap.add_argument("--follow-unchecked", action="store_true",
+                    help="Hawk copies and snipes even when a launch shows red flags (bundles, a creator who "
+                         "rugged before, a scout veto). Off by default")
     ap.add_argument("--unbench", action="store_true",
                     help="let live agents that were benched (real trades far behind practice) buy again now")
     args = ap.parse_args()
@@ -5364,6 +5583,7 @@ def main():
     if args.direct and not args.live:
         raise SystemExit("--direct needs --live (it changes how real pump.fun buys are made)")
     CFG["live_direct"] = args.direct
+    CFG["follow_checks"] = not args.follow_unchecked
     if args.live_only and not args.live:
         raise SystemExit("--live-only needs --live (it hides the paper agents and shows only real money)")
     if args.live and args.demo:
@@ -5414,7 +5634,19 @@ def main():
     CFG["daily_loss_pct"] = args.daily_loss
     CFG["report_live"] = args.report_live
     apply_risk(AGENTS, args.risk)
-    engine = Engine(CFG, trading_agents(AGENTS, args.paper_agents, live_names, bool(pump)), src,
+    if args.demo:   # the demo follows a few simulated wallets, so Hawk has something to do
+        CFG["demo_watch"] = {"Wallet00007": dict(mode="copy", label="demo-trader-7"),
+                             "Wallet00042": dict(mode="copy", label="demo-trader-42"),
+                             "Rugger005": dict(mode="snipe", label="demo-dev")}
+        watch, bad = CFG["demo_watch"], []
+    else:
+        watch, bad = load_watchlist(CFG["watchlist_file"])
+    for b in bad:
+        print(f"watchlist: {b}")
+    if pump and not args.demo:
+        print(f"Watchlist: {len(watch)} wallet{'s' if len(watch) != 1 else ''} in {CFG['watchlist_file']}"
+              + (" (Hawk is on)" if watch else " (add wallets there to snipe or copy them)"))
+    engine = Engine(CFG, trading_agents(AGENTS, args.paper_agents, live_names, bool(pump), bool(watch)), src,
                     demo=args.demo, live=live, live_names=live_names,
                     live_only=args.live_only,
                     pump=pump, fomo=fomo, notify=notify)
