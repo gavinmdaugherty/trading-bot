@@ -322,6 +322,44 @@ class RiskPresets(unittest.TestCase):
         self.assertEqual(w.get("P")["same_amt"], 0.0)
 
 
+class Learning(unittest.TestCase):
+    @staticmethod
+    def q(**kw):
+        q = dict(age=60, prog=20, real_sol=8, buyers=40, uniq_5m=20, buys_5m=40, sells_5m=20, net_sol_5m=5,
+                 buys_60s=8, holders=40, top_pct=3, top10_pct=20, bundle_pct=2, sniper_pct=5, dev_pct=1,
+                 whale=0.2, same_amt=0.1, ath_drop=-5, socials=1, mcap=8000)
+        q.update(kw)
+        return q
+
+    def test_learns_a_pattern_and_proves_it_out_of_sample(self):
+        import random, tempfile
+        rnd = random.Random(1)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "learn.json")
+            L = m.Learner(path, min_n=200, proof_n=30)
+            for i in range(1500):
+                net = rnd.uniform(-8, 12)          # the hidden truth: strong inflow wins
+                x = m.Learner.features(self.q(net_sol_5m=net, buyers=rnd.randint(5, 200)))
+                picked = L.ready() and L.ev(x) >= 0.03
+                L.learn(x, 0.4 if net > 4 else -0.25, picked)
+            good = L.ev(m.Learner.features(self.q(net_sol_5m=10)))
+            bad = L.ev(m.Learner.features(self.q(net_sol_5m=-6)))
+            self.assertGreater(good, 0.03)
+            self.assertLess(bad, 0.0)
+            self.assertTrue(L.proven())
+            L.save()
+            L2 = m.Learner(path, min_n=200, proof_n=30)       # survives a restart
+            self.assertEqual(L2.n, 1500)
+            self.assertAlmostEqual(L2.ev(m.Learner.features(self.q(net_sol_5m=10))), good)
+
+    def test_a_losing_model_never_gets_proven(self):
+        L = m.Learner(None, min_n=50, proof_n=10)
+        for i in range(400):
+            L.learn(m.Learner.features(self.q()), -0.1, True)
+        self.assertTrue(L.ready())
+        self.assertFalse(L.proven())
+
+
 class FakeLive:
     def __init__(self):
         self.calls = []
@@ -437,6 +475,40 @@ class LiveSpark(unittest.TestCase):
         w = m.PumpWatcher(m.CFG, clock=lambda: 0.0)
         w.handle({"message": "'subscribeTokenTrade' and 'subscribeAccountTrade' now require an API key"})
         self.assertTrue(w.want_rpc)
+
+    def test_live_spark_waits_for_learning_then_proof(self):
+        q = dict(self.q(), migrated=False, complete=False, from_create=True, last_trade=self.eng.t,
+                 age=120, dev_sold=False, dev_pct=1, dev_init_pct=1, creator_launches=0, bundle_pct=1,
+                 sniper_pct=2, top_pct=2, top10_pct=15, copycat=False, dup_social=False, real_sol=20,
+                 holders=60, uniq_5m=30, buys_5m=50, sells_5m=20, same_amt=0.1, whale=0.1, buys_60s=10,
+                 ath_drop=-5, meta_state=2, socials=1)
+        L = self.eng.learner
+        self.assertIsNotNone(L)
+        self.assertTrue(self.eng._why_not_curve("Spark LIVE", q).startswith("learning (0/"))
+        x = m.Learner.features(q)
+        for _ in range(L.min_n):
+            L.learn(x, 0.3, False)
+        self.assertEqual(self.eng._why_not_curve("Spark LIVE", q), "model not proven yet")
+        for _ in range(L.proof_n):
+            L.learn(x, 0.3, True)
+        self.assertIsNone(self.eng._why_not_curve("Spark LIVE", q))
+        self.assertEqual(self.eng._why_not_curve("Spark LIVE", dict(q, bundle_pct=60)), "bundled launch")
+
+    def test_shadow_trades_open_and_teach(self):
+        w = self.eng.pump
+        w.handle(dict(txType="create", mint="SH", traderPublicKey="d", symbol="SH", initialBuy=0,
+                      vSolInBondingCurve=40.0, vTokensInBondingCurve=800e6))
+        q = dict(w.get("SH"), buyers=30, last_trade=self.eng.t, age=60)
+        self.eng._open_shadows([q])
+        self.assertEqual(len(self.eng.shadows), 1)
+        self.eng._open_shadows([q])                          # not again within 45s
+        self.assertEqual(len(self.eng.shadows), 1)
+        w.handle(dict(txType="buy", mint="SH", traderPublicKey="b", solAmount=30, tokenAmount=1,
+                      vSolInBondingCurve=80.0, vTokensInBondingCurve=400e6))  # price x4: take-profit
+        self.eng._shadow_tick()
+        self.assertEqual(len(self.eng.shadows), 0)
+        self.assertEqual(self.eng.learner.n, 1)
+        self.assertGreater(self.eng.learner.recent[-1][0], 0.5)
 
     def test_live_blocked_when_wallet_sol_low(self):
         self.eng.wallet = dict(pub="x", usdc=15.0, sol=0.001)

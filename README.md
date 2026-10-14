@@ -51,6 +51,17 @@ If the creator sells while an agent holds the token, the curve agents exit at on
 
 **Live pump.fun trading:** `--live --live-agents Spark --live-usd 15` makes Spark trade real USDC. Jupiter routes each buy to the bonding curve, with a 10% slippage cap, and a buy is refused if the route price is more than 10% above the curve price. After a full sell, the bot closes the empty token account to get its rent (about 0.002 SOL) back. With a small bankroll it skips partial take-profits that would be below the $5 minimum order.
 
+## Spark learns as it goes
+
+Spark trains a small model on what actually happens to pump.fun launches:
+
+1. **Shadow trades:** every launch that passes the hard rug checks is paper-followed several times, at different moments, with Spark's real exit rules, costs and reference price. That gives hundreds of examples an hour without spending anything.
+2. **Model:** an online logistic model learns P(profit) from about 20 signals at entry: inflow, buyers, curve progress, holder spread, bundle, snipers, momentum, socials and so on. It combines that with the average win and loss to estimate the expected return after costs.
+3. **Trading on it:** after 200 shadow trades the model replaces Spark's hand-set thresholds, and Spark buys only when it expects at least +3%.
+4. **Real money needs proof:** Spark LIVE waits until the model's own picks, scored before their results were known, have made money on average over at least 30 trades. A model that keeps losing is never cleared to trade.
+
+The hard rug checks always apply. What Spark has learned is saved in `learn.json` (kept out of git), so it survives restarts. Delete that file to start learning from scratch.
+
 ## Better fills and exits
 
 - **Curve fills** use exact constant-product math on pump.fun's virtual reserves, with the 1.25% curve fee and a slippage allowance for snipers who get in ahead of you.

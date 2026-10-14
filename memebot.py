@@ -94,6 +94,11 @@ CFG = dict(
     pump_lost_secs=600,          # no price for this long: also look for the token on DEXes
     pump_writeoff_secs=1800,     # no price at all for this long: close at the last known value
     grad_window_min=120,         # a graduation counts as "fresh" for this long
+    learn_file="learn.json",     # what Spark has learned, kept across restarts
+    learn_min=200,               # shadow trades to learn from before the model takes over
+    learn_proof=30,              # out-of-sample picks needed before real money follows the model
+    learn_edge=0.03,             # buy only when the model expects at least +3% after costs
+    shadow_max=300,              # shadow trades followed at once
     bundle_window_s=3.0,         # buys this close to the launch count as bundled with it
     sniper_window_s=20.0,        # buyers in the first 20s count as snipers
     meta_min_buys=12,            # fetch a launch's metadata (socials) once it has this many buys
@@ -164,7 +169,7 @@ AGENTS = [
          min_buys_60s=5, max_buys_per_wallet=3.0, max_same_amt=0.30, max_whale=0.35,
          max_top_pct=5.0, max_top10_pct=28.0, max_dev_pct=5.0, max_bundle_pct=8.0,
          max_sniper_pct=15.0, max_creator_launches=0, skip_copycat=True, min_socials=1,
-         max_ath_drop=20, exit_dev_sell=True,
+         max_ath_drop=20, exit_dev_sell=True, learn=True,
          tp=60, tp1=30, tp1_frac=0.5, sl=-20, trail_act=30, trail=14, max_hold=20,
          pos_pct=0.06, max_open=4, max_new_per_min=2),
     dict(name="Crest",  style="pump.fun near graduation", venue="curve",
@@ -210,7 +215,7 @@ RISK = {
                   min_buys_60s=4, max_buys_per_wallet=5.0, max_same_amt=0.5, max_whale=0.7,
                   max_top_pct=10.0, max_top10_pct=45.0, max_dev_pct=10.0, max_bundle_pct=25.0,
                   max_sniper_pct=40.0, max_creator_launches=2, min_socials=0, max_ath_drop=35,
-                  tp=100, tp1=40, sl=-25, trail_act=35, trail=18, max_hold=10, max_new_per_min=5,
+                  tp=100, tp1=None, sl=-25, trail_act=35, trail=18, max_hold=10, max_new_per_min=5,
                   lock_at=33, lock_floor=30),   # once +33%, never give back below 1.3x
 }
 # Common quick-buy amounts in SOL: many traders using the same button is normal, not a bot farm.
@@ -847,6 +852,15 @@ class PumpWatcher:
         with self.lock:
             t = self.tokens.get(mint)
             return self._stats(t, self.clock()) if t else None
+
+    def peek(self, mint):
+        """Just price, creator-sold and migrated: cheap enough to call for hundreds of shadows."""
+        with self.lock:
+            t = self.tokens.get(mint)
+            if not t:
+                return None
+            price = t["vsol"] / t["vtok"] * self.sol_usd if t["vtok"] else 0.0
+            return dict(price=price, dev_sold=t["dev_sold"], migrated=t["migrated"])
 
     def candidates(self, now):
         with self.lock:
@@ -1681,6 +1695,130 @@ class SolanaLive:
 
 
 # --------------------------------------------------------------------------- #
+# Learning (Spark)
+# --------------------------------------------------------------------------- #
+class Learner:
+    """Online model that learns which pump.fun launches pay off.
+
+    Every launch that passes the hard rug checks gets a shadow trade: what Spark's own exits
+    and costs would have returned had it bought. Each finished shadow trains a logistic model
+    of P(profit) on the launch's features at entry. Expected value = P * average win +
+    (1 - P) * average loss.
+
+    Real money waits for proof that is measured out of sample: the shadow trades the model
+    would have picked, scored before their results were known, must have made money on average.
+    """
+    FEATURES = ("age", "prog", "real_sol", "buyers", "uniq_5m", "bs_ratio", "net_sol", "buys_60s",
+                "holders", "top_pct", "top10_pct", "bundle_pct", "sniper_pct", "dev_pct", "whale",
+                "same_amt", "ath_drop", "socials", "mcap", "churn")
+
+    def __init__(self, path=None, min_n=200, proof_n=30):
+        self.path, self.min_n, self.proof_n = path, min_n, proof_n
+        k = len(self.FEATURES)
+        self.w, self.b = [0.0] * k, 0.0
+        self.n = 0                                  # finished shadow trades learned from
+        self.mean, self.m2 = [0.0] * k, [0.0] * k   # running feature statistics (Welford)
+        self.wins, self.win_sum, self.loss_sum = 0, 0.0, 0.0
+        self.picks = []                             # net returns of out-of-sample picks (latest 200)
+        self.recent = []                            # (net return, won) of the latest 300 shadows
+        if path and os.path.exists(path):
+            try:
+                with open(path) as f:
+                    d = json.load(f)
+                if d.get("features") == list(self.FEATURES):
+                    for key in ("w", "b", "n", "mean", "m2", "wins", "win_sum", "loss_sum", "picks", "recent"):
+                        setattr(self, key, d[key])
+            except Exception:
+                pass
+
+    def save(self):
+        if not self.path:
+            return
+        d = {key: getattr(self, key) for key in ("w", "b", "n", "mean", "m2", "wins", "win_sum",
+                                                 "loss_sum", "picks", "recent")}
+        d["features"] = list(self.FEATURES)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, self.path)
+
+    @staticmethod
+    def features(q):
+        return [math.log1p(q["age"]), q["prog"] / 100, math.log1p(q["real_sol"]), math.log1p(q["buyers"]),
+                math.log1p(q["uniq_5m"]), math.log((q["buys_5m"] + 1) / (q["sells_5m"] + 1)),
+                q["net_sol_5m"] / (1 + abs(q["net_sol_5m"])), math.log1p(q["buys_60s"]),
+                math.log1p(q["holders"]), q["top_pct"] / 10, q["top10_pct"] / 50, q["bundle_pct"] / 20,
+                q["sniper_pct"] / 30, q["dev_pct"] / 10, q["whale"], q["same_amt"], q["ath_drop"] / 50,
+                1.0 if q["socials"] else 0.0, math.log1p(q["mcap"] / 1000),
+                q["buys_5m"] / max(q["uniq_5m"], 1) / 5]
+
+    def _z(self, x):
+        out = []
+        for i, v in enumerate(x):
+            sd = math.sqrt(self.m2[i] / self.n) if self.n > 1 else 1.0
+            out.append(max(-5.0, min(5.0, (v - self.mean[i]) / max(sd, 1e-3))))
+        return out
+
+    def p_win(self, x):
+        s = self.b + sum(wi * zi for wi, zi in zip(self.w, self._z(x)))
+        return 1 / (1 + math.exp(-max(-30.0, min(30.0, s))))
+
+    def avg_win(self):
+        return self.win_sum / self.wins if self.wins else 0.3
+
+    def avg_loss(self):
+        losses = self.n - self.wins
+        return self.loss_sum / losses if losses else -0.2
+
+    def ev(self, x):
+        p = self.p_win(x)
+        return p * self.avg_win() + (1 - p) * self.avg_loss()
+
+    def ready(self):
+        return self.n >= self.min_n
+
+    def proof(self):
+        """(number of out-of-sample picks, their average net return)."""
+        last = self.picks[-100:]
+        return len(last), (sum(last) / len(last) if last else 0.0)
+
+    def proven(self):
+        n, avg = self.proof()
+        return self.ready() and n >= self.proof_n and avg > 0
+
+    def learn(self, x, ret, picked):
+        won = ret > 0
+        self.n += 1
+        for i, v in enumerate(x):  # update the running mean / variance first
+            d = v - self.mean[i]
+            self.mean[i] += d / self.n
+            self.m2[i] += d * (v - self.mean[i])
+        z = self._z(x)
+        err = (1.0 if won else 0.0) - self.p_win(x)
+        lr = 0.08 / math.sqrt(1 + self.n / 300)
+        self.w = [wi + lr * (err * zi - 1e-3 * wi) for wi, zi in zip(self.w, z)]
+        self.b += lr * err
+        if won:
+            self.wins += 1
+            self.win_sum += ret
+        else:
+            self.loss_sum += ret
+        self.recent = (self.recent + [[round(ret, 4), won]])[-300:]
+        if picked:
+            self.picks = (self.picks + [round(ret, 4)])[-200:]
+
+    def summary(self):
+        n, avg = self.proof()
+        recent = self.recent[-100:]
+        top = sorted(zip(self.FEATURES, self.w), key=lambda kv: -abs(kv[1]))[:3]
+        return dict(n=self.n, min_n=self.min_n, ready=self.ready(), proven=self.proven(),
+                    picks=n, pick_avg=avg, proof_n=self.proof_n,
+                    win_rate=(sum(1 for r in recent if r[1]) / len(recent)) if recent else None,
+                    avg_ret=(sum(r[0] for r in recent) / len(recent)) if recent else None,
+                    top=[(f, round(v, 2)) for f, v in top])
+
+
+# --------------------------------------------------------------------------- #
 # Engine
 # --------------------------------------------------------------------------- #
 class Engine:
@@ -1714,6 +1852,9 @@ class Engine:
         self.sol_usd, self.sol_t = cfg["sol_usd_fallback"], -1e12
         self.fomo_t, self.fomo_board, self.fomo_err = -1e12, [], ""
         self.curve_buys = {}
+        self.learner, self.shadows, self.shadowed = None, {}, {}
+        if pump and any(a.get("learn") for a in self.acfg.values()):
+            self.learner = Learner(None if demo else cfg["learn_file"], cfg["learn_min"], cfg["learn_proof"])
         self.dex_err, self.dex_ok_t = "", None
         self.pump_warned = False
         self.blocks = {}          # agent -> (tokens checked, {reason it didn't buy: count})
@@ -1775,6 +1916,11 @@ class Engine:
     def _save(self):
         if self.demo:
             return
+        if self.learner:
+            try:
+                self.learner.save()
+            except Exception as e:
+                self.emit("WARN", f"could not save learn.json: {str(e)[:80]}")
         tmp = self.cfg["state_file"] + ".tmp"
         with open(tmp, "w") as f:
             json.dump(self.state, f)
@@ -1933,6 +2079,25 @@ class Engine:
                               c["live_min_trade_usd"] if a.get("live") else c["min_trade_usd"])
         if r:
             return r
+        r = self._hard_curve_reason(a, q)
+        if r:
+            return r
+        if a.get("learn") and self.learner:
+            L = self.learner
+            if L.ready():  # the model replaces the hand-set thresholds below
+                if L.ev(Learner.features(q)) < c["learn_edge"]:
+                    return "model sees no edge"
+                if a.get("live") and not L.proven():
+                    return "model not proven yet"
+                return None
+            if a.get("live"):
+                return f"learning ({L.n}/{L.min_n} shadow trades)"
+        if q["prog"] < a["min_prog"]:
+            return "curve too early"
+        return self._soft_curve_reason(a, q)
+
+    def _hard_curve_reason(self, a, q):
+        """Checks that always apply, whatever the model thinks."""
         if q["price"] <= 0 or q["migrated"] or q["complete"] or not q["from_create"]:
             return "not on the curve"
         if self.t - q["last_trade"] > 60:
@@ -1941,8 +2106,6 @@ class Engine:
             return "too young"
         if q["age"] > a["max_age_s"]:
             return "too old"
-        if q["prog"] < a["min_prog"]:
-            return "curve too early"
         if q["prog"] > a["max_prog"]:
             return "curve too far along"
         # ---- rug and manipulation checks ---- #
@@ -1964,6 +2127,10 @@ class Engine:
             return "copycat ticker"
         if q["dup_social"]:
             return "reused social links"
+        return None
+
+    def _soft_curve_reason(self, a, q):
+        """Hand-set thresholds, used until the model has learned enough."""
         if q["real_sol"] < a.get("min_real_sol", 0):
             return "curve too thin"
         if q["holders"] < a.get("min_holders", 0):
@@ -2042,7 +2209,7 @@ class Engine:
         st["cash"] -= size
         st["positions"][k] = dict(
             chain="solana", addr=q["addr"], symbol=q["symbol"], units=units, size=size, size0=size,
-            ref_price=q["price"], peak=q["price"], opened=self.t, entry_liq=None, sell_tax=0.0,
+            ref_price=size / units, peak=size / units, opened=self.t, entry_liq=None, sell_tax=0.0,
             last_price=q["price"], last_liq=0.0, last_vsol=q["vsol"], last_vtok=q["vtok"],
             curve_sol=net, miss=0, venue="curve", src="pump", last_seen=self.t)
         self.curve_buys.setdefault(name, deque(maxlen=20)).append(self.t)
@@ -2293,8 +2460,11 @@ class Engine:
                                   f"{ps['kinds']}). Switching on the on-chain feed through your Solana RPC.")
                 self.pump.start_rpc()
             self._curve_exits()
+            if self.learner:
+                self._shadow_tick()
             held = {pos["addr"] for st in self.state["agents"].values()
-                    for pos in st["positions"].values() if pos.get("venue") == "curve"}
+                    for pos in st["positions"].values() if pos.get("venue") == "curve"} | {
+                sh["mint"] for sh in self.shadows.values()}
             self.pump.prune(self.t, keep=held)
             if not self.paused and not os.path.exists(self.cfg["stop_file"]):
                 self._curve_entries()
@@ -2341,11 +2511,72 @@ class Engine:
                     continue  # the migration event switches it to DEX pricing
                 self._check_exit(name, k, pos, q["price"], dev_sold=q["dev_sold"])
 
+    def _learn_agent(self):
+        return next((a for a in self.acfg.values() if a.get("learn")), None)
+
+    def _open_shadows(self, cands):
+        """Paper-follow every launch that passes the hard checks, to learn what pays off."""
+        a, c, L = self._learn_agent(), self.cfg, self.learner
+        cost = (c["pump_fee_pct"] + c["pump_extra_slip_pct"]) / 100.0
+        for q in cands:
+            if len(self.shadows) >= c["shadow_max"]:
+                break
+            m = q["addr"]
+            last, count = self.shadowed.get(m, (-1e12, 0))
+            # sample a launch at several moments, since a real buy can come at any of them
+            if count >= 6 or self.t - last < 45 or self._hard_curve_reason(a, q):
+                continue
+            x = Learner.features(q)
+            ev = L.ev(x) if L.ready() else None
+            ref = q["price"] * (1 + cost)  # what a fill would cost, as for a real buy
+            self.shadows[(m, count)] = dict(mint=m, x=x, ref=ref, peak=ref, last=q["price"],
+                                            opened=self.t, picked=ev is not None and ev >= c["learn_edge"])
+            self.shadowed[m] = (self.t, count + 1)
+
+    @staticmethod
+    def _exit_reason(a, ret, peak_ret, held_min, dev_sold):
+        if dev_sold and a.get("exit_dev_sell"):
+            return "creator sold"
+        if ret >= a["tp"]:
+            return "take-profit"
+        if ret <= a["sl"]:
+            return "stop-loss"
+        if a.get("lock_at") and peak_ret >= a["lock_at"] and ret <= a["lock_floor"]:
+            return "profit lock"
+        if peak_ret >= a["trail_act"] and (1 + ret / 100) <= (1 + peak_ret / 100) * (1 - a["trail"] / 100):
+            return "trailing stop"
+        if held_min >= a["max_hold"]:
+            return "time limit"
+        return None
+
+    def _shadow_tick(self):
+        a, c, L = self._learn_agent(), self.cfg, self.learner
+        cost = (c["pump_fee_pct"] + c["pump_extra_slip_pct"]) / 100.0
+        for key, sh in list(self.shadows.items()):
+            q = self.pump.peek(sh["mint"])
+            if q and q["price"] > 0:
+                sh["last"] = q["price"]
+            price = sh["last"]
+            sh["peak"] = max(sh["peak"], price)
+            ret, peak_ret = (price / sh["ref"] - 1) * 100, (sh["peak"] / sh["ref"] - 1) * 100
+            why = self._exit_reason(a, ret, peak_ret, (self.t - sh["opened"]) / 60,
+                                    bool(q and q["dev_sold"]))
+            if not why and (q is None or q["migrated"]):
+                why = "ended"
+            if why:
+                L.learn(sh["x"], price * (1 - cost) / sh["ref"] - 1, sh["picked"])
+                del self.shadows[key]
+        if len(self.shadowed) > 20000:
+            cut = self.t - 7200
+            self.shadowed = {m: v for m, v in self.shadowed.items() if v[0] > cut}
+
     def _curve_entries(self):
         names = [n for n, a in self.acfg.items() if a.get("venue") == "curve"]
         if not names:
             return
         cands = sorted(self.pump.candidates(self.t), key=lambda q: -q["score"])
+        if self.learner:
+            self._open_shadows(cands)
         counts = {n: {} for n in names}
         for q in cands:
             for name in names:
@@ -2574,7 +2805,7 @@ class Engine:
                 feed = "pump" if a.get("venue") == "curve" else a.get("need") or "dex"
                 checked, counts = self.blocks.get(name, (0, {}))
                 agents.append(dict(name=name, style=a["style"], equity=eq, feed=feed,
-                                   live=bool(a.get("live")), checked=checked,
+                                   live=bool(a.get("live")), checked=checked, learns=bool(a.get("learn")),
                                    blocks=sorted(counts.items(), key=lambda kv: -kv[1])[:3],
                                    pnl=eq - st["start"], pnl_pct=(eq / st["start"] - 1) * 100,
                                    wins=st["wins"], losses=st["losses"], open=len(st["positions"]),
@@ -2640,6 +2871,7 @@ class Engine:
                 positions=sorted(positions, key=lambda x: -x["size"]), trades=trades[:30],
                 log=S["log"][-80:][::-1], equity=series, pump=pump, fomo=fomo,
                 real_only=bool(agents) and all(a["live"] for a in agents),
+                learn=dict(self.learner.summary(), open=len(self.shadows)) if self.learner else None,
                 fomo_off=self.fomo is None, dex=dict(error=self.dex_err, ok_t=self.dex_ok_t), phase=self.phase, phase_t=self.phase_t,
                 next_at=self.next_at, updated=time.time(), poll=self.cfg["poll_seconds"])
 
@@ -2739,6 +2971,9 @@ td{padding:7px 8px;border-bottom:1px solid #ffffff0c;white-space:nowrap}
 .spin.idle{animation:none;border-color:var(--up)}
 .spin.bad{animation:none;border-color:var(--down)}
 @keyframes spin{to{transform:rotate(360deg)}}
+.learn{font-size:11.5px;margin-top:8px;padding:7px 9px;border-radius:9px;background:#7dffb00d;
+  border:1px solid #7dffb033;line-height:1.45;color:var(--text)}
+.learn .t{color:var(--pump);font-weight:650}
 .why{font-size:11.5px;color:var(--mute);margin-top:8px;line-height:1.45;min-height:16px}
 .why b{color:var(--warn);font-weight:600}
 .flash{animation:flash 1.2s ease-out}
@@ -2836,6 +3071,14 @@ function drawChart(series){
 }
 
 let demo_mode=false;
+function learnTxt(L,live){
+  const pc=v=>v==null?"-":(v>=0?"+":"")+(v*100).toFixed(1)+"%";
+  const base=`${L.n} shadow trades learned, ${L.open} following now`+(L.win_rate==null?"":`, recent win rate ${Math.round(L.win_rate*100)}%, avg ${pc(L.avg_ret)}`);
+  if(!L.ready)return `<span class="t">Learning ${L.n}/${L.min_n}</span><br>${base}`+(live?"<br>Real money waits until it has learned enough.":"");
+  const proof=`model picks so far: ${L.picks} (avg ${pc(L.pick_avg)})`;
+  if(!L.proven)return `<span class="t">Model active, proving itself</span><br>${proof}, needs ${L.proof_n} with a positive average<br>${base}`;
+  return `<span class="t">Model proven: trading on what it learned</span><br>${proof}<br>${base}`;
+}
 function renderPump(p){
   const dot=$("#pdot");
   if(!p){dot.className="dot dead";$("#pfeed").textContent="pump.fun off";$("#pstat").textContent="";
@@ -2930,6 +3173,7 @@ function render(s){
       <div class="eq">${money(a.equity)}</div>
       <div class="meta"><span class="${cls(a.pnl)}">${smoney(a.pnl)} (${pct(a.pnl_pct)})</span><br>${a.wins}W / ${a.losses}L, ${a.open} open${a.capped?"<br>daily cap hit":""}</div>
       <div class="meter"><b style="width:${Math.max(4,a.equity/mx*100)}%;background:${COLORS[i%COLORS.length]}"></b></div>
+      ${a.learns&&s.learn?`<div class="learn">${learnTxt(s.learn,a.live)}</div>`:""}
       <div class="why">${why(a)}</div></div>`}).join(""));
 
   setHTML("#pos",s.positions.length?`<table><tr><th>Agent</th><th>Token</th><th>Feed</th><th>Size</th><th>Now</th><th>Move</th><th>Held</th></tr>`+

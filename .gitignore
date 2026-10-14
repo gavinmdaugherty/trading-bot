@@ -4,3 +4,4 @@ STOP
 __pycache__/
 *.pyc
 .env
+learn.json
