@@ -135,7 +135,8 @@ CFG = dict(
     live_curve_slippage_bps=1000,   # pump.fun launches move fast: 10% tolerance on curve buys
     live_curve_max_dev_pct=10.0,    # refuse a curve buy if the route price is this far above the curve
     live_curve_priority="veryHigh",  # Jupiter priority-fee level for curve buys (still capped by the max below)
-    fast_seconds_live=1.0,       # pump.fun loop interval while a live curve agent runs
+    fast_seconds_live=1.0,       # pump.fun loop interval while a live curve agent runs (at the latest)
+    fast_min_gap=0.25,           # ...but it runs as soon as new trades arrive, up to 4 times a second
     live_close_empty=True,       # close emptied token accounts to get their ~0.002 SOL rent back
     # ---- direct pump.fun route (--direct): PumpPortal builds the transaction, paid in SOL ----
     live_direct=False,
@@ -731,6 +732,7 @@ class PumpWatcher:
         self.rpc = None
         self.want_rpc = False
         self.memory = None
+        self.wake = threading.Event()   # set on every launch or trade, so Spark decides as data lands
         self.traders = {}        # wallet -> [last mint traded, launches traded]: veterans vs fresh wallets
         self.dev_q = deque(maxlen=200)
         self.dev_cache = {}      # creator wallet -> (wallet age in hours, transactions seen)
@@ -931,6 +933,7 @@ class PumpWatcher:
             self.msgs += 1
             self.last_msg = now
             self.kinds[tx or "(none)"] = self.kinds.get(tx or "(none)", 0) + 1
+            self.wake.set()
             if tx == "create":
                 self._on_create(m, now)
             elif tx in ("buy", "sell"):
@@ -954,7 +957,7 @@ class PumpWatcher:
                  dev_sold=False, migrated=False, complete=False, last_trade=now, n_buys=0,
                  n_sells=0, vol_sol=0.0, from_create=False, uri="", seen_trades=0,
                  unseen_first=0.0, bundle_seen=0.0, early={}, meta=None, meta_state=0,
-                 dup_social=False, creator_launches=0, whale_sells=deque(maxlen=200),
+                 dup_social=False, creator_launches=0, whale_sells=deque(maxlen=200), first_buy={},
                  dev_age_h=None, dev_txs=None)
         t.update(kw)
         self.tokens[mint] = t
@@ -1020,9 +1023,11 @@ class PumpWatcher:
             elif seen[0] != t["mint"]:
                 seen[0], seen[1] = t["mint"], seen[1] + 1
         prev = t["holders"].get(trader, 0.0)
+        new_bal = num(m, "newTokenBalance", default=prev + (amt if is_buy else -amt))
         if not is_buy and prev >= 0.01 * PUMP_SUPPLY:  # a 1%+ holder selling
-            sold = amt if amt > 0 else max(0.0, prev - num(m, "newTokenBalance", default=prev))
-            t["whale_sells"].append((now, sold))
+            t["whale_sells"].append((now, amt if amt > 0 else max(0.0, prev - new_bal)))
+        elif is_buy and prev >= 0.01 * PUMP_SUPPLY:  # ...or an existing one buying back: nets it out
+            t["whale_sells"].append((now, -(amt if amt > 0 else max(0.0, new_bal - prev))))
         if "newTokenBalance" in m:
             bal = num(m, "newTokenBalance")
         else:
@@ -1039,6 +1044,7 @@ class PumpWatcher:
             t["n_buys"] += 1
             if trader != t["creator"]:
                 t["buyers"].add(trader)
+                t["first_buy"].setdefault(trader, now)
                 if age <= c["bundle_window_s"]:
                     t["bundle_seen"] += amt
                 if age <= c["sniper_window_s"]:
@@ -1077,14 +1083,22 @@ class PumpWatcher:
 
     # ---- queries for the engine ---- #
     def _stats(self, t, now):
-        w, w60 = now - 300, now - 60
-        b = s = b60 = 0
-        bsol = ssol = big = 0.0
+        w, w60, w30, w90 = now - 300, now - 60, now - 30, now - 90
+        b = s = b60 = b30 = bprev = s60 = 0
+        bsol = ssol = big = sol60 = 0.0
         uniq, uniq60, sizes = set(), set(), {}
         for ts, is_buy, sol, tr in reversed(t["trades"]):
             if ts < w:
                 break
+            if ts >= w60 and not is_buy:
+                s60 += 1
             if is_buy:
+                if ts >= w30:
+                    b30 += 1
+                elif ts >= w90:
+                    bprev += 1
+                if ts >= w60:
+                    sol60 += sol
                 b += 1
                 bsol += sol
                 big = max(big, sol)
@@ -1100,7 +1114,20 @@ class PumpWatcher:
                 ssol += sol
         price_sol = t["vsol"] / t["vtok"] if t["vtok"] else 0.0
         hold = t["holders"]
-        others = sorted((v for k, v in hold.items() if k != t["creator"]), reverse=True)
+        ranked = sorted(((v, k) for k, v in hold.items() if k != t["creator"]), reverse=True)
+        others = [v for v, _ in ranked]
+        top10w = [k for _, k in ranked[:10]]
+        # top holders who never traded another launch: fresh wallets, often one person's sybils
+        fresh10 = sum(1 for k in top10w if self.traders.get(k, (None, 1))[1] <= 1)
+        # top holders whose first buys landed within the same 1.5 seconds, after the launch rush (the
+        # sniper and bundle checks cover that): a coordinated group, often one person's wallet farm
+        rush = t["created"] + self.cfg["sniper_window_s"]
+        firsts = sorted((t["first_buy"][k], hold[k]) for k in top10w if t["first_buy"].get(k, 0) > rush)
+        cl_n = cl_amt = 0
+        for i in range(len(firsts)):
+            grp = [a for ts, a in firsts[i:] if ts - firsts[i][0] <= 1.5]
+            if len(grp) > cl_n:
+                cl_n, cl_amt = len(grp), sum(grp)
         top = others[0] / PUMP_SUPPLY * 100 if others else 0.0
         top10 = sum(others[:10]) / PUMP_SUPPLY * 100
         dev_pct = hold.get(t["creator"], 0.0) / PUMP_SUPPLY * 100
@@ -1119,7 +1146,7 @@ class PumpWatcher:
             c_rugs = c_wins = smart = rugw = smart_now = 0
             th_lift = th_heat = 0.0
         vets = sum(1 for tr in uniq if self.traders.get(tr, (None, 0))[1] >= 3)
-        whale_sold = sum(a for ts, a in t["whale_sells"] if ts >= w) / PUMP_SUPPLY * 100
+        whale_sold = max(0.0, sum(a for ts, a in t["whale_sells"] if ts >= w)) / PUMP_SUPPLY * 100  # net
         usd = self.sol_usd
         q = dict(chain="solana", addr=t["mint"], symbol=t["symbol"], name=t["name"], venue="curve",
                  price=price_sol * usd, price_sol=price_sol, vsol=t["vsol"], vtok=t["vtok"],
@@ -1142,7 +1169,11 @@ class PumpWatcher:
                  ath_drop=(price_sol / t["ath"] - 1) * 100 if t["ath"] else 0.0,
                  uniq_60s=len(uniq60), buyers_per_min=len(t["buyers"]) / max((now - t["created"]) / 60, 1.0),
                  veteran_frac=vets / len(uniq) if uniq else 0.0, smart_now=smart_now,
-                 whale_sold_pct=whale_sold, dev_age_h=t["dev_age_h"], dev_txs=t["dev_txs"])
+                 whale_sold_pct=whale_sold, dev_age_h=t["dev_age_h"], dev_txs=t["dev_txs"],
+                 buys_30s=b30, buys_prev60=bprev, sells_60s=s60,
+                 size_60s=(sol60 / b60) if b60 else 0.0, size_5m=(bsol / b) if b else 0.0,
+                 top10_fresh=fresh10, top10_n=len(top10w), cluster_n=cl_n if cl_n >= 2 else 0,
+                 cluster_pct=cl_amt / PUMP_SUPPLY * 100 if cl_n >= 2 else 0.0)
         q["score"] = (q["net_sol_5m"] + 0.25 * q["uniq_5m"] - (25 if q["dev_sold"] else 0)
                       - 2 * max(0.0, top - 8) - 0.5 * max(0.0, -q["ath_drop"] - 20)
                       - 1.5 * max(0.0, bundle - 5) - (10 if copycat or q["dup_social"] else 0)
@@ -1401,13 +1432,25 @@ class DemoPump(PumpWatcher):
         self.connected = True
         self.wallets = [f"Wallet{i:05d}" for i in range(4000)]
         self.ruggers = [f"Rugger{i:03d}" for i in range(25)]
+        self.jit = 0.0
         self.bundlers = [f"Bundler{i:03d}" for i in range(80)]
 
     def start(self):
         pass
 
+    def handle(self, m):
+        # real trades are spread out in time; give each demo message its own moment inside the step
+        base = self.clock
+        self.clock = lambda: base() - 4.95 + self.jit   # within the 5s step that just ended
+        try:
+            super().handle(m)
+        finally:
+            self.clock = base
+        self.jit = min(4.95, self.jit + self.rng.expovariate(8.0))
+
     def tick(self, now):
         r = self.rng
+        self.jit = 0.0
         if r.random() < 0.35:
             self._launch()
         for mint, s in list(self.sim.items()):
@@ -2325,7 +2368,8 @@ class Learner:
                 "same_amt", "ath_drop", "socials", "mcap", "churn",
                 "creator_wins", "creator_rugs", "smart_early", "rugger_early",
                 "theme_lift", "theme_heat", "ai_meme", "ai_narrative", "ai_scam", "ai_known",
-                "uniq_60s", "buyers_per_min", "veteran_frac", "smart_now", "whale_sold", "dev_age", "dev_known")
+                "uniq_60s", "buyers_per_min", "veteran_frac", "smart_now", "whale_sold", "dev_age", "dev_known",
+                "scout_atlas", "scout_bolt", "scout_cinder", "scout_drift", "scout_ember", "scout_flux", "scout_crest")
     CAL_N = 40          # real fills kept for the reality check
 
     def __init__(self, path=None, min_n=200, proof_n=30):
@@ -2375,7 +2419,7 @@ class Learner:
 
     @staticmethod
     def features(q):
-        return [math.log1p(q["age"]), q["prog"] / 100, math.log1p(q["real_sol"]), math.log1p(q["buyers"]),
+        return [math.log1p(max(0.0, q["age"])), q["prog"] / 100, math.log1p(q["real_sol"]), math.log1p(q["buyers"]),
                 math.log1p(q["uniq_5m"]), math.log((q["buys_5m"] + 1) / (q["sells_5m"] + 1)),
                 q["net_sol_5m"] / (1 + abs(q["net_sol_5m"])), math.log1p(q["buys_60s"]),
                 math.log1p(q["holders"]), q["top_pct"] / 10, q["top10_pct"] / 50, q["bundle_pct"] / 20,
@@ -2390,7 +2434,8 @@ class Learner:
                 math.log1p(q.get("uniq_60s", 0)), math.log1p(q.get("buyers_per_min", 0.0)),
                 q.get("veteran_frac", 0.0), math.log1p(q.get("smart_now", 0)), q.get("whale_sold_pct", 0.0) / 10,
                 math.log1p(q["dev_age_h"]) / 5 if q.get("dev_age_h") is not None else 0.0,
-                1.0 if q.get("dev_age_h") is not None else 0.0]
+                1.0 if q.get("dev_age_h") is not None else 0.0] + [
+                (q.get("scout_scores") or {}).get(n, 0.0) for n in Scouts.NAMES]
 
     def _z(self, x):
         out = []
@@ -2518,6 +2563,177 @@ class Learner:
 
 
 # --------------------------------------------------------------------------- #
+# Scouts: the other agents work for Spark
+# --------------------------------------------------------------------------- #
+class Scouts:
+    """Spark's scouting squad. Each scout studies one side of a launch in detail and reports a
+    score (-1 bad .. +1 good) with a written note. Everything they read is already in memory, so
+    a full review takes microseconds and never slows Spark down. Spark makes the call: the scores
+    are features of its model (it learns how far to trust each scout), a red flag serious enough
+    is a veto, and before the model is ready three red scouts are a no."""
+    SQUAD = (("Atlas", "Holders", "who holds it: spread, fresh wallets, groups that bought together"),
+             ("Bolt", "Flow", "the buying right now: speeding up or fading, buy sizes, sell pressure"),
+             ("Cinder", "Creator", "the dev: wallet age, past launches and rugs, how much they hold"),
+             ("Drift", "Socials", "links, description, copycat tickers, reused socials"),
+             ("Ember", "Dump watch", "snipers, bundles, big holders selling, known rug wallets"),
+             ("Flux", "Trends", "whether its theme is running and matches what is trending"),
+             ("Crest", "Graduation", "how fast the curve is filling and when it could graduate"))
+    NAMES = tuple(n for n, _, _ in SQUAD)
+    GREEN, RED = 0.15, -0.15
+    GRAD_SOL = 85.0   # real SOL in the curve at graduation (about 115 SOL of virtual reserves)
+
+    def __init__(self):
+        self.trend_words = set()
+        self.trend_src = {}
+        self.stats = {n: dict(reviewed=0, green=0, red=0, vetoes=0, notes=deque(maxlen=3)) for n in self.NAMES}
+        self.seen = {}
+
+    def set_trends(self, by_word):
+        """by_word: word -> where it is trending (for example '$WIF on Fomo')."""
+        self.trend_src = dict(by_word)
+        self.trend_words = set(by_word)
+
+    @staticmethod
+    def _c(x):
+        return max(-1.0, min(1.0, x))
+
+    @staticmethod
+    def _age(h):
+        return f"{h * 60:.0f} min" if h < 1 else (f"{h:.0f}h" if h < 48 else f"{h / 24:.0f} days")
+
+    # ---- the seven scouts: each returns (score, note, veto or None) ---- #
+    def atlas(self, q):
+        n, fresh, cl, clp = q.get("top10_n", 0), q.get("top10_fresh", 0), q.get("cluster_n", 0), q.get("cluster_pct", 0.0)
+        sc = 0.4 - min(q["top10_pct"] / 40, 1) * 0.6 - (fresh / n if n else 0) * 0.5 - (0.5 if cl >= 4 else 0.2 if cl == 3 else 0)
+        note = f"top 10 hold {q['top10_pct']:.0f}% (largest {q['top_pct']:.1f}%), {fresh} of {n} are fresh wallets"
+        if cl >= 3:
+            note += f"; {cl} of them bought within 1.5s, holding {clp:.0f}%"
+        veto = (f"{cl} top holders bought in the same moment and hold {clp:.0f}%" if cl >= 5 and clp >= 15 else None)
+        return self._c(sc), note, veto
+
+    def bolt(self, q):
+        b30, prev = q.get("buys_30s", 0), q.get("buys_prev60", 0)
+        accel = (2.0 * b30 / prev) if prev else (2.0 if b30 else 0.5)
+        size, size5 = q.get("size_60s", 0.0), q.get("size_5m", 0.0)
+        sells, buys = q.get("sells_60s", 0), max(q["buys_60s"], 1)
+        sc = (0.35 * math.log2(max(accel, 0.125)) + 0.2 * ((size / size5 - 1) if size5 else 0)
+              - 0.4 * max(0.0, sells / buys - 0.6) + (0.2 if q.get("uniq_60s", 0) >= 8 else 0))
+        pace = "speeding up" if accel > 1.2 else ("slowing down" if accel < 0.8 else "steady")
+        note = (f"{b30} buys in the last 30s vs {prev} in the minute before ({pace}, {accel:.1f}x), "
+                f"{q.get('uniq_60s', 0)} buyers and {sells} sells last minute, avg buy {size:.2f} SOL")
+        return self._c(sc), note, None
+
+    def cinder(self, q):
+        age, rugs, wins, n = q.get("dev_age_h"), q.get("creator_rugs", 0), q.get("creator_wins", 0), q["creator_launches"]
+        sc = 0.0
+        if age is not None:
+            sc += 0.3 if age >= 168 else (0.1 if age >= 24 else (-0.4 if age < 1 else -0.1))
+        sc += 0.4 * min(wins, 2) / 2 - 0.8 * min(rugs, 1) - 0.3 * min(n, 2) / 2 - max(0.0, q["dev_pct"] - 5) / 10
+        parts = [f"wallet {self._age(age)} old" if age is not None else "wallet age not looked up yet"]
+        if n:
+            parts.append(f"{n} other launch{'es' if n > 1 else ''} in 24h")
+        if wins or rugs:
+            parts.append(f"past record {wins} ran / {rugs} rugged")
+        parts.append("sold out" if q["dev_sold"] else f"holds {q['dev_pct']:.1f}%")
+        return self._c(sc), ", ".join(parts), None
+
+    def drift(self, q):
+        if q["meta_state"] != 2:
+            return 0.0, "reading its metadata", None
+        links = [str(x).lower() for x in q.get("links") or []]
+        kinds = []
+        for u in links:
+            if "x.com" in u or "twitter.com" in u:
+                kinds.append("X community" if "/communities/" in u else ("a tweet" if "/status/" in u else "X profile"))
+            elif "t.me" in u:
+                kinds.append("Telegram")
+            else:
+                kinds.append("website")
+        desc = q.get("desc") or ""
+        sc = {0: -0.3, 1: 0.05}.get(len(links), 0.25) + (0.1 if len(desc) >= 40 else 0)
+        sc -= 0.8 if q["dup_social"] else 0
+        sc -= 0.4 if q["copycat"] else 0
+        note = (", ".join(kinds) if kinds else ("metadata unreachable" if q.get("meta_failed") else "no socials"))
+        note += f"; description {len(desc)} chars" if desc else "; no description"
+        if q["dup_social"]:
+            note += "; links reused from another launch"
+        if q["copycat"]:
+            note += "; copies an earlier ticker"
+        return self._c(sc), note, None
+
+    def ember(self, q):
+        sn, bu, ws, rw, drop = q["sniper_pct"], q["bundle_pct"], q.get("whale_sold_pct", 0.0), q.get("rugger_early", 0), q["ath_drop"]
+        sc = 0.3 - sn / 40 - bu / 30 - ws / 15 - 0.25 * rw - max(0.0, -drop - 15) / 60
+        note = f"snipers hold {sn:.0f}%, bundle {bu:.0f}%"
+        if ws >= 1:
+            note += f", big holders net sold {ws:.1f}% of supply in 5m"
+        if rw:
+            note += f", {rw} known rug wallet{'s' if rw > 1 else ''} bought early"
+        note += f", {-drop:.0f}% off its high" if drop < -5 else ", at its high"
+        veto = (f"big holders net dumped {ws:.0f}% of supply in 5 minutes while money flows out"
+                if ws >= 10 and q["net_sol_5m"] < 0 else None)
+        return self._c(sc), note, veto
+
+    def flux(self, q):
+        words = Memory.words(q.get("name", ""), q["symbol"])
+        hits = [w for w in words if w in self.trend_words]
+        lift, heat = q.get("theme_lift", 0.0), q.get("theme_heat", 0.0)
+        sc = 0.5 * lift + 0.3 * min(heat, 3) / 3 + (0.3 if hits else 0)
+        parts = [f"theme {lift:+.2f} vs average" if heat else "theme not seen before"]
+        if hits:
+            parts.append("matches " + ", ".join(self.trend_src.get(w, w) for w in hits[:2]))
+        if q.get("ai_known"):
+            sc += (q["ai_narrative"] - 5) / 10 * 0.4
+            parts.append(f"AI narrative {q['ai_narrative']}/10")
+        return self._c(sc), ", ".join(parts), None
+
+    def crest(self, q):
+        rate = q["net_sol_5m"] / 5
+        left = max(0.0, self.GRAD_SOL - q["real_sol"])
+        sc = 0.6 * max(-1.0, min(1.0, rate / 2)) - (0.2 if rate <= 0 else 0)
+        note = f"curve {q['prog']:.0f}%, filling at {rate:+.1f} SOL/min"
+        if rate > 0 and left / rate < 120:
+            note += f", graduates in about {left / rate:.0f} min at this pace"
+        return self._c(sc), note, None
+
+    def review(self, q):
+        """Attach every scout's report to the launch: q["scouts"], q["scout_scores"],
+        q["scout_green"], q["scout_red"] and q["scout_veto"] (name, reason) or None."""
+        out, veto, scores = {}, None, {}
+        for name in self.NAMES:
+            sc, note, v = getattr(self, name.lower())(q)
+            out[name] = (round(sc, 2), note)
+            scores[name] = sc
+            if v and not veto:
+                veto = (name, v)
+        q.update(scouts=out, scout_scores=scores, scout_veto=veto,
+                 scout_green=sum(1 for v in scores.values() if v >= self.GREEN),
+                 scout_red=sum(1 for v in scores.values() if v <= self.RED))
+        first = q["addr"] not in self.seen
+        if first or (veto and not self.seen[q["addr"]]):
+            if len(self.seen) > 20000:
+                self.seen.clear()
+            self.seen[q["addr"]] = bool(veto)
+            for name, sc in scores.items():
+                st = self.stats[name]
+                if first:
+                    st["reviewed"] += 1
+                    st["green"] += sc >= self.GREEN
+                    st["red"] += sc <= self.RED
+                    if abs(sc) >= 0.6:
+                        st["notes"].append((q["symbol"], round(sc, 2), out[name][1]))
+                if veto and veto[0] == name:
+                    st["vetoes"] += 1
+                    st["notes"].append((q["symbol"], -1.0, "VETO: " + veto[1]))
+        return q
+
+    def summary(self):
+        return [dict(name=n, role=r, watches=w, reviewed=self.stats[n]["reviewed"], green=self.stats[n]["green"],
+                     red=self.stats[n]["red"], vetoes=self.stats[n]["vetoes"], notes=list(self.stats[n]["notes"])[::-1])
+                for n, r, w in self.SQUAD]
+
+
+# --------------------------------------------------------------------------- #
 # Engine
 # --------------------------------------------------------------------------- #
 class Engine:
@@ -2567,6 +2783,11 @@ class Engine:
         self.fill_times = deque(maxlen=50)   # seconds from signal to a filled live buy
         self.direct_ok = bool(cfg.get("live_direct"))
         self.direct_fails = 0
+        self.scouts = Scouts() if pump else None
+        self.desk = deque(maxlen=8)     # Spark's latest calls, with what each scout reported
+        self.on_desk = None             # the launch Spark is weighing right now
+        self.trend_t = -1e12
+        self.snap_t = 0.0
         self.report_t = 0.0
         self.blocks = {}          # agent -> (tokens checked, {reason it didn't buy: count})
         self.phase, self.phase_t, self.next_at = "starting up", time.time(), None
@@ -2903,10 +3124,14 @@ class Engine:
             return "copycat ticker"
         if q["dup_social"]:
             return "reused social links"
+        if q.get("scout_veto"):
+            return f"scout veto ({q['scout_veto'][0]})"
         return None
 
     def _soft_curve_reason(self, a, q):
         """Hand-set thresholds, used until the model has learned enough."""
+        if q.get("scout_red", 0) >= 3:
+            return "scouts against it"
         if q["real_sol"] < a.get("min_real_sol", 0):
             return "curve too thin"
         if q["holders"] < a.get("min_holders", 0):
@@ -2998,7 +3223,7 @@ class Engine:
         style = st["positions"][k]["exit_style"]
         self.emit("EXEC", f"{name} BUY ${q['symbol']} ${size:.2f} on pump.fun, mcap ${q['mcap'] / 1000:.1f}k, "
                           f"curve {q['prog']:.0f}%, {q['buyers']} buyers, +{q['net_sol_5m']:.1f} SOL/5m"
-                          + (f", selling style: {style}" if style != "base" else ""))
+                          + (f", selling style: {style}" if style != "base" else "") + self._call(name, q, size))
         return True
 
     def _direct_usable(self, usd):
@@ -3070,7 +3295,8 @@ class Engine:
                           + (" (direct)" if route == "pump" else "") + f", mcap "
                           f"${q['mcap'] / 1000:.1f}k, curve {q['prog']:.0f}%, filled in {took:.1f}s"
                           + (f" (quote {tm['quote']:.1f}s, land {tm['landed']:.1f}s)" if tm else "")
-                          + f", paid {slip * 100:+.1f}% vs the signal price, tx {str(res['sig'])[:10]}")
+                          + f", paid {slip * 100:+.1f}% vs the signal price, tx {str(res['sig'])[:10]}"
+                          + self._call(name, q, spent))
         return True
 
     def _live_fail(self, msg):
@@ -3321,7 +3547,8 @@ class Engine:
             self.pump.prune(self.t, keep=held)
             if not self.paused and not os.path.exists(self.cfg["stop_file"]):
                 self._curve_entries()
-            if not self.demo:
+            if not self.demo and time.time() - self.snap_t >= 1.0:   # decisions can run faster than the page needs
+                self.snap_t = time.time()
                 self._cache = self.snapshot()
 
     def _on_grad(self, g):
@@ -3457,6 +3684,12 @@ class Engine:
         cands = sorted(self.pump.candidates(self.t), key=lambda q: -q["score"])
         if self.brain:
             self._brain_pass(cands)
+        if self.scouts:
+            if self.t - self.trend_t > 30:
+                self.trend_t = self.t
+                self.scouts.set_trends(self._trending_words())
+            for q in cands:
+                self.scouts.review(q)
         if self.learner:
             self._open_shadows(cands)
         counts = {n: {} for n in names}
@@ -3473,6 +3706,54 @@ class Engine:
                     counts[name][why] = counts[name].get(why, 0) + 1
         for name in names:
             self.blocks[name] = (len(cands), counts[name])
+        self._update_desk(cands, names)
+
+    def _trending_words(self):
+        """Words from what is trending right now, for the trend scout: Fomo's board and DEX
+        tokens up hard this hour."""
+        out = {}
+        for b in self.fomo_board[:30]:
+            for w in Memory.words(b.get("name", ""), b.get("symbol", "")):
+                out.setdefault(w, f"${b.get('symbol', '?')} on Fomo")
+        for u in self.universe.values():
+            p = u.get("pair")
+            if p and u["miss"] == 0 and p.get("chg_h1", 0) >= 25 and p.get("liq", 0) >= 20_000:
+                for w in Memory.words(p.get("name", ""), p.get("symbol", "")):
+                    out.setdefault(w, f"${p['symbol']} (+{p['chg_h1']:.0f}% 1h)")
+        return out
+
+    def _update_desk(self, cands, names):
+        """The launch Spark is weighing right now: the best-ranked one past the hard checks."""
+        name = next((n for n in names if self.acfg[n].get("learn") and self.acfg[n].get("live")), None) or \
+            next((n for n in names if self.acfg[n].get("learn")), names[0] if names else None)
+        if not name or not self.scouts:
+            return
+        a = self.acfg[name]
+        for q in cands:
+            if self._hard_curve_reason(a, q) and not q.get("scout_veto"):
+                continue
+            why = self._why_not_curve(name, q)
+            if why in ("already holding", "cooldown"):
+                continue
+            self.on_desk = dict(t=self.t, symbol=q["symbol"], mcap=q["mcap"], prog=q["prog"], agent=name,
+                                verdict=why or "buy", ev=self._ev(q), scouts=self._scout_rows(q))
+            return
+
+    def _ev(self, q):
+        L = self.learner
+        return round(L.ev(Learner.features(q)), 4) if L and L.ready() else None
+
+    @staticmethod
+    def _scout_rows(q):
+        return [[n, sc, note] for n, (sc, note) in (q.get("scouts") or {}).items()]
+
+    def _call(self, name, q, size):
+        """Record a buy on Spark's desk and return the short scout summary for the log."""
+        if q.get("scouts"):
+            self.desk.append(dict(t=self.t, agent=name, symbol=q["symbol"], size=round(size, 2), mcap=q["mcap"],
+                                  ev=self._ev(q), scouts=self._scout_rows(q)))
+            return f", scouts {q['scout_green']} green / {q['scout_red']} red"
+        return ""
 
     def _count_block(self, p, why, names=None):
         for n in names or [n for n in self.acfg if self._wants(n, p)]:
@@ -3738,10 +4019,11 @@ class Engine:
                             ai=(self.brain.get(q["addr"]) if self.brain else None),
                             dev_age=q["dev_age_h"], vets=q["veteran_frac"], uniq60=q["uniq_60s"],
                             whale_sold=q["whale_sold_pct"],
+                            sc=[q.get("scout_green", 0), q.get("scout_red", 0)] if q.get("scouts") else None,
                             socials=q["socials"] if q["meta_state"] == 2 else None,
                             held=any(tkey("solana", q["addr"]) in st["positions"]
                                      for st in S["agents"].values()))
-                       for q in self.pump.top(self.t, 12)]
+                       for q in (self.scouts.review(q) if self.scouts else q for q in self.pump.top(self.t, 12))]
                 pump = dict(ps, hot=hot, sol_usd=self.sol_usd, demo=self.demo)
             fomo = None
             if self.fomo:
@@ -3774,6 +4056,8 @@ class Engine:
                 memory=self.memory.summary() if self.memory else None,
                 brain=self.brain.status() if self.brain else None,
                 themes=self.memory.hot_themes(self.t, 6) if self.memory else [],
+                scouts=dict(squad=self.scouts.summary(), desk=list(self.desk)[::-1], now=self.on_desk)
+                if self.scouts else None,
                 fomo_off=self.fomo is None, dex=dict(error=self.dex_err, ok_t=self.dex_ok_t), phase=self.phase, phase_t=self.phase_t,
                 next_at=self.next_at, updated=time.time(), poll=self.cfg["poll_seconds"])
 
@@ -4036,6 +4320,18 @@ td:first-child{font-weight:600}
 .empty{color:var(--mute);font-size:13px;padding:18px 4px;line-height:1.55}
 .prog{display:inline-block;width:70px;height:6px;border-radius:6px;background:rgba(255,255,255,.08);vertical-align:middle;margin-right:7px;overflow:hidden}
 .prog b{display:block;height:100%;border-radius:6px;background:linear-gradient(90deg,#3dffb5,#ffcf5c,#ff5ea8);background-size:70px 100%}
+/* scout squad */
+.squad{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:18px;margin-bottom:14px}
+@media (max-width:900px){.squad{grid-template-columns:1fr}}
+.squad h3{font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:var(--mute);margin:0 0 8px;font-weight:600}
+.desk .call{font-size:20px;font-weight:700;margin-bottom:8px}.desk .call .v{font-size:14px;font-weight:600;margin-left:8px}
+.srow{display:grid;grid-template-columns:62px 46px 1fr;gap:8px;align-items:baseline;font-size:12.5px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+.srow b{font-weight:700}.srow .sc{font-family:var(--mono);font-size:12px;text-align:right}
+.scouts{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+.scout{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:9px 10px;font-size:11.5px;line-height:1.4;min-width:0}
+.scout .n{font-weight:700;font-size:13px}.scout .r{color:var(--mute);font-size:10.5px;text-transform:uppercase;letter-spacing:.08em}
+.scout .last{margin-top:5px;color:var(--mute);overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical}
+.calls{margin-top:12px;font-size:12px;line-height:1.5;max-height:150px;overflow:auto}
 .learn{font-size:11.5px;margin-top:9px;padding:7px 9px;border-radius:10px;background:rgba(61,255,181,.06);border:1px solid rgba(61,255,181,.22);line-height:1.45}
 .learn .t{color:var(--pump);font-weight:700}
 .why{font-size:11.5px;color:var(--mute);margin-top:9px;line-height:1.45;min-height:16px}
@@ -4079,6 +4375,8 @@ td:first-child{font-weight:600}
 </section>
 
 <section class="card spot" id="spot"></section>
+
+<section class="card squad" id="squad" style="display:none"></section>
 
 <section class="grid mid">
   <div class="card chartcard"><div class="row"><div class="label" style="margin:0">Balance history</div><div class="small" id="range" style="margin:0"></div></div><canvas id="chart"></canvas></div>
@@ -4193,6 +4491,27 @@ function realityTxt(C){
     ` vs ${(C.assumed*100).toFixed(1)}% assumed`+((b.cost!=null||s.cost!=null)?"; practice now uses the real numbers":"")+
     (routes?`<br>typical fill time: ${routes}`:"");
 }
+// the scouts and the call Spark is making
+function renderSquad(S){
+  const el=$("#squad");
+  if(!S){el.style.display="none";return}
+  el.style.display="grid";
+  const col=v=>v>=0.15?"var(--up)":(v<=-0.15?"var(--down)":"var(--mute)");
+  const rows=sc=>(sc||[]).map(([n,v,note])=>`<div class="srow"><b>${esc(n)}</b><span class="sc" style="color:${col(v)}">${v>0?"+":""}${v.toFixed(2)}</span><span>${esc(note)}</span></div>`).join("");
+  const N=S.now, pc=v=>(v>=0?"+":"")+(v*100).toFixed(1)+"%";
+  const verdict=N?(N.verdict==="buy"?'<span class="v" style="color:var(--up)">BUYING</span>':`<span class="v" style="color:var(--mute)">passing: ${esc(N.verdict)}</span>`):"";
+  const desk=N?`<div class="call">$${esc(N.symbol)} <span class="mute small">${kmoney(N.mcap)} · curve ${N.prog.toFixed(0)}%${N.ev!=null?" · model "+pc(N.ev):""}</span>${verdict}</div>${rows(N.scouts)}`
+    :'<div class="empty">Waiting for a launch that gets past the hard rug checks...</div>';
+  const calls=(S.desk||[]).map(c=>{const g=c.scouts.filter(x=>x[1]>=0.15).length,r=c.scouts.filter(x=>x[1]<=-0.15).length;
+    return `<div>${hhmm(c.t)} <b>${esc(c.agent)}</b> bought $${esc(c.symbol)} ${money(c.size)} at ${kmoney(c.mcap)}: scouts <span class="up">${g} green</span> / <span class="down">${r} red</span>${c.ev!=null?", model "+pc(c.ev):""}</div>`}).join("");
+  const squad=S.squad.map(x=>{const last=x.notes[0];
+    return `<div class="scout"><div class="n">${esc(x.name)}</div><div class="r">${esc(x.role)}</div>
+      <div class="small" style="margin:4px 0 0">${x.reviewed} reviewed · <span class="up">${x.green}</span> / <span class="down">${x.red}</span>${x.vetoes?` · <span class="down">${x.vetoes} vetoes</span>`:""}</div>
+      <div class="last" title="${esc(x.watches)}">${last?`$${esc(last[0])}: ${esc(last[2])}`:esc(x.watches)}</div></div>`}).join("");
+  setHTML("#squad",`<div class="desk"><h3>Spark's desk: weighing now</h3>${desk}
+      ${calls?`<h3 style="margin-top:14px">Recent calls</h3><div class="calls">${calls}</div>`:""}</div>
+    <div><h3>Scout squad · reporting to Spark</h3><div class="scouts">${squad}</div></div>`);
+}
 function brainTxt(B,T){
   let out="";
   if(T&&T.length)out+=`<br><span class="t">Hot themes</span> `+T.map(t=>esc(t[0])).join(", ");
@@ -4231,10 +4550,11 @@ function renderPump(p){
     q.top>8?`<span class="badge b-warn">top ${q.top.toFixed(0)}%</span>`:"",
     q.dev_age!=null&&q.dev_age<1?`<span class="badge b-bad" title="the creator's wallet first appeared ${Math.round(q.dev_age*60)} minutes ago">fresh dev wallet</span>`:"",
     q.whale_sold>5&&q.net<0?`<span class="badge b-warn">big holders dumping</span>`:""].filter(Boolean).join(" ");
-  setHTML("#pump",`<table><tr><th>Token</th><th>Age</th><th>MCap</th><th>Curve</th><th>Buyers</th><th>B/S 5m</th><th>Net 5m</th><th></th></tr>`+
+  setHTML("#pump",`<table><tr><th>Token</th><th>Age</th><th>MCap</th><th>Curve</th><th>Buyers</th><th>B/S 5m</th><th>Net 5m</th><th>Scouts</th><th></th></tr>`+
     p.hot.map(q=>`<tr><td>$${esc(q.symbol)}</td><td>${dur(q.age)}</td><td>${kmoney(q.mcap)}</td>
       <td><span class="prog"><b style="width:${Math.min(100,q.prog).toFixed(0)}%"></b></span>${q.prog.toFixed(0)}%</td>
       <td>${q.buyers}</td><td>${q.buys}/${q.sells}</td><td class="${cls(q.net)}">${q.net>=0?"+":""}${q.net.toFixed(1)} SOL</td>
+      <td>${q.sc?`<span class="up">${q.sc[0]}✓</span> <span class="down">${q.sc[1]}✗</span>`:"-"}</td>
       <td>${flags(q)}</td></tr>`).join("")+"</table>");
 }
 
@@ -4299,7 +4619,7 @@ function render(s){
   $("#logn").textContent=s.log.length+" recent events";
   setHTML("#log",s.log.map(e=>`<div><span style="color:#a68f95">${hhmm(e.t)}</span> <span class="tag t-${esc(e.tag)}">[${esc(e.tag)}]</span> ${esc(e.msg)}</div>`).join(""));
 
-  demo_mode=demo; renderPump(s.pump); renderFomo(s.fomo,s.fomo_off); renderTape(s); renderSpot(s);
+  demo_mode=demo; renderPump(s.pump); renderFomo(s.fomo,s.fomo_off); renderTape(s); renderSpot(s); renderSquad(s.scouts);
   const d=s.dex||{}; $("#ddot").className="dot"+(d.error?" off":(d.ok_t||demo?"":" dead"));
   $("#dfeed").textContent=d.error?"DexScreener error":(d.ok_t||demo?"DexScreener ok":"DexScreener...");
 
@@ -4631,6 +4951,15 @@ def start_live(args):
     return ex, names
 
 
+def trading_agents(agents, paper_agents=False, live_names=(), pump=True):
+    """Who trades this run. By default only Spark (plus any live agents); the others are its scouts.
+    Without pump.fun there is nothing to scout, so everyone trades as before."""
+    if paper_agents or not pump:
+        return agents
+    keep = {"Spark", *live_names}
+    return [a for a in agents if a["name"] in keep]
+
+
 def load_env_file(path=None):
     """Read KEY=VALUE lines from a .env file next to this script (kept out of git by .gitignore).
     Variables already set in the environment win."""
@@ -4685,6 +5014,9 @@ def main():
                     help="with --live: buy pump.fun launches straight on pump.fun, paid in SOL (PumpPortal builds "
                          "the transaction, 0.5%% fee). Faster, and works before Jupiter knows a token. "
                          "Falls back to USDC through Jupiter when SOL runs short or the route errors")
+    ap.add_argument("--paper-agents", action="store_true",
+                    help="let the other agents paper-trade as well, as before. By default they work as Spark's "
+                         "scouts and only Spark (and any --live-agents) trades")
     ap.add_argument("--unbench", action="store_true",
                     help="let live agents that were benched (real trades far behind practice) buy again now")
     args = ap.parse_args()
@@ -4744,7 +5076,8 @@ def main():
     CFG["daily_loss_pct"] = args.daily_loss
     CFG["report_live"] = args.report_live
     apply_risk(AGENTS, args.risk)
-    engine = Engine(CFG, AGENTS, src, demo=args.demo, live=live, live_names=live_names,
+    engine = Engine(CFG, trading_agents(AGENTS, args.paper_agents, live_names, bool(pump)), src,
+                    demo=args.demo, live=live, live_names=live_names,
                     live_only=args.live_only,
                     pump=pump, fomo=fomo, notify=notify)
     if pump and args.demo:
@@ -4766,16 +5099,24 @@ def main():
                                                   for a in engine.acfg.values()) else CFG["fast_seconds"]
 
         def fast_loop():
+            # Event-driven: run as soon as new trades land, at most every fast_min_gap seconds and at
+            # least every fast_s (exits still need checking when the market is quiet).
             while True:
+                t0 = time.time()
+                pump.wake.clear()
                 try:
                     engine.fast()
                 except Exception as e:
                     engine._err(f"pump.fun loop error: {e}")
-                time.sleep(fast_s)
+                spent = time.time() - t0
+                time.sleep(max(0.0, CFG["fast_min_gap"] - spent))
+                pump.wake.wait(max(0.0, fast_s - max(spent, CFG["fast_min_gap"])))
         threading.Thread(target=fast_loop, name="fast", daemon=True).start()
     mode = "DEMO" if args.demo else ("LIVE + PAPER" if live else "PAPER")
     feeds = ", ".join(["DexScreener"] + (["pump.fun"] if pump else []) + (["Fomo"] if fomo else []))
     print(f"Spark risk level: {args.risk}")
+    if engine.scouts and not args.paper_agents:
+        print("Scouts working for Spark: " + ", ".join(f"{n} ({r.lower()})" for n, r, _ in Scouts.SQUAD))
     if engine.brain and not args.demo:
         b = engine.brain
         print(f"AI brain: {b.model}, up to {b.per_hour} launches an hour" if b.enabled else f"AI brain {b.error}")

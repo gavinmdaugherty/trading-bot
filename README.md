@@ -1,6 +1,6 @@
 # MemeBot
 
-A memecoin paper-trading engine with a live dashboard. It watches **DexScreener**, **pump.fun** and **Fomo** at the same time and runs ten strategy agents side by side, each with its own $200 paper balance. It uses only the Python standard library (3.9+), and everything is in one file.
+A self-learning pump.fun trading bot, **Spark**, with a live dashboard. It watches **DexScreener**, **pump.fun** and **Fomo** at the same time. Seven other agents work as Spark's scouts: each studies one side of every launch and reports to Spark, which makes the call. It uses only the Python standard library (3.9+), and everything is in one file.
 
 ```bash
 python memebot.py --demo     # offline preview with synthetic data
@@ -21,7 +21,35 @@ pump.fun also has a second, independent source: the bot can read pump.fun's own 
 
 Use `--no-pump` or `--no-fomo` to turn a feed off. If `FOMO_API_KEY` isn't set, the Fomo watcher stays off and the bot tells you at startup.
 
-## The agents
+## The scouts
+
+By default only Spark trades. The other agents work for it, each studying one side of every launch that gets past the hard rug checks:
+
+| Scout | Studies |
+|---|---|
+| **Atlas** | Holders: how spread out they are, how many top holders are fresh wallets that never traded another launch, and groups that bought within the same 1.5 seconds after the launch rush |
+| **Bolt** | Flow: whether buying is speeding up or fading over the last 30 seconds, buy sizes, sell pressure, distinct buyers |
+| **Cinder** | Creator: wallet age, past launches, past runners and rugs, how much the creator holds |
+| **Drift** | Socials: which links (X profile, X community, tweet, Telegram, website), the description, copycat tickers, reused links |
+| **Ember** | Dump watch: snipers and bundles still holding, big holders' net selling, known rug wallets, distance from the high |
+| **Flux** | Trends: how its theme is doing, and whether it matches what is trending on Fomo or up hard on DEXes |
+| **Crest** | Graduation: how fast the curve is filling, and when it would graduate at that pace |
+
+Each scout returns a score from -1 to +1 with a written note. How Spark uses them:
+- **Model:** the scores are model features, so Spark learns from results how far to trust each scout.
+- **Vetoes:** two red flags block a buy outright. Atlas vetoes 5 or more top holders who bought together and hold 15% or more. Ember vetoes big holders net-dumping 10% or more of supply while money flows out.
+- **Before the model is ready:** three red scouts are a no.
+
+The dashboard's scout panel shows:
+- the launch Spark is weighing right now, with every scout's note and Spark's verdict
+- Spark's recent calls
+- each scout's record
+
+Scouting reads only data already in memory, so a full review takes well under a tenth of a millisecond per launch. Spark's decision loop also runs as soon as new trades arrive, up to 4 times a second, instead of on a fixed 1-second tick.
+
+Use `--paper-agents` to have the other agents paper-trade as well, as before.
+
+## The agents (with --paper-agents)
 
 | Agent | Feed | Idea |
 |---|---|---|

@@ -1397,5 +1397,107 @@ def urllib_parse_qsl(s):
     return urllib.parse.parse_qsl(s)
 
 
+class ScoutSquad(unittest.TestCase):
+    def setUp(self):
+        self.now = 1000.0
+        self.w = m.PumpWatcher(m.CFG, clock=lambda: self.now)
+        self.sc = m.Scouts()
+
+    def launch(self, mint="S1"):
+        self.w.handle(dict(txType="create", mint=mint, traderPublicKey="DEV", symbol="CAT", name="cat coin",
+                           initialBuy=0, vSolInBondingCurve=30.0, vTokensInBondingCurve=m.PUMP_V_TOK0, pool="pump"))
+
+    def buy(self, trader, sol, bal, mint="S1", vsol=40.0, vtok=800e6, side="buy", amt=0):
+        self.w.handle(dict(txType=side, mint=mint, traderPublicKey=trader, solAmount=sol, newTokenBalance=bal,
+                           tokenAmount=amt, vSolInBondingCurve=vsol, vTokensInBondingCurve=vtok, pool="pump"))
+
+    def test_every_scout_reports_with_a_note(self):
+        self.launch()
+        for i in range(30):
+            self.now += 3
+            self.buy(f"W{i}", 0.3 + i * 0.02, 4e6)
+        q = self.sc.review(self.w.get("S1"))
+        self.assertEqual(set(q["scouts"]), set(m.Scouts.NAMES))
+        for name, (score, note) in q["scouts"].items():
+            self.assertTrue(-1 <= score <= 1 and note, name)
+        self.assertIn("buys in the last 30s", q["scouts"]["Bolt"][1])
+        self.assertIn("graduates in about", q["scouts"]["Crest"][1])
+        self.assertIsNone(q["scout_veto"])
+        self.assertGreater(q["scouts"]["Bolt"][0], 0)                   # steady stream of growing buys
+        x = m.Learner.features(q)
+        self.assertEqual(len(x), len(m.Learner.FEATURES))
+        self.assertEqual(x[-7:], [q["scout_scores"][n] for n in m.Scouts.NAMES])
+
+    def test_coordinated_group_after_the_rush_is_vetoed_by_atlas(self):
+        self.launch()
+        self.now += 60                                                  # well after the sniper window
+        for i in range(6):
+            self.now += 0.2
+            self.buy(f"FARM{i}", 1.0, 30e6)                             # six 3% holders within 1.2s
+        q = self.sc.review(self.w.get("S1"))
+        self.assertEqual(q["cluster_n"], 6)
+        self.assertEqual(q["scout_veto"][0], "Atlas")
+        self.assertEqual(q["top10_fresh"], 6)
+
+    def test_launch_rush_is_left_to_the_sniper_checks(self):
+        self.launch()
+        for i in range(6):
+            self.now += 0.2
+            self.buy(f"SNIPE{i}", 1.0, 30e6)
+        self.assertEqual(self.w.get("S1")["cluster_n"], 0)
+
+    def test_ember_vetoes_a_dump_and_counts_it_once(self):
+        self.launch()
+        self.now += 30
+        self.buy("WHALE", 3.0, 120e6)                                   # 12% holder
+        self.now += 30
+        self.buy("WHALE", 4.0, 0, side="sell", amt=120e6, vsol=36.0)
+        q = self.sc.review(self.w.get("S1"))
+        self.assertEqual(q["scout_veto"][0], "Ember")
+        self.sc.review(self.w.get("S1"))
+        st = self.sc.stats["Ember"]
+        self.assertEqual((st["reviewed"], st["vetoes"]), (1, 1))
+
+    def test_spark_obeys_the_veto_and_three_red_scouts(self):
+        eng = demo_engine()
+        a = eng.acfg["Spark"]
+        q = dict(scout_veto=("Ember", "dumping"), price=1, migrated=False, complete=False, from_create=True,
+                 last_trade=eng.t, age=100, prog=20, dev_sold=False, dev_pct=1, dev_init_pct=1, creator_launches=0,
+                 bundle_pct=0, sniper_pct=0, top_pct=1, top10_pct=10, copycat=False, dup_social=False)
+        self.assertEqual(eng._hard_curve_reason(a, q), "scout veto (Ember)")
+        q.update(scout_veto=None, scout_red=3)
+        self.assertIsNone(eng._hard_curve_reason(a, q))
+        self.assertEqual(eng._soft_curve_reason(a, q), "scouts against it")
+
+    def test_buys_land_on_sparks_desk_with_the_scout_reports(self):
+        eng = demo_engine()
+        for _ in range(40):
+            eng.cycle()
+            if eng.desk:
+                break
+        self.assertTrue(eng.desk)
+        call = eng.desk[-1]
+        self.assertEqual(len(call["scouts"]), 7)
+        self.assertTrue(any("scouts" in e["msg"] and "green" in e["msg"] for e in eng.state["log"]))
+        snap = eng.snapshot()
+        self.assertEqual(len(snap["scouts"]["squad"]), 7)
+        self.assertTrue(snap["pump"]["hot"][0]["sc"] is not None)
+
+    def test_trades_wake_the_decision_loop(self):
+        self.launch()
+        self.w.wake.clear()
+        self.buy("X", 0.5, 1e6)
+        self.assertTrue(self.w.wake.is_set())
+
+
+class WhoTrades(unittest.TestCase):
+    def test_only_spark_trades_unless_asked(self):
+        names = lambda lst: [a["name"] for a in lst]
+        self.assertEqual(names(m.trading_agents(m.AGENTS)), ["Spark"])
+        self.assertEqual(names(m.trading_agents(m.AGENTS, live_names=["Bolt"])), ["Bolt", "Spark"])
+        self.assertEqual(len(m.trading_agents(m.AGENTS, paper_agents=True)), len(m.AGENTS))
+        self.assertEqual(len(m.trading_agents(m.AGENTS, pump=False)), len(m.AGENTS))   # nothing to scout
+
+
 if __name__ == "__main__":
     unittest.main()
