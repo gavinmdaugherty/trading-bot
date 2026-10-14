@@ -752,6 +752,20 @@ class LiveSpark(unittest.TestCase):
         self.assertEqual(len(sh), 5)
         self.assertEqual(sum(1 for v in sh if v["picked"]), 1)
 
+    def test_failed_sells_back_off(self):
+        self.assertTrue(self.eng._buy_curve("Spark LIVE", self.q()))
+        k = m.tkey("solana", "MINT1")
+        pos = self.eng.state["agents"]["Spark LIVE"]["positions"][k]
+        tries = []
+        self.live.sell = lambda mint, raw: tries.append(1) or dict(ok=False, stage="tx", err="no route")
+        self.eng._sell("Spark LIVE", k, "stop-loss")
+        self.eng._sell("Spark LIVE", k, "stop-loss")         # within the backoff: not attempted again
+        self.assertEqual(len(tries), 1)
+        self.eng.t += 6
+        self.eng._sell("Spark LIVE", k, "stop-loss")
+        self.assertEqual(len(tries), 2)
+        self.assertEqual(pos["retry_at"] - self.eng.t, 10)    # 5s, then 10s, doubling up to 2 minutes
+
     def test_live_blocked_when_wallet_sol_low(self):
         self.eng.wallet = dict(pub="x", usdc=15.0, sol=0.001)
         self.assertEqual(self.eng._live_reason("Spark LIVE"), "wallet SOL too low for fees")

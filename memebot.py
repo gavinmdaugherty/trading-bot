@@ -2747,14 +2747,19 @@ class Engine:
         units = pos["units"] if full else pos["units"] * frac
         sold_raw = None
         if pos.get("live"):
+            if self.t < pos.get("retry_at", 0):
+                return  # a recent sell failed: wait out the backoff instead of hammering the APIs
             want = pos["raw"] if full else int(pos["raw"] * frac)
             res = self.live.sell(pos["addr"], want)
             if not res["ok"]:
                 if full:
                     pos["pending_exit"] = reason
                 pos["sell_fails"] = pos.get("sell_fails", 0) + 1
-                self._live_fail(f"{name} could not sell ${pos['symbol']}: {res['err']} (will retry)")
+                wait = min(120, 5 * 2 ** min(pos["sell_fails"] - 1, 5))
+                pos["retry_at"] = self.t + wait
+                self._live_fail(f"{name} could not sell ${pos['symbol']}: {res['err']} (retrying in {wait}s)")
                 return
+            pos.pop("retry_at", None)
             self.live_fails = 0
             proceeds = res["got_usd"]
             sold_raw = res.get("sold_raw", want)
@@ -3998,6 +4003,7 @@ def main():
         os.remove(CFG["state_file"])
 
     # Never abandon real positions: if the saved state holds open live trades, live mode is required.
+    open_live = {}
     if os.path.exists(CFG["state_file"]) and not args.demo:
         try:
             with open(CFG["state_file"]) as f:
@@ -4013,6 +4019,14 @@ def main():
 
     live, live_names = None, []
     if args.live:
+        wanted = [n.strip() for n in args.live_agents.split(",") if n.strip()]
+        orphans = [n for n in open_live if n.removesuffix(" LIVE") not in wanted]
+        live_names = wanted
+        if orphans:
+            raise SystemExit("These live agents still hold real positions but are not in --live-agents: "
+                             + ", ".join(orphans) + "\nInclude them (for example --live-agents "
+                             + ",".join(sorted({n.removesuffix(' LIVE') for n in orphans} | set(live_names)))
+                             + ") so the bot can manage and sell them.")
         live, live_names = start_live(args)
 
     poll = args.poll if args.poll is not None else (1.0 if args.demo else CFG["poll_seconds"])
