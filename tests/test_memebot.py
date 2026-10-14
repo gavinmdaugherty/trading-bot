@@ -415,6 +415,29 @@ class LiveSpark(unittest.TestCase):
         self.assertNotIn(k, st["positions"])
         self.assertEqual(st["trades"][-1]["reason"], "profit lock 1.3x")
 
+    def test_live_usd_sets_the_bankroll_each_run(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            cfg = dict(self.cfg, state_file=os.path.join(d, "state.json"))
+            def engine(usd):
+                c = dict(cfg, live_usd=usd)
+                pump = m.DemoPump(c, clock=time.time)
+                e = m.Engine(c, m.AGENTS, m.DemoSource(), demo=False, pump=pump, live=self.live,
+                             live_names=["Spark"], live_only=True)
+                return e, e.state["agents"]["Spark LIVE"]
+            e, st = engine(15.0)
+            st["cash"], st["pnl"] = 4.99, -10.01   # an earlier run lost $10
+            e._save()
+            e, st = engine(25.0)                   # the owner topped up and starts with --live-usd 25
+            self.assertEqual((st["cash"], st["start"]), (25.0, 25.0))
+            self.assertEqual(st["pnl"], -10.01)     # history is kept
+            self.assertTrue(any("bankroll set to $25.00" in l["msg"] for l in e.state["log"]))
+
+    def test_pumpportal_paywall_notice_requests_onchain_feed(self):
+        w = m.PumpWatcher(m.CFG, clock=lambda: 0.0)
+        w.handle({"message": "'subscribeTokenTrade' and 'subscribeAccountTrade' now require an API key"})
+        self.assertTrue(w.want_rpc)
+
     def test_live_blocked_when_wallet_sol_low(self):
         self.eng.wallet = dict(pub="x", usdc=15.0, sol=0.001)
         self.assertEqual(self.eng._live_reason("Spark LIVE"), "wallet SOL too low for fees")

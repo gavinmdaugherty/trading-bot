@@ -515,6 +515,7 @@ class PumpWatcher:
         self.recent = set()      # trades already counted (both feeds can deliver the same one)
         self.recent_q = deque()
         self.rpc = None
+        self.want_rpc = False
 
     # ---- feed ---- #
     def start(self):
@@ -650,6 +651,8 @@ class PumpWatcher:
                 if text not in self.server_msgs and len(self.server_msgs) < 20:
                     self.server_msgs.append(text)
                     self.events.append(("PUMP", f"PumpPortal says: {text}"))
+                    if "subscribetokentrade" in text.lower().replace(" ", ""):
+                        self.want_rpc = True  # trade data restricted: the engine switches to the chain
             return
         now = self.clock()
         tx = str(m.get("txType") or "").lower()
@@ -1725,12 +1728,28 @@ class Engine:
         if not cfg["daily_loss_pct"]:
             for st in self.state["agents"].values():
                 st["capped"] = False
+        self.bank_notes = []
+        for name, a in self.acfg.items():
+            # --live-usd is the real money each live agent may use this run. The startup check has
+            # already confirmed the wallet holds it, so a top-up (or a fresh budget) takes effect here.
+            if not a.get("live"):
+                continue
+            st = self.state["agents"][name]
+            invested = sum(p["size"] for p in st["positions"].values())
+            bank = cfg["live_usd"]
+            if abs(st["start"] - bank) > 0.005 or abs(st["cash"] + invested - bank) > 0.005:
+                self.bank_notes.append(f"{name} bankroll set to ${bank:.2f} for this run "
+                                       f"(was ${st['cash'] + invested:.2f})")
+                st["cash"], st["start"] = max(0.0, bank - invested), bank
+                self.state["equity"] = []
         for st in self.state["agents"].values():
             for pos in st["positions"].values():
                 if pos.get("venue") == "curve" and self.pump:
                     self.pump.follow(pos["addr"], pos["symbol"])
                 else:
                     self._track(pos["chain"], pos["addr"])
+        for note in self.bank_notes:
+            self.emit("RISK", note)
         self._cache = self.snapshot()
 
     # ---- persistence ------------------------------------------------------ #
@@ -2262,6 +2281,11 @@ class Engine:
             for g in self.pump.pop_migrations():
                 self._on_grad(g)
             ps = self.pump.status()
+            if not self.demo and self.pump.rpc is None and self.pump.want_rpc:
+                self.pump_warned = True
+                self.emit("WARN", "PumpPortal does not send trade data without a paid key. "
+                                  "Switching on the on-chain pump.fun feed through your Solana RPC.")
+                self.pump.start_rpc()
             if (not self.demo and not self.pump_warned and self.pump.rpc is None
                     and ps["connected_for"] > 90 and ps["seen"] >= 10 and ps["trades"] == 0):
                 self.pump_warned = True
