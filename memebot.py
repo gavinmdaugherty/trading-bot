@@ -3506,7 +3506,7 @@ HTML = r"""<!doctype html>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap">
 <style>
 :root{
-  --bg:#06060b; --panel:rgba(20,20,34,.62); --panel2:rgba(28,28,46,.7); --line:rgba(255,255,255,.075);
+  --bg:#06060b; --panel:rgba(18,18,31,.84); --panel2:rgba(26,26,43,.88); --line:rgba(255,255,255,.075);
   --line2:rgba(255,255,255,.14); --text:#eef0ff; --mute:#8b8fae;
   --up:#3dffb5; --down:#ff5c7a; --amber:#ffcf5c; --blue:#6ea8ff; --violet:#a78bfa; --warn:#ffb057;
   --pump:#3dffb5; --fomo:#ff5ea8;
@@ -3523,7 +3523,8 @@ body{font-family:var(--sans);color:var(--text);min-height:100vh;padding:18px 22p
 .bgfx::before{content:"";position:absolute;inset:0;
   background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);
   background-size:44px 44px;mask-image:radial-gradient(ellipse at 50% 0%,#000 30%,transparent 75%)}
-.blob{position:absolute;border-radius:50%;filter:blur(90px);opacity:.38;animation:drift 26s ease-in-out infinite alternate}
+.blob{position:absolute;border-radius:50%;opacity:.38;animation:drift 26s ease-in-out infinite alternate;will-change:transform;
+  -webkit-mask-image:radial-gradient(closest-side,#000 15%,transparent);mask-image:radial-gradient(closest-side,#000 15%,transparent)}
 .blob.a{width:620px;height:620px;background:#3dffb5;top:-260px;left:-140px;opacity:.16}
 .blob.b{width:560px;height:560px;background:#7c3aed;top:-200px;right:-160px;animation-duration:32s;opacity:.28}
 .blob.c{width:500px;height:500px;background:#ff5ea8;bottom:-280px;left:35%;animation-duration:38s;opacity:.14}
@@ -3538,7 +3539,7 @@ h1{font-size:30px;font-weight:700;letter-spacing:-.03em;line-height:1;
 .sub{color:var(--mute);font-size:13px;margin-top:5px}
 .spacer{flex:1}
 .pill{display:flex;align-items:center;gap:8px;padding:8px 13px;border:1px solid var(--line);border-radius:999px;
-  background:var(--panel);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);font-size:12.5px;color:var(--text);white-space:nowrap}
+  background:var(--panel);font-size:12.5px;color:var(--text);white-space:nowrap}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--up);box-shadow:var(--glow-up);flex:none;animation:beat 2s ease-in-out infinite}
 .dot.off{background:var(--warn);box-shadow:0 0 14px var(--warn)}
 .dot.dead{background:#4a4d66;box-shadow:none;animation:none}
@@ -3549,8 +3550,8 @@ button.pill:hover{border-color:var(--up);box-shadow:var(--glow-up)}
 button.pill:focus-visible{outline:2px solid var(--up);outline-offset:2px}
 
 /* ticker tape */
-.tape{overflow:hidden;border:1px solid var(--line);border-radius:12px;background:var(--panel);backdrop-filter:blur(12px);
-  -webkit-backdrop-filter:blur(12px);margin-bottom:12px;height:36px;display:flex;align-items:center;
+.tape{overflow:hidden;border:1px solid var(--line);border-radius:12px;background:var(--panel);
+  margin-bottom:12px;height:36px;display:flex;align-items:center;
   mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent)}
 .tape-track{display:flex;gap:34px;white-space:nowrap;padding-left:34px;animation:scroll 60s linear infinite;width:max-content;
   font:600 12.5px var(--mono)}
@@ -3565,7 +3566,7 @@ button.pill:focus-visible{outline:2px solid var(--up);outline-offset:2px}
 .spin.bad{animation:none;border-color:var(--down);box-shadow:var(--glow-down)}
 @keyframes spin{to{transform:rotate(360deg)}}
 .banner{border:1px solid rgba(255,176,87,.35);background:rgba(255,176,87,.08);color:#ffd7a6;border-radius:12px;padding:10px 14px;
-  font-size:13px;margin-bottom:14px;display:none;backdrop-filter:blur(10px)}
+  font-size:13px;margin-bottom:14px;display:none;}
 .banner.live{border-color:rgba(255,59,92,.45);background:linear-gradient(90deg,rgba(255,59,92,.16),rgba(255,59,92,.05));color:#ffc2cd}
 
 .grid{display:grid;gap:14px}
@@ -3573,7 +3574,7 @@ button.pill:focus-visible{outline:2px solid var(--up);outline-offset:2px}
 .mid{grid-template-columns:1.3fr 1fr;margin-top:14px}
 .feeds{grid-template-columns:1.4fr 1fr;margin-top:14px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:16px 18px;min-width:0;position:relative;
-  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);box-shadow:0 10px 30px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.05);
+  box-shadow:0 10px 30px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.05);
   transition:border-color .3s,transform .3s}
 .card:hover{border-color:var(--line2)}
 .label{color:var(--mute);font-size:11.5px;margin-bottom:9px;text-transform:uppercase;letter-spacing:.09em;font-weight:600}
@@ -3639,7 +3640,7 @@ button.pill:focus-visible{outline:2px solid var(--up);outline-offset:2px}
 .tables{grid-template-columns:1fr 1fr;margin-top:14px}
 table{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
 th{color:var(--mute);font-weight:600;text-align:left;padding:7px 8px;border-bottom:1px solid var(--line2);font-size:10.5px;
-  text-transform:uppercase;letter-spacing:.08em;position:sticky;top:0;background:rgba(14,14,24,.92);backdrop-filter:blur(8px)}
+  text-transform:uppercase;letter-spacing:.08em;position:sticky;top:0;background:rgba(14,14,24,.92);}
 td{padding:8px;border-bottom:1px solid rgba(255,255,255,.04);white-space:nowrap}
 tr:hover td{background:rgba(255,255,255,.03)}
 td:first-child{font-weight:600}
