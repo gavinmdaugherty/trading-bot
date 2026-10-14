@@ -1,0 +1,149 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Spark scout squad</title>
+<style>
+@font-face{font-family:"JBM";src:url(fonts/jetbrains-mono-latin-500-normal.woff2) format("woff2");font-weight:500}
+@font-face{font-family:"JBM";src:url(fonts/jetbrains-mono-latin-700-normal.woff2) format("woff2");font-weight:700}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:1080px;height:1080px;overflow:hidden;background:#05050a}
+body{font-family:"Inter Display","Inter",sans-serif;color:#f2f3ff;-webkit-font-smoothing:antialiased}
+#stage{position:relative;width:1080px;height:1080px;overflow:hidden}
+.grid{position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,.045) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.045) 1px,transparent 1px);
+  background-size:54px 54px;-webkit-mask-image:radial-gradient(ellipse at 50% 45%,#000 25%,transparent 72%)}
+.blob{position:absolute;border-radius:50%;filter:blur(110px)}
+.scene{position:absolute;inset:0;opacity:0}
+.kicker{font:700 20px "JBM";letter-spacing:.32em;text-transform:uppercase;color:#3dffb5}
+.h{font-weight:800;letter-spacing:-.045em;line-height:1.02}
+.g{background:linear-gradient(90deg,#3dffb5,#6ea8ff 55%,#a78bfa);-webkit-background-clip:text;background-clip:text;color:transparent}
+/* squad ring */
+.sc{position:absolute;width:200px;margin-left:-100px;text-align:center;padding:16px 10px;border-radius:22px;
+  background:rgba(20,20,36,.92);border:2px solid rgba(255,255,255,.1)}
+.sc .n{font-size:30px;font-weight:800;letter-spacing:-.02em}
+.sc .r{font:700 14px "JBM";letter-spacing:.16em;text-transform:uppercase;color:#8d91b3;margin-top:4px}
+#core{position:absolute;left:540px;top:600px;width:220px;height:220px;margin:-110px 0 0 -110px}
+/* report */
+#coin{position:absolute;left:90px;top:250px;width:900px;display:flex;align-items:center;gap:22px}
+#coin .t{font-size:64px;font-weight:800;letter-spacing:-.03em}
+#coin .m{font:700 22px "JBM";color:#8d91b3}
+.rep{position:absolute;left:90px;width:900px;display:grid;grid-template-columns:150px 64px 1fr;align-items:center;gap:12px;
+  font-size:25px;padding:11px 0;border-bottom:1px solid rgba(255,255,255,.06)}
+.rep b{font-size:27px;font-weight:800}
+.rep .mk{font:700 30px "JBM";text-align:center}
+.rep .tx{color:#c9cbe4}
+#tally{position:absolute;left:90px;top:900px;font:700 30px "JBM"}
+.stamp{position:absolute;white-space:nowrap;font:700 64px "JBM";letter-spacing:.14em;padding:14px 40px;border-radius:20px;border:6px solid;transform-origin:center}
+</style></head><body>
+<div id="stage">
+  <svg width="0" height="0" style="position:absolute"><defs><linearGradient id="sg" x1="0.15" y1="0.1" x2="0.85" y2="0.95"><stop offset="0" stop-color="#3dffb5"/><stop offset=".5" stop-color="#6ea8ff"/><stop offset="1" stop-color="#a78bfa"/></linearGradient>
+        <filter id="gl" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="24" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs></svg>
+  <div class="grid"></div>
+  <div class="blob" id="b1" style="width:700px;height:700px;background:#3dffb5"></div>
+  <div class="blob" id="b2" style="width:700px;height:700px;background:#7c3aed"></div>
+  <div class="blob" id="b3" style="width:600px;height:600px;background:#6ea8ff"></div>
+
+  <!-- 1: hook -->
+  <div class="scene" id="s1">
+    <div style="position:absolute;left:0;right:0;top:350px;text-align:center">
+      <div class="kicker">Spark · new upgrade</div>
+      <div class="h" style="font-size:118px;margin-top:36px">Spark doesn't<br><span class="g">trench alone.</span></div>
+    </div>
+  </div>
+
+  <!-- 2: the squad -->
+  <div class="scene" id="s2">
+    <div style="position:absolute;left:0;right:0;top:90px;text-align:center">
+      <div class="kicker">Meet the squad</div>
+      <div class="h" style="font-size:80px;margin-top:22px">Seven <span class="g">scouts.</span></div>
+    </div>
+    <svg id="core" viewBox="0 0 1000 1000">
+      
+      <path d="M500 168 C 528 400, 600 472, 832 500 C 600 528, 528 600, 500 832 C 472 600, 400 528, 168 500 C 400 472, 472 400, 500 168 Z" fill="url(#sg)" filter="url(#gl)"/>
+      <circle cx="500" cy="500" r="24" fill="#fff"/></svg>
+    <svg id="links" width="1080" height="1080" style="position:absolute;left:0;top:0"></svg>
+    <div id="ring"></div>
+  </div>
+
+  <!-- 3: a launch gets reviewed -->
+  <div class="scene" id="s3">
+    <div style="position:absolute;left:0;right:0;top:110px;text-align:center"><div class="kicker">New launch · scouts reporting</div></div>
+    <div id="coin"><div class="t">$CAT</div><div class="m">2m old · curve 21% · 64 buyers</div></div>
+    <div id="reps"></div>
+    <div id="tally"></div>
+  </div>
+
+  <!-- 4: Spark's call -->
+  <div class="scene" id="s4">
+    <div style="position:absolute;left:0;right:0;top:150px;text-align:center">
+      <div class="kicker">Spark makes the call</div>
+      <div class="h" style="font-size:84px;margin-top:24px">One brain. <span class="g">One call.</span></div>
+    </div>
+    <div class="stamp" id="buy" style="left:540px;top:420px;color:#3dffb5;border-color:#3dffb5;background:rgba(61,255,181,.08)">$CAT · BUY</div>
+    <div class="stamp" id="veto" style="left:540px;top:600px;color:#ff5c7a;border-color:#ff5c7a;background:rgba(255,92,122,.08);font-size:46px">$RUGZ · VETO</div>
+    <div id="vnote" style="position:absolute;left:0;right:0;top:730px;text-align:center;font-size:28px;color:#8d91b3">Ember: big holders dumping while money flows out</div>
+    <div id="speed" style="position:absolute;left:0;right:0;top:880px;text-align:center;font:700 30px 'JBM';color:#3dffb5">all seven reports: under a millisecond</div>
+  </div>
+
+  <!-- 5: end card -->
+  <div class="scene" id="s5">
+    <svg id="star" style="position:absolute;left:390px;top:150px" width="300" height="300" viewBox="0 0 1000 1000">
+      <path d="M500 168 C 528 400, 600 472, 832 500 C 600 528, 528 600, 500 832 C 472 600, 400 528, 168 500 C 400 472, 472 400, 500 168 Z" fill="url(#sg)" filter="url(#gl)"/>
+      <circle cx="500" cy="500" r="24" fill="#fff"/></svg>
+    <div style="position:absolute;left:0;right:0;top:500px;text-align:center">
+      <div class="h" style="font-size:150px;background:linear-gradient(90deg,#fff 10%,#bff9e4 45%,#a78bfa 90%);-webkit-background-clip:text;background-clip:text;color:transparent">Spark</div>
+      <div style="font-size:52px;font-weight:700;margin-top:26px;letter-spacing:-.02em">Seven scouts. <span class="g">One call ⚡</span></div>
+    </div>
+    <div style="position:absolute;left:0;right:0;bottom:60px;text-align:center;font-size:20px;color:#6f7394">Illustrative example. Memecoins are extremely risky. Not financial advice.</div>
+  </div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+const clamp=(v,a=0,b=1)=>Math.max(a,Math.min(b,v));
+const ease=x=>1-Math.pow(1-clamp(x),3);
+const back=x=>{x=clamp(x);const c=1.7;return 1+(c+1)*Math.pow(x-1,3)+c*Math.pow(x-1,2)};
+const SC={s1:[0,3],s2:[3,7.4],s3:[7.4,13.2],s4:[13.2,16.8],s5:[16.8,20]};
+function vis(id,t){const [a,b]=SC[id];if(t<a||t>b)return 0;return Math.min(id==="s1"?1:clamp((t-a)/.4),id==="s5"?1:clamp((b-t)/.3))}
+const SQUAD=[["Atlas","Holders"],["Bolt","Flow"],["Cinder","Creator"],["Drift","Socials"],["Ember","Dump watch"],["Flux","Trends"],["Crest","Graduation"]];
+const REPORTS=[["Atlas",1,"top 10 hold 18%, spread across real wallets"],["Bolt",1,"buying speeding up 2.4x in the last 30s"],
+  ["Cinder",0,"creator wallet only 40 minutes old"],["Drift",1,"X community + Telegram, real description"],
+  ["Ember",1,"snipers out, no big holders selling"],["Flux",1,"cat theme running hot right now"],["Crest",1,"filling at +2.1 SOL/min"]];
+// the squad sits on an ellipse around Spark
+const POS=SQUAD.map((_,i)=>{const a=-Math.PI/2+i*2*Math.PI/7;return [540+390*Math.cos(a),600+300*Math.sin(a)]});
+$("#ring").innerHTML=SQUAD.map(([n,r],i)=>`<div class="sc" id="q${i}" style="left:${POS[i][0]}px;top:${POS[i][1]-52}px"><div class="n">${n}</div><div class="r">${r}</div></div>`).join("");
+$("#links").innerHTML=POS.map((p,i)=>`<line id="l${i}" x1="540" y1="600" x2="${p[0]}" y2="${p[1]}" stroke="rgba(61,255,181,.35)" stroke-width="3" stroke-dasharray="8 10"/>`).join("");
+$("#reps").innerHTML=REPORTS.map(([n,ok,tx],i)=>`<div class="rep" id="r${i}" style="top:${370+i*72}px"><b>${n}</b><span class="mk" style="color:${ok?"#3dffb5":"#ff5c7a"}">${ok?"✓":"✗"}</span><span class="tx">${tx}</span></div>`).join("");
+
+function render(t){
+  $("#b1").style.transform=`translate(${-250+Math.sin(t*.4)*80}px,${-330+Math.cos(t*.3)*60}px)`;$("#b1").style.opacity=.10;
+  $("#b2").style.transform=`translate(${650+Math.cos(t*.35)*80}px,${-250+Math.sin(t*.4)*70}px)`;$("#b2").style.opacity=.26;
+  $("#b3").style.transform=`translate(${250+Math.sin(t*.3)*120}px,${700+Math.cos(t*.35)*60}px)`;$("#b3").style.opacity=.10;
+  for(const id in SC){const v=vis(id,t),el=$("#"+id);el.style.opacity=v;el.style.display=v>0?"block":"none";
+    if(id!=="s1")el.style.transform=`translateY(${(1-ease((t-SC[id][0])/.7))*24}px)`}
+
+  {const k=ease(t/.9);$("#s1 > div").style.transform=`scale(${.93+.07*k})`;$("#s1 > div").style.opacity=k}
+
+  // 2: Spark in the middle, the scouts pop in one by one and link up
+  {const u=t-SC.s2[0];
+   $("#core").style.transform=`scale(${back(clamp(u/.6))}) rotate(${u*12}deg)`;
+   SQUAD.forEach((_,i)=>{const k=clamp((u-.5-i*.28)/.4);const el=$("#q"+i);el.style.opacity=k;el.style.transform=`scale(${k>0?back(k):.5})`;
+     const l=$("#l"+i);l.style.opacity=k;l.setAttribute("stroke-dashoffset",-u*40)})}
+
+  // 3: each scout reports on $CAT, then the tally
+  {const u=t-SC.s3[0];
+   $("#coin").style.opacity=ease(u/.5);
+   REPORTS.forEach((_,i)=>{const k=clamp((u-.6-i*.55)/.35);const el=$("#r"+i);el.style.opacity=k;el.style.transform=`translateX(${(1-ease(k))*-40}px)`});
+   const done=u>=.6+6*.55+.4;
+   $("#tally").innerHTML=done?`<span style="color:#3dffb5">6 green</span> <span style="color:#8d91b3">·</span> <span style="color:#ff5c7a">1 red</span> <span style="color:#8d91b3">→ over to Spark</span>`:"";
+   $("#tally").style.opacity=done?ease((u-(.6+6*.55+.4))/.4):0}
+
+  // 4: BUY stamp, then a veto on another launch
+  {const u=t-SC.s4[0];
+   const b=clamp((u-.5)/.35), v=clamp((u-1.5)/.35);
+   $("#buy").style.opacity=b>0?1:0;$("#buy").style.transform=`translateX(-50%) rotate(-6deg) scale(${b>0?back(b):0})`;
+   $("#veto").style.opacity=v>0?1:0;$("#veto").style.transform=`translateX(-50%) rotate(4deg) scale(${v>0?back(v):0})`;
+   $("#vnote").style.opacity=ease((u-1.9)/.4);$("#speed").style.opacity=ease((u-2.4)/.4)}
+
+  {const u=t-SC.s5[0],k=ease(u/.8);
+   $("#star").style.opacity=k;$("#star").style.transform=`scale(${.7+.3*back(clamp(u/.7))}) rotate(${(1-k)*-40}deg)`;
+   $("#s5 > div").style.opacity=ease((u-.3)/.7)}
+}
+window.render=render;render(0);
+</script></body></html>
