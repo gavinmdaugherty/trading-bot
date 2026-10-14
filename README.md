@@ -83,7 +83,7 @@ If the creator sells while an agent holds the token, the curve agents exit at on
 
 Spark trains a small model on what actually happens to pump.fun launches:
 
-1. **Shadow trades:** every launch that passes the hard rug checks is paper-followed several times, at different moments, with Spark's real exit rules, costs and reference price. That gives hundreds of examples an hour without spending anything.
+1. **Shadow trades:** every launch that passes the hard rug checks is paper-followed every 20 seconds for as long as Spark could buy it, with Spark's real exit rules, costs and reference price. Practice therefore covers every moment a real buy can happen, including the late ones. That gives hundreds of examples an hour without spending anything.
 2. **Model:** an online logistic model learns P(profit) from about 35 signals at entry: inflow, buyers, curve progress, holder spread, bundle, snipers, momentum, socials and so on. It combines that with the average win and loss to estimate the expected return after costs. Newer signals:
    - **creator wallet age:** how long ago the creator's wallet first appeared. Wallets funded minutes before the launch are a classic rug sign. Looked up through your RPC for launches that reach 12 buys, at most 90 an hour (about 10 Helius credits each); `dev_lookups_per_hour` in `CFG` changes the cap
    - **unique buyers in the last minute** and **buyers per minute** since launch: real demand versus one bot buying again and again
@@ -93,7 +93,12 @@ Spark trains a small model on what actually happens to pump.fun launches:
 
    New signals sit out until they have enough data to be measured, so adding them never upsets what Spark already learned.
 3. **Trading on it:** after 200 shadow trades the model replaces Spark's hand-set thresholds, and Spark buys only when it expects at least +3%.
-4. **Real money needs proof:** Spark LIVE waits until the model's own picks, scored before their results were known, have made money on average over at least 30 trades. A model that keeps losing is never cleared to trade.
+4. **Real money needs proof:** Spark LIVE waits until the model's own picks, scored before their results were known, have made money on average over at least 30 trades. A model that keeps losing is never cleared to trade. Picks are booked the way Spark really trades:
+   - no more open at once than Spark's position limit
+   - the same buy-rate limit and per-token cooldown
+   - each pick scored with the selling style Spark would actually use
+
+   So the proof measures trades Spark could have made, not every good moment it saw.
 5. **Reality check:** practice trades start out assuming a 4.25% cost per buy and per sell. Every real fill is measured against the price at the moment Spark decided: what a buy really paid over that price, and what a sell really fetched under it, including slow fills, failed routes and other snipers. After 5 real buys (or sells), practice trades and paper Spark switch to the median of the latest 40 real fills, so Spark learns what is profitable after real-world costs. The dashboard's "Reality check" shows both numbers and the typical fill time for each route.
 6. **Automatic stop:** after each closed real trade, Spark compares its latest 20 real trades with its practice picks. If the real ones lose money on average and trail practice by more than 15 points (after at least 10 real trades), Spark LIVE is **benched**: no new real buys, open positions are still managed, and it keeps practising. It buys again by itself once 30 new practice picks, priced with the real costs, average a profit. `--unbench` lifts a bench straight away.
 
@@ -113,7 +118,7 @@ Each verdict is credited to the creator and to every wallet that bought in the f
 - **Refusals:** on Opus and Sonnet models, server-side refusal fallbacks are switched on (`fallbacks: "default"`).
 - **Untrusted text:** token text is treated as untrusted data in the prompt.
 
-The hard rug checks always apply. What Spark has learned is saved in `learn.json` (kept out of git), so it survives restarts. Delete that file to start learning from scratch.
+The hard rug checks always apply. What Spark has learned is saved in `learn.json` (kept out of git), so it survives restarts. `learn.json`, `memory.json`, `state.json` and `spark-report.html` always live next to `memebot.py`, whichever folder you start it from; files an older version saved in the starting folder are moved there once, with a note at startup. Delete that file to start learning from scratch.
 
 ## Better fills and exits
 

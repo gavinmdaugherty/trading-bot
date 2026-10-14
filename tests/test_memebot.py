@@ -1576,5 +1576,26 @@ class WhoTrades(unittest.TestCase):
         self.assertEqual(len(m.trading_agents(m.AGENTS, pump=False)), len(m.AGENTS))   # nothing to scout
 
 
+class DataFiles(unittest.TestCase):
+    def test_files_live_next_to_the_script_and_strays_move_over(self):
+        import tempfile
+        here, cwd = tempfile.mkdtemp(), tempfile.mkdtemp()
+        with open(os.path.join(cwd, "memory.json"), "w") as f:
+            f.write("{}")
+        with open(os.path.join(cwd, "learn.json"), "w") as f:
+            f.write("old")
+        with open(os.path.join(here, "learn.json"), "w") as f:
+            f.write("new")                                       # already in place: never overwritten
+        cfg = dict(m.CFG)
+        notes = m.anchor_data_files(cfg, here=here, cwd=cwd)
+        self.assertEqual(cfg["memory_file"], os.path.join(here, "memory.json"))
+        self.assertTrue(os.path.exists(os.path.join(here, "memory.json")))
+        self.assertFalse(os.path.exists(os.path.join(cwd, "memory.json")))
+        with open(os.path.join(here, "learn.json")) as f:
+            self.assertEqual(f.read(), "new")
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(cfg["state_file"], os.path.join(here, "state.json"))
+
+
 if __name__ == "__main__":
     unittest.main()

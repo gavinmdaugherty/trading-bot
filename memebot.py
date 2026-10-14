@@ -108,8 +108,9 @@ CFG = dict(
     learn_proof=30,              # out-of-sample picks needed before real money follows the model
     learn_edge=0.03,             # buy only when the model expects at least +3% after costs
     shadow_max=2500,             # shadow trades followed at once
-    shadow_every_s=20,           # sample the same launch again after this long...
-    shadow_per_token=12,         # ...up to this many times
+    shadow_every_s=20,           # sample the same launch again after this long, for as long as Spark
+    shadow_per_token=60,         # could buy it (up to this many times): practice must cover every moment
+                                 # a real buy can happen, or the model is trusted where it never practised
     bundle_window_s=3.0,         # buys this close to the launch count as bundled with it
     sniper_window_s=20.0,        # buyers in the first 20s count as snipers
     meta_min_buys=12,            # fetch a launch's metadata (socials) once it has this many buys
@@ -2531,7 +2532,12 @@ class Learner:
         n, avg = self.proof()
         return self.ready() and n >= self.proof_n and avg > 0
 
-    def learn(self, x, ret, picked, meta=None):
+    def add_pick(self, ret):
+        """Score one out-of-sample pick (its result with the exits Spark would really have used)."""
+        self.picks = (self.picks + [round(ret, 4)])[-200:]
+        self.picks_total += 1
+
+    def learn(self, x, ret, picked, meta=None, count_pick=True):
         won = ret > 0
         if meta is not None:
             self.log = (self.log + [dict(meta, ret=round(ret, 4), picked=bool(picked))])[-300:]
@@ -2552,9 +2558,8 @@ class Learner:
         else:
             self.loss_sum += ret
         self.recent = (self.recent + [[round(ret, 4), won]])[-300:]
-        if picked:
-            self.picks = (self.picks + [round(ret, 4)])[-200:]
-            self.picks_total += 1
+        if picked and count_pick:
+            self.add_pick(ret)
 
     def picks_since(self, total_then):
         """Out-of-sample picks scored since the counter read total_then."""
@@ -2831,6 +2836,9 @@ class Engine:
         self.fomo_t, self.fomo_board, self.fomo_err = -1e12, [], ""
         self.curve_buys = {}
         self.learner, self.shadows, self.shadowed, self.picked_mints = None, {}, {}, set()
+        # practice books its picks the way Spark really trades: a few slots, a buy-rate limit and a
+        # cooldown per token, so the proof measures trades Spark could actually have made
+        self.vbook, self.vcool, self.vbuys = {}, {}, deque(maxlen=50)
         self.memory = None
         if pump:
             self.memory = Memory(None if demo else cfg["memory_file"])
@@ -3701,14 +3709,25 @@ class Engine:
                 continue
             x = Learner.features(q)
             ev = L.ev(x) if L.ready() else None
-            pick = ev is not None and ev >= c["learn_edge"] and m not in self.picked_mints
-            if pick:  # proof counts each launch once, however often it is sampled
+            pick = ev is not None and ev >= c["learn_edge"] and self._vbook_room(a, m)
+            if pick:
                 self.picked_mints.add(m)
+                self.vbook[m] = (m, count)
+                self.vbuys.append(self.t)
             ref = q["price"] * (1 + cost)  # what a fill would cost, as for a real buy
+            stage = curve_stage(q["prog"])
             self.shadows[(m, count)] = dict(mint=m, sym=q["symbol"], x=x, ref=ref, peak=ref, last=q["price"], opened=self.t,
-                                            picked=pick, stage=curve_stage(q["prog"]),
-                                            open_styles=list(EXIT_PROFILES))
+                                            picked=pick, stage=stage, open_styles=list(EXIT_PROFILES),
+                                            use=L.best_exit(stage) if pick else None)
             self.shadowed[m] = (self.t, count + 1)
+
+    def _vbook_room(self, a, mint):
+        """Could Spark have bought this launch right now? Same limits as a real position."""
+        if mint in self.vbook or self.t - self.vcool.get(mint, -1e12) < self.cfg["cooldown_min"] * 60:
+            return False
+        if len(self.vbook) >= a["max_open"]:
+            return False
+        return sum(1 for t in self.vbuys if self.t - t < 60) < a.get("max_new_per_min", 2)
 
     @staticmethod
     def _exit_reason(a, ret, peak_ret, held_min, dev_sold):
@@ -3744,15 +3763,25 @@ class Engine:
                     sh["open_styles"].remove(style)
                     L.record_exit(sh.get("stage", "mid"), style, net)
                     if style == "base":  # the buy model learns from the agent's own exits
-                        L.learn(sh["x"], net, sh["picked"],
+                        L.learn(sh["x"], net, sh["picked"], count_pick=False,
                                 meta=dict(t=round(time.time() if not self.demo else self.t), sym=sh.get("sym", "?"),
                                           stage=sh.get("stage", "")))
+                    if sh["picked"] and style == (sh.get("use") or "base"):
+                        # the proof: this pick's result with the selling style Spark would have used
+                        L.add_pick(net)
+                        if self.vbook.get(sh["mint"]) == key:
+                            del self.vbook[sh["mint"]]
+                            self.vcool[sh["mint"]] = self.t
             if ended or not sh["open_styles"]:
                 del self.shadows[key]
         if len(self.shadowed) > 20000:
             cut = self.t - 7200
             self.shadowed = {m: v for m, v in self.shadowed.items() if v[0] > cut}
             self.picked_mints &= set(self.shadowed)
+            self.vcool = {m: t for m, t in self.vcool.items() if t > cut}
+        for m_, key_ in list(self.vbook.items()):   # a booked shadow that vanished frees its slot
+            if key_ not in self.shadows:
+                del self.vbook[m_]
 
     def _curve_entries(self):
         names = [n for n, a in self.acfg.items() if a.get("venue") == "curve"]
@@ -5029,6 +5058,32 @@ def start_live(args):
     return ex, names
 
 
+DATA_KEYS = ("state_file", "learn_file", "memory_file", "report_file", "stop_file")
+
+
+def anchor_data_files(cfg, here=None, cwd=None):
+    """Keep Spark's files next to memebot.py, wherever the terminal was when it started. Files an
+    older version left in the starting folder are moved over once (only when the target is free).
+    Returns a note per move."""
+    here = here or os.path.dirname(os.path.abspath(__file__))
+    cwd = cwd or os.getcwd()
+    notes = []
+    for key in DATA_KEYS:
+        name = cfg[key]
+        if os.path.isabs(name):
+            continue
+        target, stray = os.path.join(here, name), os.path.join(cwd, name)
+        if (key != "stop_file" and os.path.normcase(os.path.abspath(stray)) != os.path.normcase(target)
+                and os.path.exists(stray) and not os.path.exists(target)):
+            try:
+                os.replace(stray, target)
+                notes.append(f"moved {name} from {cwd} to {here}")
+            except OSError as e:
+                notes.append(f"found {name} in {cwd} but could not move it ({e}); copy it next to memebot.py")
+        cfg[key] = target
+    return notes
+
+
 def trading_agents(agents, paper_agents=False, live_names=(), pump=True):
     """Who trades this run. By default only Spark (plus any live agents); the others are its scouts.
     Without pump.fun there is nothing to scout, so everyone trades as before."""
@@ -5098,6 +5153,8 @@ def main():
     ap.add_argument("--unbench", action="store_true",
                     help="let live agents that were benched (real trades far behind practice) buy again now")
     args = ap.parse_args()
+    for note in anchor_data_files(CFG):
+        print("Spark data: " + note)
     if args.check:
         raise SystemExit(0 if run_checks() else 1)
 
@@ -5193,6 +5250,8 @@ def main():
     mode = "DEMO" if args.demo else ("LIVE + PAPER" if live else "PAPER")
     feeds = ", ".join(["DexScreener"] + (["pump.fun"] if pump else []) + (["Fomo"] if fomo else []))
     print(f"Spark risk level: {args.risk}")
+    if not args.demo:
+        print(f"Spark's memory and learning are saved in {os.path.dirname(CFG['state_file'])}")
     if engine.scouts and not args.paper_agents:
         print("Scouts working for Spark: " + ", ".join(f"{n} ({r.lower()})" for n, r, _ in Scouts.SQUAD))
     if engine.brain and not args.demo:
