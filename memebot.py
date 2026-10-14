@@ -49,6 +49,7 @@ import random
 import socket
 import ssl
 import struct
+import sys
 import threading
 import time
 import urllib.error
@@ -4017,6 +4018,123 @@ def make_handler(engine, port):
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+def run_checks():
+    """--check: test every connection and key Spark uses, without trading. Returns True if all passed."""
+    results = []
+    try:
+        sys.stdout.reconfigure(errors="replace")   # some Windows consoles can't print ✓ / ✗
+    except Exception:
+        pass
+
+    def check(name, fn, fix=""):
+        t = time.time()
+        try:
+            note = fn() or "ok"
+            results.append(True)
+            print(f"  ✓ {name:<26} {note}  ({time.time() - t:.1f}s)")
+        except (Exception, SystemExit) as e:   # SolanaLive exits on a bad key; report it like any failure
+            results.append(False)
+            print(f"  ✗ {name:<26} {str(e)[:110]}")
+            if fix:
+                print(f"    {'':<26} fix: {fix}")
+
+    def mask(v):
+        return (v[:4] + "…" + v[-4:]) if len(v) > 12 else "set"
+
+    print("\nSpark setup check (nothing is traded)\n")
+    env = {k: os.environ.get(k, "").strip() for k in
+           ("MEMEBOT_SOLANA_KEY", "SOLANA_RPC_URL", "JUPITER_API_KEY", "FOMO_API_KEY", "ANTHROPIC_API_KEY")}
+    print("  keys found: " + ", ".join(f"{k}={'(set)' if k == 'MEMEBOT_SOLANA_KEY' and v else mask(v) if v else '-'}"
+                                       for k, v in env.items()) + "\n")
+
+    def dexscreener():
+        d = get_json(LiveSource.API + "/token-profiles/latest/v1")
+        return f"{len(d) if isinstance(d, list) else 0} token profiles"
+    check("DexScreener", dexscreener, "your network or firewall blocks api.dexscreener.com")
+
+    rpc = env["SOLANA_RPC_URL"] or "https://api.mainnet-beta.solana.com"
+
+    def solana_rpc():
+        req = urllib.request.Request(rpc, data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getSlot"}).encode(),
+                                     headers={"Content-Type": "application/json", "User-Agent": "memebot/2.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                d = json.load(r)
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"HTTP {e.code}" + (" (key rejected)" if e.code in (401, 403) else
+                                                   " (data allowance used up)" if e.code in (413, 429) else ""))
+        if "result" not in d:
+            raise RuntimeError(str(d.get("error"))[:100])
+        return f"slot {d['result']} via {urllib.parse.urlparse(rpc).netloc}"
+    check("Solana RPC", solana_rpc,
+          "put a working key in .env: SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY")
+
+    def onchain_feed():
+        ws = WebSocket(RpcPumpFeed.ws_url(), timeout=15)
+        ws.connect()
+        try:
+            ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
+                                "params": [{"mentions": [RpcPumpFeed.PROGRAM]}, {"commitment": "processed"}]}))
+            events, end = 0, time.time() + 12
+            while time.time() < end and events < 5:
+                msg = json.loads(ws.recv())
+                if msg.get("error"):
+                    raise RuntimeError(f"subscription refused: {str(msg['error'])[:80]}")
+                for line in ((msg.get("params") or {}).get("result") or {}).get("value", {}).get("logs") or []:
+                    if line.startswith("Program data: "):
+                        try:
+                            if RpcPumpFeed.decode(base64.b64decode(line[14:])):
+                                events += 1
+                        except Exception:
+                            pass
+            if not events:
+                raise RuntimeError("connected, but no pump.fun events arrived in 12s")
+            return f"{events} pump.fun events decoded"
+        finally:
+            ws.close()
+    check("On-chain pump.fun feed", onchain_feed, "needs a websocket-capable RPC, e.g. a free Helius key in SOLANA_RPC_URL")
+
+    def pumpportal():
+        ws = WebSocket(CFG["pump_ws"], timeout=15)
+        ws.connect()
+        try:
+            ws.send(json.dumps({"method": "subscribeNewToken"}))
+            end = time.time() + 15
+            while time.time() < end:
+                msg = json.loads(ws.recv())
+                if msg.get("txType") == "create":
+                    return f"new launch seen: ${str(msg.get('symbol', '?'))[:12]}"
+            raise RuntimeError("connected, but no launch arrived in 15s")
+        finally:
+            ws.close()
+    check("PumpPortal (launches)", pumpportal, "optional: the on-chain feed covers launches too")
+
+    def jupiter():
+        key = env["JUPITER_API_KEY"]
+        base = os.environ.get("JUPITER_API_URL", "https://api.jup.ag/swap/v1" if key else "https://lite-api.jup.ag/swap/v1")
+        q = urllib.parse.urlencode(dict(inputMint=SolanaLive.USDC, outputMint=WSOL, amount=1_000_000, slippageBps=50))
+        d = get_json(f"{base.rstrip('/')}/quote?{q}", headers={"x-api-key": key} if key else None)
+        return f"1 USDC quotes {int(d['outAmount']) / 1e9:.5f} SOL"
+    check("Jupiter (swaps)", jupiter, "get a free server key at https://portal.jup.ag and add JUPITER_API_KEY=... to .env")
+
+    if env["MEMEBOT_SOLANA_KEY"]:
+        def wallet():
+            ex = SolanaLive(CFG)
+            return f"{ex.pub[:4]}…{ex.pub[-4:]}: {ex.usdc():.2f} USDC, {ex.sol():.4f} SOL"
+        check("Bot wallet", wallet, "check MEMEBOT_SOLANA_KEY, run  pip install solders, and fund the wallet")
+    if env["FOMO_API_KEY"]:
+        check("Fomo trending", lambda: f"{len(FomoFeed(CFG).fetch())} tokens", "check FOMO_API_KEY at fomoapi.io")
+    if env["ANTHROPIC_API_KEY"]:
+        def brain():
+            import anthropic  # noqa: F401
+            return "key set and SDK installed (not called, so no cost)"
+        check("AI brain", brain, "run  pip install anthropic")
+
+    ok = all(results)
+    print(f"\n{sum(results)}/{len(results)} checks passed." + ("" if ok else " Fix the ✗ lines above, then run --check again."))
+    return ok
+
+
 def start_live(args):
     """All the checks that must pass before any real order can be placed."""
     names = [n.strip() for n in args.live_agents.split(",") if n.strip()]
@@ -4110,6 +4228,9 @@ def main():
     ap.add_argument("--daily-loss", type=float, default=CFG["daily_loss_pct"],
                     help="stop an agent opening trades after it loses this %% of its bankroll in a day "
                          "(default 0 = no daily cap)")
+    ap.add_argument("--check", action="store_true",
+                    help="test every connection and key (DexScreener, Solana RPC, on-chain feed, PumpPortal, "
+                         "Jupiter, wallet, Fomo, AI brain) without trading, then exit")
     ap.add_argument("--report-live", action="store_true",
                     help="also put real-money trades in the shareable spark-report.html (off: practice only)")
     ap.add_argument("--live-only", action="store_true",
@@ -4117,6 +4238,8 @@ def main():
     ap.add_argument("--live-usd", type=float, default=CFG["live_usd"],
                     help="USDC bankroll per live agent: the most each can ever deploy")
     args = ap.parse_args()
+    if args.check:
+        raise SystemExit(0 if run_checks() else 1)
 
     if args.live_only and not args.live:
         raise SystemExit("--live-only needs --live (it hides the paper agents and shows only real money)")

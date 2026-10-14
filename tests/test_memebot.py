@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import unittest
+import urllib.request as urllib_req
 from collections import deque
 from http.server import ThreadingHTTPServer
 
@@ -603,6 +604,28 @@ class PublicReport(unittest.TestCase):
     def test_report_without_learning(self):
         eng = m.Engine(m.CFG, [a for a in m.AGENTS if a["name"] == "Bolt"], m.DemoSource(), demo=True)
         self.assertIn("no practice record yet", m.build_report(eng))
+
+
+class SetupCheck(unittest.TestCase):
+    def test_check_reports_failures_without_crashing(self):
+        import contextlib, io
+        def boom(*a, **k):
+            raise RuntimeError("HTTP 401 Unauthorized")
+        saved = (m.get_json, m.WebSocket.connect, urllib_req.urlopen)
+        m.get_json, m.WebSocket.connect, urllib_req.urlopen = boom, boom, boom
+        old = {k: os.environ.pop(k, None) for k in ("MEMEBOT_SOLANA_KEY", "FOMO_API_KEY", "ANTHROPIC_API_KEY")}
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                ok = m.run_checks()
+        finally:
+            m.get_json, m.WebSocket.connect, urllib_req.urlopen = saved
+            for k, v in old.items():
+                if v is not None:
+                    os.environ[k] = v
+        self.assertFalse(ok)
+        self.assertIn("fix:", out.getvalue())
+        self.assertIn("0/5 checks passed", out.getvalue())
 
 
 class FakeLive:

@@ -141,6 +141,8 @@ The tests cover:
 
 ## Troubleshooting
 
+Run `python memebot.py --check` first. It tests DexScreener, your Solana RPC, the on-chain feed, PumpPortal, Jupiter, the wallet, Fomo and the AI brain without trading, and prints the fix for anything that fails.
+
 All settings can go in a `.env` file next to `memebot.py`, one `NAME=value` per line.
 
 | You see | Do this |
