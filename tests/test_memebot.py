@@ -625,7 +625,7 @@ class SetupCheck(unittest.TestCase):
                     os.environ[k] = v
         self.assertFalse(ok)
         self.assertIn("fix:", out.getvalue())
-        self.assertIn("0/5 checks passed", out.getvalue())
+        self.assertIn("0/6 checks passed", out.getvalue())
 
 
 class FakeLive:
@@ -1031,6 +1031,370 @@ class Dashboard(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+# --------------------------------------------------------------------------- #
+# Reality check, automatic stop, new signals, direct pump.fun route
+# --------------------------------------------------------------------------- #
+class FakeDirectLive(FakeLive):
+    """FakeLive plus the direct pump.fun route. Fills cost `slip` more than the signal price."""
+    def __init__(self, slip=0.0):
+        super().__init__()
+        self.slip = slip
+        self.direct = dict(ok=True)
+
+    def buy(self, mint, usd, ref_price, slippage_bps=None, max_dev_pct=None, priority="high"):
+        self.calls.append(("buy", mint, usd, slippage_bps, max_dev_pct))
+        return dict(ok=True, spent_usd=usd, raw=int(usd / (ref_price * (1 + self.slip)) * 1e6), decimals=6, sig="SIG")
+
+    def direct_buy(self, mint, sol, sol_usd):
+        self.calls.append(("direct_buy", mint, sol))
+        if not self.direct["ok"]:
+            return dict(self.direct)
+        usd = sol * sol_usd
+        price = self.price * (1 + self.slip)
+        return dict(ok=True, spent_usd=usd, spent_sol=sol, raw=int(usd / price * 1e6), decimals=6, sig="D1",
+                    route="pump", timing=dict(quote=0.2, landed=0.8, total=1.0))
+
+    def direct_sell(self, mint, raw, sol_usd):
+        self.calls.append(("direct_sell", mint, raw))
+        return dict(ok=True, got_usd=6.0, got_sol=6.0 / sol_usd, sig="D2", sold_raw=raw, route="pump")
+
+
+class RealityCheck(unittest.TestCase):
+    def setUp(self):
+        self.cfg = dict(m.CFG, live_usd=15.0)
+        self.live = FakeDirectLive(slip=0.08)
+        src = m.DemoSource()
+        pump = m.DemoPump(self.cfg, clock=time.time)
+        self.eng = m.Engine(self.cfg, m.AGENTS, src, demo=True, pump=pump, live=self.live, live_names=["Spark"])
+        pump.clock = lambda: self.eng.t
+        self.eng.wallet = self.live.wallet()
+
+    def q(self):
+        return dict(addr="MINT1", symbol="GO", price=50 / 900e6 * self.eng.sol_usd, vsol=50.0, vtok=900e6,
+                    mcap=1e4, prog=20.0, buyers=40, net_sol_5m=6.0)
+
+    def test_costs_stay_on_the_guess_until_enough_real_fills(self):
+        L, guess = self.eng.learner, self.eng._cost_guess()
+        for _ in range(4):
+            L.record_fill("buy", 0.12, 1.5)
+        self.assertAlmostEqual(self.eng._curve_cost("buy"), guess)
+        L.record_fill("buy", 0.10, 1.5)
+        L.record_fill("buy", 0.50, 1.5)   # one awful fill does not drag the median
+        self.assertAlmostEqual(self.eng._curve_cost("buy"), 0.12)
+        self.assertAlmostEqual(self.eng._curve_cost("sell"), guess)
+
+    def test_real_buys_and_sells_are_measured_and_practice_uses_them(self):
+        L = self.eng.learner
+        k = m.tkey("solana", "MINT1")
+        st = self.eng.state["agents"]["Spark LIVE"]
+        for i in range(5):
+            st["cool"].clear()
+            self.assertTrue(self.eng._buy_curve("Spark LIVE", self.q()))
+            pos = st["positions"][k]
+            self.assertAlmostEqual(L.calib["buy"][-1][0], 0.08, places=3)   # paid 8% over the signal price
+            self.eng._sell("Spark LIVE", k, "test")                         # FakeLive returns $6 for $5 of tokens
+        self.assertEqual(len(L.calib["sell"]), 5)
+        self.assertAlmostEqual(self.eng._curve_cost("buy"), 0.08, places=3)
+        # practice trades now pay what real ones do
+        w = self.eng.pump
+        w.handle(dict(txType="create", mint="SH", traderPublicKey="d", symbol="SH", initialBuy=0,
+                      vSolInBondingCurve=40.0, vTokensInBondingCurve=800e6))
+        qq = dict(w.get("SH"), buyers=30, last_trade=self.eng.t, age=60)
+        self.eng._open_shadows([qq])
+        sh = next(iter(self.eng.shadows.values()))
+        self.assertAlmostEqual(sh["ref"], qq["price"] * 1.08, places=12)
+        snap = self.eng.snapshot()
+        self.assertEqual(snap["learn"]["calib"]["buy"]["n"], 5)
+
+    def test_calibration_survives_restart(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "learn.json")
+        L = m.Learner(path)
+        for c in (0.05, 0.06, 0.07, 0.08, 0.09):
+            L.record_fill("sell", c, None, "pump")
+        L.picks_total = 7
+        L.save()
+        L2 = m.Learner(path)
+        self.assertAlmostEqual(L2.fill_cost("sell", 0.0), 0.07)
+        self.assertEqual(L2.picks_total, 7)
+        self.assertEqual(L2.calib_summary(0.04)["sell"]["routes"]["pump"]["n"], 5)
+
+
+class AutoStop(unittest.TestCase):
+    def setUp(self):
+        self.cfg = dict(m.CFG, live_usd=15.0)
+        src = m.DemoSource()
+        pump = m.DemoPump(self.cfg, clock=time.time)
+        self.eng = m.Engine(self.cfg, m.AGENTS, src, demo=True, pump=pump, live=FakeLive(), live_names=["Spark"])
+        self.eng.wallet = dict(pub="x", usdc=15.0, sol=0.05)
+        self.st = self.eng.state["agents"]["Spark LIVE"]
+
+    def test_bench_when_real_trades_trail_practice_then_return_after_new_proof(self):
+        L = self.eng.learner
+        for _ in range(40):
+            L.learn([0.0] * len(m.Learner.FEATURES), 0.10, True)          # practice picks average +10%
+        self.st["real_rets"] = [-0.30] * 9
+        self.eng._check_bench("Spark LIVE")
+        self.assertIsNone(self.st.get("bench"))                              # 9 trades: too few to judge
+        self.st["real_rets"].append(-0.30)
+        self.eng._check_bench("Spark LIVE")
+        self.assertTrue(self.st["bench"])
+        self.assertEqual(self.eng._live_reason("Spark LIVE"), "benched: real trades fell behind practice")
+        self.assertTrue(any(e["tag"] == "HALT" for e in self.eng.state["log"]))
+        for _ in range(29):
+            L.learn([0.0] * len(m.Learner.FEATURES), 0.05, True)
+        self.assertIsNotNone(self.eng._live_reason("Spark LIVE"))           # 29 new picks: not yet
+        L.learn([0.0] * len(m.Learner.FEATURES), 0.05, True)
+        self.assertIsNone(self.eng._live_reason("Spark LIVE"))
+        self.assertIsNone(self.st["bench"])
+
+    def test_no_bench_when_real_matches_practice_or_makes_money(self):
+        L = self.eng.learner
+        for _ in range(40):
+            L.learn([0.0] * len(m.Learner.FEATURES), 0.10, True)
+        self.st["real_rets"] = [0.02] * 20                                   # below practice, but profitable
+        self.eng._check_bench("Spark LIVE")
+        self.assertIsNone(self.st.get("bench"))
+        self.st["real_rets"] = [-0.02] * 20                                  # losing, but within 15 points
+        self.eng._check_bench("Spark LIVE")
+        self.assertIsNone(self.st.get("bench"))
+
+    def test_closed_real_trades_feed_the_check(self):
+        q = dict(addr="M", symbol="M", price=1e-5, vsol=50.0, vtok=900e6, mcap=1e4, prog=20.0,
+                 buyers=40, net_sol_5m=6.0)
+        k = m.tkey("solana", "M")
+        self.assertTrue(self.eng._buy_curve("Spark LIVE", q))
+        self.eng._sell("Spark LIVE", k, "test")
+        self.assertEqual(len(self.st["real_rets"]), 1)
+        self.assertAlmostEqual(self.st["real_rets"][0], 0.2)                 # $5 in, $6 back
+
+
+class NewSignals(unittest.TestCase):
+    def setUp(self):
+        self.now = 1000.0
+        self.w = m.PumpWatcher(m.CFG, clock=lambda: self.now)
+
+    def create(self, mint, dev="DEV"):
+        self.w.handle(dict(txType="create", mint=mint, traderPublicKey=dev, symbol=mint, name=mint,
+                           initialBuy=0, vSolInBondingCurve=30.0, vTokensInBondingCurve=m.PUMP_V_TOK0, pool="pump"))
+
+    def trade(self, mint, side, trader, sol, bal):
+        self.w.handle(dict(txType=side, mint=mint, traderPublicKey=trader, solAmount=sol, newTokenBalance=bal,
+                           vSolInBondingCurve=40.0, vTokensInBondingCurve=800e6, pool="pump"))
+
+    def test_veterans_buyers_per_minute_and_whale_selling(self):
+        for mint in ("A", "B", "C"):
+            self.create(mint)
+            self.trade(mint, "buy", "VET", 0.5, 1e6)      # VET trades three different launches
+        self.create("D")
+        self.now += 120
+        self.trade("D", "buy", "VET", 0.5, 1e6)
+        self.trade("D", "buy", "NEW1", 0.5, 30e6)          # 3% holder
+        self.now += 100
+        self.trade("D", "buy", "NEW2", 0.5, 1e6)
+        self.trade("D", "sell", "NEW1", 0.5, 0)            # the 3% holder sells everything
+        q = self.w.get("D")
+        self.assertAlmostEqual(q["veteran_frac"], 1 / 3)
+        self.assertEqual(q["uniq_60s"], 1)
+        self.assertAlmostEqual(q["buyers_per_min"], 3 / (220 / 60))
+        self.assertAlmostEqual(q["whale_sold_pct"], 3.0)
+        self.assertIsNone(q["dev_age_h"])
+        x = m.Learner.features(q)
+        self.assertEqual(len(x), len(m.Learner.FEATURES))
+
+    def test_creator_wallet_age_is_looked_up_once_per_creator(self):
+        self.create("E", dev="FRESHDEV")
+        for i in range(m.CFG["meta_min_buys"]):
+            self.trade("E", "buy", f"W{i}", 0.2, 1e6)
+        self.assertEqual(list(self.w.dev_q), [("E", "FRESHDEV")])
+        with self.w.lock:
+            self.w._set_dev("FRESHDEV", (0.2, 3))
+        self.assertAlmostEqual(self.w.get("E")["dev_age_h"], 0.2)
+        self.create("F", dev="FRESHDEV")
+        for i in range(m.CFG["meta_min_buys"]):
+            self.trade("F", "buy", f"V{i}", 0.2, 1e6)
+        self.assertEqual(len(self.w.dev_q), 1)              # cached: no second lookup
+        self.assertAlmostEqual(self.w.get("F")["dev_age_h"], 0.2)
+
+    def test_dev_lookup_parses_signatures(self):
+        seen = {}
+
+        def fake_post(url, body, timeout=15):
+            seen.update(url=url, body=body)
+            return json.dumps({"result": [{"blockTime": 10_000}, {"blockTime": 9_000}, {"blockTime": None}]}).encode()
+        old = m.post_json
+        m.post_json = fake_post
+        try:
+            age, n = m.PumpWatcher.dev_lookup("WALLET", "https://rpc", now=9_000 + 7200)
+        finally:
+            m.post_json = old
+        self.assertEqual((round(age, 3), n), (2.0, 3))
+        self.assertEqual(seen["body"]["method"], "getSignaturesForAddress")
+        self.assertEqual(seen["body"]["params"][0], "WALLET")
+
+    def test_new_features_sit_out_until_they_have_statistics(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "learn.json")
+        L = m.Learner(path)
+        k_old = len(m.Learner.FEATURES) - 7
+        with open(path, "w") as f:   # a learn.json written before the 7 new signals existed
+            json.dump(dict(features=list(m.Learner.FEATURES[:k_old]), w=[0.1] * k_old, b=0.0, n=500,
+                           mean=[0.0] * k_old, m2=[500.0] * k_old, wins=200, win_sum=40.0, loss_sum=-60.0,
+                           picks=[], recent=[]), f)
+        L = m.Learner(path)
+        x = [1.0] * len(m.Learner.FEATURES)
+        z = L._z(x)
+        self.assertEqual(z[-7:], [0.0] * 7)                 # no statistics yet: no influence
+        self.assertAlmostEqual(z[0], 1.0)
+        L.learn(x, 0.1, False)
+        L.learn([2.0] * len(x), 0.1, False)
+        self.assertEqual(L.fn[-1], 2)
+        self.assertEqual(L.fn[0], 502)
+        self.assertNotEqual(L._z([3.0] * len(x))[-1], 0.0)
+
+
+class DirectRoute(unittest.TestCase):
+    def setUp(self):
+        self.cfg = dict(m.CFG, live_usd=15.0, live_direct=True)
+        self.live = FakeDirectLive()
+        src = m.DemoSource()
+        pump = m.DemoPump(self.cfg, clock=time.time)
+        self.eng = m.Engine(self.cfg, m.AGENTS, src, demo=True, pump=pump, live=self.live, live_names=["Spark"])
+        self.eng.wallet = dict(pub="x", usdc=15.0, sol=0.2)       # about $30 of SOL at $150
+        self.q = dict(addr="MINT1", symbol="GO", price=50 / 900e6 * self.eng.sol_usd, vsol=50.0, vtok=900e6,
+                      mcap=1e4, prog=20.0, buyers=40, net_sol_5m=6.0)
+        self.live.price = self.q["price"]
+        self.k = m.tkey("solana", "MINT1")
+
+    def test_buys_and_sells_on_pump_fun_in_sol(self):
+        st = self.eng.state["agents"]["Spark LIVE"]
+        self.assertTrue(self.eng._buy_curve("Spark LIVE", self.q))
+        kind, mint, sol = self.live.calls[0]
+        self.assertEqual(kind, "direct_buy")
+        self.assertAlmostEqual(sol * self.eng.sol_usd, 5.0)
+        pos = st["positions"][self.k]
+        self.assertEqual(pos["route"], "pump")
+        self.assertAlmostEqual(self.eng.wallet["sol"], 0.2 - sol)
+        self.eng._sell("Spark LIVE", self.k, "stop-loss")
+        self.assertEqual([c[0] for c in self.live.calls], ["direct_buy", "direct_sell", "close"])
+        self.assertAlmostEqual(st["cash"], 16.0)
+        self.assertEqual(self.eng.learner.calib["buy"][-1][2], "pump")
+
+    def test_route_errors_fall_back_to_jupiter_then_switch_off(self):
+        self.live.direct = dict(ok=False, stage="build", err="HTTP 500 from pumpportal.fun")
+        st = self.eng.state["agents"]["Spark LIVE"]
+        for i in range(3):
+            st["cool"].clear()
+            st["positions"].clear()
+            st["cash"] = 15.0
+            self.assertTrue(self.eng._buy_curve("Spark LIVE", self.q))     # Jupiter filled it instead
+        self.assertEqual([c[0] for c in self.live.calls],
+                         ["direct_buy", "buy", "direct_buy", "buy", "direct_buy", "buy"])
+        self.assertFalse(self.eng.direct_ok)
+        st["cool"].clear()
+        st["positions"].clear()
+        self.eng._buy_curve("Spark LIVE", self.q)
+        self.assertEqual(self.live.calls[-1][0], "buy")                    # route off: straight to Jupiter
+        self.assertEqual(self.eng.live_fails, 0)
+
+    def test_slippage_is_a_skip_not_a_fault(self):
+        self.live.direct = dict(ok=False, stage="slip", err="custom program error: 0x1772")
+        self.assertFalse(self.eng._buy_curve("Spark LIVE", self.q))
+        self.assertEqual([c[0] for c in self.live.calls], ["direct_buy"])
+        self.assertEqual((self.eng.live_fails, self.eng.direct_fails), (0, 0))
+
+    def test_short_on_sol_uses_jupiter(self):
+        self.eng.wallet["sol"] = 0.03
+        self.assertTrue(self.eng._buy_curve("Spark LIVE", self.q))
+        self.assertEqual(self.live.calls[0][0], "buy")
+        self.assertEqual(self.eng.state["agents"]["Spark LIVE"]["positions"][self.k]["route"], "jup")
+
+    def test_stage_classification(self):
+        st = m.SolanaLive._stage
+        self.assertEqual(st("rpc sendTransaction: Transaction simulation failed: custom program error: 0x1772"), "slip")
+        self.assertEqual(st("rpc sendTransaction: Transaction simulation failed: AccountNotFound"), "sim")
+        self.assertEqual(st("transaction failed on-chain: {'InstructionError': [2, 'X']}"), "tx")
+
+
+class DirectAccounting(unittest.TestCase):
+    def ex(self):
+        ex = m.SolanaLive.__new__(m.SolanaLive)
+        ex.cfg = m.CFG
+        ex.pub = "PUB"
+        ex.kp = "KP"
+        w = dict(lam=1_000_000_000, tok=0, rent=0)
+
+        class Msg:
+            message = "MSG"
+        ex.built = []
+        ex.pumpportal_tx = lambda *a: ex.built.append(a) or Msg()
+        ex._VT = lambda message, signers: ("signed", message)
+        ex.lamports = lambda: w["lam"]
+        ex.token_accounts = lambda mint: (w["tok"], 6, w["rent"])
+        ex.token_balance = lambda mint: (w["tok"], 6)
+
+        def send(signed):
+            if ex.built[-1][0] == "buy":   # 0.1 SOL in, a new token account (rent 0.00203928), fee 0.0003
+                w.update(lam=w["lam"] - 100_000_000 - 2_039_280 - 300_000, tok=3_000_000_000, rent=2_039_280)
+            else:
+                w.update(lam=w["lam"] + 90_000_000, tok=0)
+            return "SIG"
+        ex._send = send
+        return ex
+
+    def test_buy_excludes_returnable_rent_and_sell_counts_sol_back(self):
+        ex = self.ex()
+        res = ex.direct_buy("MINT", 0.1, 150.0)
+        self.assertTrue(res["ok"])
+        self.assertEqual(ex.built[0][:4], ("buy", "MINT", 0.1, True))
+        self.assertAlmostEqual(res["spent_sol"], 0.1003)          # fee counted, rent (returned later) not
+        self.assertAlmostEqual(res["spent_usd"], 0.1003 * 150)
+        self.assertEqual((res["raw"], res["route"]), (3_000_000_000, "pump"))
+        res = ex.direct_sell("MINT", 3_000_000_000, 150.0)
+        self.assertTrue(res["ok"])
+        self.assertEqual(ex.built[-1][:4], ("sell", "MINT", "100%", False))
+        self.assertAlmostEqual(res["got_sol"], 0.09)
+
+    def test_partial_sell_sends_token_amount(self):
+        ex = self.ex()
+        ex.direct_buy("MINT", 0.1, 150.0)
+        ex.direct_sell("MINT", 1_500_000_000, 150.0)
+        self.assertEqual(ex.built[-1][2], "1500.000000")
+
+    def test_pumpportal_request_shape(self):
+        ex = m.SolanaLive.__new__(m.SolanaLive)
+        ex.cfg, ex.pub = m.CFG, "PUB"
+        ex._VT = type("VT", (), {"from_bytes": staticmethod(lambda b: ("tx", b))})
+        seen = {}
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+            def read(self):
+                return b"\x01RAWTX"
+        old = m.urllib.request.urlopen
+        m.urllib.request.urlopen = lambda req, timeout=0: seen.update(url=req.full_url, body=req.data) or Resp()
+        try:
+            tx = ex.pumpportal_tx("buy", "MINT", 0.05, True, 10)
+        finally:
+            m.urllib.request.urlopen = old
+        self.assertEqual(tx, ("tx", b"\x01RAWTX"))
+        self.assertEqual(seen["url"], "https://pumpportal.fun/api/trade-local")
+        form = dict(urllib_parse_qsl(seen["body"].decode()))
+        self.assertEqual((form["publicKey"], form["action"], form["mint"], form["denominatedInSol"], form["pool"]),
+                         ("PUB", "buy", "MINT", "true", "auto"))
+        self.assertEqual(float(form["amount"]), 0.05)
+
+
+def urllib_parse_qsl(s):
+    import urllib.parse
+    return urllib.parse.parse_qsl(s)
 
 
 if __name__ == "__main__":

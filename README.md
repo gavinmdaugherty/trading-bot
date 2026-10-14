@@ -56,9 +56,18 @@ If the creator sells while an agent holds the token, the curve agents exit at on
 Spark trains a small model on what actually happens to pump.fun launches:
 
 1. **Shadow trades:** every launch that passes the hard rug checks is paper-followed several times, at different moments, with Spark's real exit rules, costs and reference price. That gives hundreds of examples an hour without spending anything.
-2. **Model:** an online logistic model learns P(profit) from about 20 signals at entry: inflow, buyers, curve progress, holder spread, bundle, snipers, momentum, socials and so on. It combines that with the average win and loss to estimate the expected return after costs.
+2. **Model:** an online logistic model learns P(profit) from about 35 signals at entry: inflow, buyers, curve progress, holder spread, bundle, snipers, momentum, socials and so on. It combines that with the average win and loss to estimate the expected return after costs. Newer signals:
+   - **creator wallet age:** how long ago the creator's wallet first appeared. Wallets funded minutes before the launch are a classic rug sign. Looked up through your RPC for launches that reach 12 buys, at most 90 an hour (about 10 Helius credits each); `dev_lookups_per_hour` in `CFG` changes the cap
+   - **unique buyers in the last minute** and **buyers per minute** since launch: real demand versus one bot buying again and again
+   - **veteran buyers:** the share of buyers who have traded other launches recently. Bundles and sybil farms use fresh wallets
+   - **smart wallets buying now:** known winners from memory among this launch's recent buyers, not only its first 20 seconds
+   - **big holders selling:** tokens sold in the last 5 minutes by wallets that held 1% or more
+
+   New signals sit out until they have enough data to be measured, so adding them never upsets what Spark already learned.
 3. **Trading on it:** after 200 shadow trades the model replaces Spark's hand-set thresholds, and Spark buys only when it expects at least +3%.
 4. **Real money needs proof:** Spark LIVE waits until the model's own picks, scored before their results were known, have made money on average over at least 30 trades. A model that keeps losing is never cleared to trade.
+5. **Reality check:** practice trades start out assuming a 4.25% cost per buy and per sell. Every real fill is measured against the price at the moment Spark decided: what a buy really paid over that price, and what a sell really fetched under it, including slow fills, failed routes and other snipers. After 5 real buys (or sells), practice trades and paper Spark switch to the median of the latest 40 real fills, so Spark learns what is profitable after real-world costs. The dashboard's "Reality check" shows both numbers and the typical fill time for each route.
+6. **Automatic stop:** after each closed real trade, Spark compares its latest 20 real trades with its practice picks. If the real ones lose money on average and trail practice by more than 15 points (after at least 10 real trades), Spark LIVE is **benched**: no new real buys, open positions are still managed, and it keeps practising. It buys again by itself once 30 new practice picks, priced with the real costs, average a profit. `--unbench` lifts a bench straight away.
 
 **Learned exits.** Every practice trade runs four selling styles side by side on the same launch: scalp, Spark's own exits, swing and runner. Spark keeps a running score for each style at each stage of the curve (early, mid, late), with recent results counting most. A new position uses whichever style has clearly beaten Spark's own exits: at least 30 practice trades and more than 1% better. The style shows as a badge on the position and in the "How it sells" chips.
 
@@ -116,7 +125,15 @@ export DISCORD_WEBHOOK_URL=...
 
 ## Live trading
 
-Any agent can have a live twin that trades real USDC on Solana, for example `--live --live-agents Spark --live-usd 15`. There is no daily loss cap unless you set one with `--daily-loss 20` (a percentage of the bankroll). Add `--live-only` to skip the paper agents, so the dashboard shows only your real balance. The paper agents don't learn or feed into the live ones; they're only there for comparison. Put the wallet key in a `.env` file next to `memebot.py` (`MEMEBOT_SOLANA_KEY=...`). Never commit that file; `.gitignore` already excludes it.
+Any agent can have a live twin that trades real money on Solana, for example `--live --live-agents Spark --live-usd 15`.
+
+**Direct pump.fun route (`--direct`).** By default Spark pays in USDC through Jupiter, which needs a quote and a swap request and only routes a token once it knows about it. With `--direct`, pump.fun buys go straight to pump.fun and are paid in SOL:
+- PumpPortal's local-transaction API builds the transaction in one request. Spark signs it on your machine, so the key never leaves it.
+- It works from a launch's first block.
+- PumpPortal charges 0.5% per trade. The reality check measures that along with everything else, and the dashboard shows typical fill times for both routes so you can compare.
+- Sells go back to SOL, so the wallet needs SOL beyond the 0.02 kept for fees. With too little SOL, or if the route errors, Spark uses Jupiter instead. After 3 errors in a row it switches the direct route off for the run.
+- A price that runs past the slippage limit is treated as a skip, not a fault.
+- `python memebot.py --check` simulates a 0.001 SOL direct buy without sending it. There is no daily loss cap unless you set one with `--daily-loss 20` (a percentage of the bankroll). Add `--live-only` to skip the paper agents, so the dashboard shows only your real balance. The paper agents don't learn or feed into the live ones; they're only there for comparison. Put the wallet key in a `.env` file next to `memebot.py` (`MEMEBOT_SOLANA_KEY=...`). Never commit that file; `.gitignore` already excludes it.
 
 ## Tests
 

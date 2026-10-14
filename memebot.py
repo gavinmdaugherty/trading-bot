@@ -112,6 +112,7 @@ CFG = dict(
     bundle_window_s=3.0,         # buys this close to the launch count as bundled with it
     sniper_window_s=20.0,        # buyers in the first 20s count as snipers
     meta_min_buys=12,            # fetch a launch's metadata (socials) once it has this many buys
+    dev_lookups_per_hour=90,     # creator wallet-age lookups through your RPC (about 10 Helius credits each)
     ipfs_fallback=["https://dweb.link/ipfs/", "https://gateway.pinata.cloud/ipfs/"],
     # ---- Fomo (fomo.family) trending board, through FOMO API ----
     fomo_api="https://api.fomoapi.io/v2/leaderboard/tokens/trending",
@@ -136,6 +137,15 @@ CFG = dict(
     live_curve_priority="veryHigh",  # Jupiter priority-fee level for curve buys (still capped by the max below)
     fast_seconds_live=1.0,       # pump.fun loop interval while a live curve agent runs
     live_close_empty=True,       # close emptied token accounts to get their ~0.002 SOL rent back
+    # ---- direct pump.fun route (--direct): PumpPortal builds the transaction, paid in SOL ----
+    live_direct=False,
+    pumpportal_trade="https://pumpportal.fun/api/trade-local",
+    live_direct_priority_sol=0.0003,   # priority fee per direct transaction, in SOL
+    live_direct_max_fails=3,     # direct route errors in a row before it is switched off for the run
+    # ---- automatic stop: real results far worse than practice ----
+    bench_min=10,                # real trades needed before the comparison counts
+    bench_window=20,             # compare the latest this-many real trades
+    bench_gap=0.15,              # bench when real trades average 15 points below practice (and lose money)
 )
 
 # Strategy agents. Percent fields are percent; DEX ages are minutes; curve ages are seconds.
@@ -721,12 +731,18 @@ class PumpWatcher:
         self.rpc = None
         self.want_rpc = False
         self.memory = None
+        self.traders = {}        # wallet -> [last mint traded, launches traded]: veterans vs fresh wallets
+        self.dev_q = deque(maxlen=200)
+        self.dev_cache = {}      # creator wallet -> (wallet age in hours, transactions seen)
+        self.dev_stats = dict(done=0, failed=0, error="")
 
     # ---- feed ---- #
     def start(self):
         threading.Thread(target=self._run, name="pump-feed", daemon=True).start()
         for i in range(3):
             threading.Thread(target=self._meta_loop, name=f"pump-meta{i}", daemon=True).start()
+        if self.cfg.get("dev_lookups_per_hour"):
+            threading.Thread(target=self._dev_loop, name="pump-devs", daemon=True).start()
 
     def _run(self):
         url = self.cfg["pump_ws"]
@@ -847,6 +863,52 @@ class PumpWatcher:
                     if other in self.tokens:
                         self.tokens[other]["dup_social"] = True
 
+    # ---- creator wallet age: a wallet funded minutes before the launch is a classic rug sign ---- #
+    def _dev_loop(self):
+        gap = 3600.0 / max(1, self.cfg["dev_lookups_per_hour"])
+        while True:
+            job = None
+            with self.lock:
+                while self.dev_q and not job:
+                    mint, dev = self.dev_q.pop()   # newest first: fresh launches matter most
+                    if mint in self.tokens and dev not in self.dev_cache:
+                        job = (mint, dev)
+            if not job:
+                time.sleep(0.5)
+                continue
+            try:
+                info = self.dev_lookup(job[1])
+                with self.lock:
+                    self.dev_stats["done"] += 1
+                    self._set_dev(job[1], info)
+            except Exception as e:
+                with self.lock:
+                    self.dev_stats["failed"] += 1
+                    self.dev_stats["error"] = str(e)[:100]
+            time.sleep(gap)
+
+    @staticmethod
+    def dev_lookup(wallet, rpc=None, now=None):
+        """(age of the wallet in hours, transactions seen) from its newest 100 signatures."""
+        rpc = rpc or os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+        d = json.loads(post_json(rpc, {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+                                       "params": [wallet, {"limit": 100, "commitment": "confirmed"}]}, timeout=10))
+        if d.get("error"):
+            raise RuntimeError(str(d["error"])[:100])
+        sigs = d.get("result") or []
+        times = [x["blockTime"] for x in sigs if x.get("blockTime")]
+        if not times:
+            return (0.0, len(sigs))
+        return (max(0.0, ((now or time.time()) - min(times)) / 3600), len(sigs))
+
+    def _set_dev(self, dev, info):
+        if len(self.dev_cache) > 50000:
+            self.dev_cache.clear()
+        self.dev_cache[dev] = info
+        for t in self.tokens.values():
+            if t["creator"] == dev:
+                t["dev_age_h"], t["dev_txs"] = info
+
     # ---- message handling (also used by the demo feed and tests) ---- #
     AMM_POOLS = ("pump-amm", "pumpswap", "pump-swap", "raydium", "raydium-cpmm", "meteora", "launchlab")
 
@@ -892,7 +954,8 @@ class PumpWatcher:
                  dev_sold=False, migrated=False, complete=False, last_trade=now, n_buys=0,
                  n_sells=0, vol_sol=0.0, from_create=False, uri="", seen_trades=0,
                  unseen_first=0.0, bundle_seen=0.0, early={}, meta=None, meta_state=0,
-                 dup_social=False, creator_launches=0)
+                 dup_social=False, creator_launches=0, whale_sells=deque(maxlen=200),
+                 dev_age_h=None, dev_txs=None)
         t.update(kw)
         self.tokens[mint] = t
         self.sub_q.add(mint)
@@ -948,6 +1011,18 @@ class PumpWatcher:
                 t["complete"] = True
         sol = num(m, "solAmount")
         trader = m.get("traderPublicKey") or ""
+        if trader:  # how many different launches this wallet trades: real trenchers vs fresh sybils
+            seen = self.traders.get(trader)
+            if seen is None:
+                if len(self.traders) > 300000:
+                    self.traders.clear()
+                self.traders[trader] = [t["mint"], 1]
+            elif seen[0] != t["mint"]:
+                seen[0], seen[1] = t["mint"], seen[1] + 1
+        prev = t["holders"].get(trader, 0.0)
+        if not is_buy and prev >= 0.01 * PUMP_SUPPLY:  # a 1%+ holder selling
+            sold = amt if amt > 0 else max(0.0, prev - num(m, "newTokenBalance", default=prev))
+            t["whale_sells"].append((now, sold))
         if "newTokenBalance" in m:
             bal = num(m, "newTokenBalance")
         else:
@@ -971,6 +1046,11 @@ class PumpWatcher:
             if t["meta_state"] == 0 and t["n_buys"] >= c["meta_min_buys"] and t["uri"]:
                 t["meta_state"] = 1
                 self.meta_q.append(t["mint"])
+            if t["n_buys"] == c["meta_min_buys"] and t["creator"] and t["dev_age_h"] is None:
+                if t["creator"] in self.dev_cache:
+                    t["dev_age_h"], t["dev_txs"] = self.dev_cache[t["creator"]]
+                else:
+                    self.dev_q.append((t["mint"], t["creator"]))
         else:
             t["n_sells"] += 1
             if trader and trader == t["creator"] and not t["dev_sold"]:
@@ -1000,7 +1080,7 @@ class PumpWatcher:
         w, w60 = now - 300, now - 60
         b = s = b60 = 0
         bsol = ssol = big = 0.0
-        uniq, sizes = set(), {}
+        uniq, uniq60, sizes = set(), set(), {}
         for ts, is_buy, sol, tr in reversed(t["trades"]):
             if ts < w:
                 break
@@ -1014,6 +1094,7 @@ class PumpWatcher:
                     sizes[key] = sizes.get(key, 0) + 1
                 if ts >= w60:
                     b60 += 1
+                    uniq60.add(tr)
             else:
                 s += 1
                 ssol += sol
@@ -1032,10 +1113,13 @@ class PumpWatcher:
         if self.memory:
             _, c_rugs, c_wins = self.memory.creator(t["creator"])
             smart, rugw = self.memory.crowd(t["early"])
+            smart_now = self.memory.crowd(uniq)[0]
             th_lift, th_heat = self.memory.theme(t["name"], t["symbol"], now)
         else:
-            c_rugs = c_wins = smart = rugw = 0
+            c_rugs = c_wins = smart = rugw = smart_now = 0
             th_lift = th_heat = 0.0
+        vets = sum(1 for tr in uniq if self.traders.get(tr, (None, 0))[1] >= 3)
+        whale_sold = sum(a for ts, a in t["whale_sells"] if ts >= w) / PUMP_SUPPLY * 100
         usd = self.sol_usd
         q = dict(chain="solana", addr=t["mint"], symbol=t["symbol"], name=t["name"], venue="curve",
                  price=price_sol * usd, price_sol=price_sol, vsol=t["vsol"], vtok=t["vtok"],
@@ -1055,7 +1139,10 @@ class PumpWatcher:
                  theme_lift=th_lift, theme_heat=th_heat, desc=meta.get("desc", ""), links=meta.get("links", []),
                  socials=meta.get("socials", 0), meta_failed=bool(meta.get("failed")),
                  dup_social=t["dup_social"],
-                 ath_drop=(price_sol / t["ath"] - 1) * 100 if t["ath"] else 0.0)
+                 ath_drop=(price_sol / t["ath"] - 1) * 100 if t["ath"] else 0.0,
+                 uniq_60s=len(uniq60), buyers_per_min=len(t["buyers"]) / max((now - t["created"]) / 60, 1.0),
+                 veteran_frac=vets / len(uniq) if uniq else 0.0, smart_now=smart_now,
+                 whale_sold_pct=whale_sold, dev_age_h=t["dev_age_h"], dev_txs=t["dev_txs"])
         q["score"] = (q["net_sol_5m"] + 0.25 * q["uniq_5m"] - (25 if q["dev_sold"] else 0)
                       - 2 * max(0.0, top - 8) - 0.5 * max(0.0, -q["ath_drop"] - 20)
                       - 1.5 * max(0.0, bundle - 5) - (10 if copycat or q["dup_social"] else 0)
@@ -1142,7 +1229,7 @@ class PumpWatcher:
     def status(self):
         with self.lock:
             trades = self.kinds.get("buy", 0) + self.kinds.get("sell", 0)
-            return dict(connected=self.connected, error=self.error, seen=self.seen,
+            return dict(connected=self.connected, error=self.error, seen=self.seen, devs=dict(self.dev_stats),
                         grads=self.grads, watching=len(self.tokens), msgs=self.msgs, trades=trades,
                         kinds=dict(self.kinds), notices=list(self.server_msgs[-3:]),
                         connected_for=(time.time() - self.connected_t) if self.connected and self.connected_t else 0,
@@ -1366,6 +1453,10 @@ class DemoPump(PumpWatcher):
         sym = f"PF{r.randrange(1, self.n)}" if self.n > 5 and r.random() < 0.08 else f"PF{self.n}"
         self._msg(mint, s, txType="create", traderPublicKey=dev, symbol=sym,
                   name=f"Pump demo {self.n}", initialBuy=init, solAmount=init_sol, uri="demo://meta")
+        fresh = r.random() < (0.75 if rug else 0.2)   # rugs mostly come from wallets funded minutes ago
+        with self.lock:
+            self.tokens[mint]["dev_age_h"] = r.uniform(0.02, 0.8) if fresh else r.uniform(4, 3000)
+            self.tokens[mint]["dev_txs"] = r.randint(2, 8) if fresh else 100
         if bundled:  # the bundle buys in the launch block; half the time they are not seen (as on PumpPortal)
             seen = r.random() < 0.5
             for _ in range(r.randint(4, 10)):
@@ -1752,14 +1843,22 @@ class SolanaLive:
 
     # ---- wallet reads ----
     def token_balance(self, mint):
+        return self.token_accounts(mint)[:2]
+
+    def token_accounts(self, mint):
+        """(raw balance, decimals, SOL locked as rent in those accounts, in lamports)."""
         r = self._rpc("getTokenAccountsByOwner",
                       [self.pub, {"mint": mint}, {"encoding": "jsonParsed", "commitment": "confirmed"}])
-        raw, dec = 0, None
+        raw, dec, rent = 0, None, 0
         for acc in r["value"]:
             ta = acc["account"]["data"]["parsed"]["info"]["tokenAmount"]
             raw += int(ta["amount"])
             dec = ta["decimals"]
-        return raw, dec
+            rent += int(acc["account"].get("lamports") or 0)
+        return raw, dec, rent
+
+    def lamports(self):
+        return int(self._rpc("getBalance", [self.pub, {"commitment": "confirmed"}])["value"])
 
     def usdc(self):
         return self.token_balance(self.USDC)[0] / 1e6
@@ -1805,7 +1904,11 @@ class SolanaLive:
                     "priorityLevel": priority, "maxLamports": int(c["live_max_priority_lamports"])}}}
         sw = self._http(f"{self.jup}/swap", body, self.hdrs, timeout=30)
         tx = self._VT.from_bytes(base64.b64decode(sw["swapTransaction"]))
-        signed = self._VT(tx.message, [self.kp])
+        return self._send(self._VT(tx.message, [self.kp]))
+
+    def _send(self, signed):
+        """Simulate (preflight), broadcast and wait for confirmation of a signed transaction."""
+        c = self.cfg
         b64 = base64.b64encode(bytes(signed)).decode()
         sig = self._rpc("sendTransaction", [b64, {"encoding": "base64", "skipPreflight": False,
                                                   "preflightCommitment": "confirmed", "maxRetries": 3}])
@@ -1877,6 +1980,118 @@ class SolanaLive:
         spent = usdc0 - usdc1
         return dict(ok=True, spent_usd=spent if spent > 0 else usd, raw=raw, decimals=dec, sig=sig,
                     timing=dict(quote=t_quote - t0, landed=t_done - t_quote, total=t_done - t0))
+
+    # ---- direct pump.fun route (--direct) ----
+    def pumpportal_tx(self, action, mint, amount, in_sol, slippage_pct):
+        """An unsigned pump.fun transaction built by PumpPortal's local-transaction API. It is signed
+        here, so the key never leaves this machine. pool=auto also covers tokens that graduated."""
+        c = self.cfg
+        body = urllib.parse.urlencode(dict(
+            publicKey=self.pub, action=action, mint=mint, amount=amount,
+            denominatedInSol="true" if in_sol else "false", slippage=slippage_pct,
+            priorityFee=c["live_direct_priority_sol"], pool="auto")).encode()
+        req = urllib.request.Request(c["pumpportal_trade"], data=body, headers={
+            "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "memebot/2.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                raw = r.read()
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read()[:150].decode("utf-8", "replace")
+            except Exception:
+                detail = ""
+            raise RuntimeError(f"HTTP {e.code} from pumpportal.fun {detail}".strip())
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"network error: {e.reason}")
+        try:
+            return self._VT.from_bytes(raw)
+        except Exception:
+            raise RuntimeError(f"pumpportal.fun did not return a transaction: {raw[:100]!r}")
+
+    @staticmethod
+    def _stage(err):
+        """slip: the price moved past the slippage limit (pump.fun errors 6002/6003), which is the
+        market, not a fault. sim: any other simulation (preflight) refusal; nothing happened on-chain.
+        tx: anything else, which may have reached the chain."""
+        e = err.lower()
+        if "0x1772" in e or "0x1773" in e or "toomuchsolrequired" in e or "toolittlesolreceived" in e:
+            return "slip"
+        return "sim" if ("simulation failed" in e or "preflight" in e) else "tx"
+
+    def direct_buy(self, mint, sol, sol_usd):
+        """Buy straight on pump.fun with SOL: one request to build, no quote round trip, and it works
+        from a launch's first block, before any router knows the token."""
+        c = self.cfg
+        t0 = time.time()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            f_tx = pool.submit(self.pumpportal_tx, "buy", mint, round(sol, 6), True,
+                               c["live_curve_slippage_bps"] / 100)
+            f_sol = pool.submit(self.lamports)
+            f_tok = pool.submit(self.token_accounts, mint)
+            concurrent.futures.wait([f_tx, f_sol, f_tok])
+        try:
+            tx = f_tx.result()
+        except Exception as e:
+            return dict(ok=False, stage="build", err=str(e)[:160])
+        t_built = time.time()
+        try:
+            lam0, (tok0, _, rent0) = f_sol.result(), f_tok.result()
+            try:
+                sig = self._send(self._VT(tx.message, [self.kp]))
+            except TimeoutError as e:
+                time.sleep(15)
+                if self.token_balance(mint)[0] <= tok0:
+                    raise
+                sig = str(e)[-90:]
+            tok1 = self._changed(lambda: self.token_balance(mint)[0], tok0)
+            lam1 = self._changed(self.lamports, lam0)
+            _, dec, rent1 = self.token_accounts(mint)
+        except Exception as e:
+            err = str(e)[:200]
+            return dict(ok=False, stage=self._stage(err), err=err)
+        t_done = time.time()
+        if tok1 - tok0 <= 0:
+            return dict(ok=False, stage="tx", err="confirmed but no tokens received")
+        # SOL that left the wallet, minus rent parked in a new token account (returned when it is closed)
+        spent_sol = max(0.0, ((lam0 - lam1) - (rent1 - rent0)) / 1e9) or sol
+        return dict(ok=True, spent_usd=spent_sol * sol_usd, spent_sol=spent_sol, raw=tok1 - tok0,
+                    decimals=dec if dec is not None else 6, sig=sig, route="pump",
+                    timing=dict(quote=t_built - t0, landed=t_done - t_built, total=t_done - t0))
+
+    def direct_sell(self, mint, raw_expected, sol_usd):
+        c = self.cfg
+        try:
+            raw_now, dec, _ = self.token_accounts(mint)
+            lam0 = self.lamports()
+        except Exception as e:
+            return dict(ok=False, stage="tx", err=str(e)[:160])
+        if raw_now <= 0:
+            return dict(ok=True, got_usd=0.0, got_sol=0.0, sig=None, sold_raw=0, route="pump",
+                        note="wallet holds none of this token, closed at 0")
+        amount = min(raw_now, raw_expected) if raw_expected else raw_now
+        dec = 6 if dec is None else dec
+        size = "100%" if amount >= raw_now else f"{amount / 10 ** dec:.{dec}f}"
+        last = dict(ok=False, stage="tx", err="unknown error")
+        for bps in c["live_sell_slippage_bps"]:
+            try:
+                tx = self.pumpportal_tx("sell", mint, size, False, bps / 100)
+            except Exception as e:
+                return dict(ok=False, stage="build", err=str(e)[:160])
+            try:
+                try:
+                    sig = self._send(self._VT(tx.message, [self.kp]))
+                except TimeoutError as e:
+                    time.sleep(15)
+                    if self.token_balance(mint)[0] >= raw_now:
+                        raise
+                    sig = str(e)[-90:]
+                lam1 = self._changed(self.lamports, lam0)
+                got = max(0.0, (lam1 - lam0) / 1e9)
+                return dict(ok=True, got_usd=got * sol_usd, got_sol=got, sig=sig, sold_raw=amount, route="pump")
+            except Exception as e:
+                err = str(e)[:160]
+                last = dict(ok=False, stage=self._stage(err), err=err)
+        return last
 
     def close_empty(self, mint):
         """Close this wallet's empty token accounts for `mint`, returning their rent
@@ -2109,7 +2324,9 @@ class Learner:
                 "holders", "top_pct", "top10_pct", "bundle_pct", "sniper_pct", "dev_pct", "whale",
                 "same_amt", "ath_drop", "socials", "mcap", "churn",
                 "creator_wins", "creator_rugs", "smart_early", "rugger_early",
-                "theme_lift", "theme_heat", "ai_meme", "ai_narrative", "ai_scam", "ai_known")
+                "theme_lift", "theme_heat", "ai_meme", "ai_narrative", "ai_scam", "ai_known",
+                "uniq_60s", "buyers_per_min", "veteran_frac", "smart_now", "whale_sold", "dev_age", "dev_known")
+    CAL_N = 40          # real fills kept for the reality check
 
     def __init__(self, path=None, min_n=200, proof_n=30):
         self.path, self.min_n, self.proof_n = path, min_n, proof_n
@@ -2117,11 +2334,14 @@ class Learner:
         self.w, self.b = [0.0] * k, 0.0
         self.n = 0                                  # finished shadow trades learned from
         self.mean, self.m2 = [0.0] * k, [0.0] * k   # running feature statistics (Welford)
+        self.fn = [0] * k                           # samples behind each feature's statistics
         self.wins, self.win_sum, self.loss_sum = 0, 0.0, 0.0
         self.picks = []                             # net returns of out-of-sample picks (latest 200)
         self.exits = {}                             # stage -> style -> [weight, weighted sum of returns]
         self.log = []                               # latest 300 practice trades, for the public report
         self.recent = []                            # (net return, won) of the latest 300 shadows
+        self.picks_total = 0                        # out-of-sample picks ever scored
+        self.calib = dict(buy=[], sell=[])          # real fills: [cost vs signal price, seconds, route]
         if path and os.path.exists(path):
             try:
                 with open(path) as f:
@@ -2132,7 +2352,11 @@ class Learner:
                         setattr(self, key, d[key])
                     self.exits = d.get("exits", {})
                     self.log = d.get("log", [])
+                    self.picks_total = d.get("picks_total", len(self.picks))
+                    self.calib = d.get("calib") or self.calib
                     pad = k - len(old)
+                    # features added since: no statistics yet, so they sit out until they have some
+                    self.fn = (d.get("fn") or [self.n] * len(old)) + [0] * pad
                     self.w, self.mean, self.m2 = self.w + [0.0] * pad, self.mean + [0.0] * pad, self.m2 + [0.0] * pad
             except Exception:
                 pass
@@ -2140,8 +2364,9 @@ class Learner:
     def save(self):
         if not self.path:
             return
-        d = {key: getattr(self, key) for key in ("w", "b", "n", "mean", "m2", "wins", "win_sum",
-                                                 "loss_sum", "picks", "recent", "exits", "log")}
+        d = {key: getattr(self, key) for key in ("w", "b", "n", "mean", "m2", "fn", "wins", "win_sum",
+                                                 "loss_sum", "picks", "recent", "exits", "log",
+                                                 "picks_total", "calib")}
         d["features"] = list(self.FEATURES)
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
@@ -2161,12 +2386,20 @@ class Learner:
                 math.log1p(q.get("smart_early", 0)), math.log1p(q.get("rugger_early", 0)),
                 q.get("theme_lift", 0.0), math.log1p(q.get("theme_heat", 0.0)) / 3,
                 q.get("ai_meme", 5) / 10, q.get("ai_narrative", 5) / 10, q.get("ai_scam", 5) / 10,
-                1.0 if q.get("ai_known") else 0.0]
+                1.0 if q.get("ai_known") else 0.0,
+                math.log1p(q.get("uniq_60s", 0)), math.log1p(q.get("buyers_per_min", 0.0)),
+                q.get("veteran_frac", 0.0), math.log1p(q.get("smart_now", 0)), q.get("whale_sold_pct", 0.0) / 10,
+                math.log1p(q["dev_age_h"]) / 5 if q.get("dev_age_h") is not None else 0.0,
+                1.0 if q.get("dev_age_h") is not None else 0.0]
 
     def _z(self, x):
         out = []
         for i, v in enumerate(x):
-            sd = math.sqrt(self.m2[i] / self.n) if self.n > 1 else 1.0
+            n = self.fn[i]
+            if n < 2:
+                out.append(0.0)
+                continue
+            sd = math.sqrt(self.m2[i] / n)
             out.append(max(-5.0, min(5.0, (v - self.mean[i]) / max(sd, 1e-3))))
         return out
 
@@ -2203,8 +2436,9 @@ class Learner:
             self.log = (self.log + [dict(meta, ret=round(ret, 4), picked=bool(picked))])[-300:]
         self.n += 1
         for i, v in enumerate(x):  # update the running mean / variance first
+            self.fn[i] += 1
             d = v - self.mean[i]
-            self.mean[i] += d / self.n
+            self.mean[i] += d / self.fn[i]
             self.m2[i] += d * (v - self.mean[i])
         z = self._z(x)
         err = (1.0 if won else 0.0) - self.p_win(x)
@@ -2219,6 +2453,38 @@ class Learner:
         self.recent = (self.recent + [[round(ret, 4), won]])[-300:]
         if picked:
             self.picks = (self.picks + [round(ret, 4)])[-200:]
+            self.picks_total += 1
+
+    def picks_since(self, total_then):
+        """Out-of-sample picks scored since the counter read total_then."""
+        k = min(self.picks_total - total_then, len(self.picks))
+        return self.picks[-k:] if k > 0 else []
+
+    # ---- reality check: what real fills cost compared with the price at the signal ---- #
+    def record_fill(self, side, cost, secs=None, route="jup"):
+        book = self.calib.setdefault(side, [])
+        book.append([round(max(-0.3, min(0.9, cost)), 4), None if secs is None else round(secs, 2), route])
+        del book[:-self.CAL_N]
+
+    def fill_cost(self, side, default, min_n=5):
+        """Median real cost of a buy or sell, or the default until there are enough real fills."""
+        xs = sorted(r[0] for r in self.calib.get(side, []))
+        if len(xs) < min_n:
+            return default
+        mid = len(xs) // 2
+        return xs[mid] if len(xs) % 2 else (xs[mid - 1] + xs[mid]) / 2
+
+    def calib_summary(self, default):
+        out = dict(assumed=default)
+        for side in ("buy", "sell"):
+            rows = self.calib.get(side, [])
+            out[side] = dict(n=len(rows), cost=self.fill_cost(side, None), routes={})
+            for route in sorted({r[2] for r in rows}):
+                rr = [r for r in rows if r[2] == route]
+                secs = sorted(r[1] for r in rr if r[1] is not None)
+                out[side]["routes"][route] = dict(n=len(rr), cost=sorted(r[0] for r in rr)[len(rr) // 2],
+                                                  secs=secs[len(secs) // 2] if secs else None)
+        return out
 
     def record_exit(self, stage, style, ret):
         book = self.exits.setdefault(stage, {})
@@ -2299,6 +2565,8 @@ class Engine:
         self.dex_err, self.dex_ok_t = "", None
         self.pump_warned = False
         self.fill_times = deque(maxlen=50)   # seconds from signal to a filled live buy
+        self.direct_ok = bool(cfg.get("live_direct"))
+        self.direct_fails = 0
         self.report_t = 0.0
         self.blocks = {}          # agent -> (tokens checked, {reason it didn't buy: count})
         self.phase, self.phase_t, self.next_at = "starting up", time.time(), None
@@ -2415,12 +2683,21 @@ class Engine:
         if st["day"] != d:
             st.update(day=d, day_pnl=0.0, capped=False)
 
+    def _cost_guess(self):
+        return (self.cfg["pump_fee_pct"] + self.cfg["pump_extra_slip_pct"]) / 100.0
+
+    def _curve_cost(self, side):
+        """Cost of a curve buy or sell as a fraction of the price at the signal: Spark's real fills
+        once there are enough of them (the reality check), the configured guess until then."""
+        guess = self._cost_guess()
+        return self.learner.fill_cost(side, guess) if self.learner else guess
+
     def _value(self, pos, units=None):
         """What the position (or `units` of it) would net if sold now, after every cost."""
         c = self.cfg
         units = pos["units"] if units is None else units
         if pos.get("venue") == "curve":
-            cost = (c["pump_fee_pct"] + c["pump_extra_slip_pct"]) / 100.0
+            cost = self._curve_cost("sell")
             vs, vt = pos.get("last_vsol") or 0.0, pos.get("last_vtok") or 0.0
             if vs <= 0 or vt <= units:
                 return units * pos["last_price"] * (1 - cost)
@@ -2462,9 +2739,54 @@ class Engine:
             return "live trades Solana only"
         if self.live is None or self.live_halt:
             return "live trading halted"
+        if self.state["agents"][name].get("bench") and not self._unbench(name):
+            return "benched: real trades fell behind practice"
         if self.wallet and self.wallet.get("sol", 1.0) < self.cfg["live_min_sol_trade"]:
             return "wallet SOL too low for fees"
         return None
+
+    # ---- automatic stop ------------------------------------------------------------ #
+    def _practice_avg(self, name):
+        """What practice says a trade should return: the model's latest blind picks for a learning
+        agent, break-even for the others."""
+        L = self.learner
+        if self.acfg[name].get("learn") and L and L.picks:
+            last = L.picks[-50:]
+            return sum(last) / len(last)
+        return 0.0
+
+    def _check_bench(self, name):
+        """After each closed real trade: if real results run well below practice (and lose money),
+        stop real buys and keep practising. Practice then has to prove itself again."""
+        c, st = self.cfg, self.state["agents"][name]
+        rets = st.get("real_rets", [])
+        if st.get("bench") or len(rets) < c["bench_min"]:
+            return
+        last = rets[-c["bench_window"]:]
+        real, practice = sum(last) / len(last), self._practice_avg(name)
+        if real < 0 and practice - real > c["bench_gap"]:
+            st["bench"] = dict(t=self.t, real=round(real, 4), practice=round(practice, 4), n=len(last),
+                               picks_at=self.learner.picks_total if self.learner else None)
+            st["real_rets"] = []
+            again = (f"it buys again once {c['learn_proof']} new practice picks average a profit"
+                     if self.acfg[name].get("learn") and self.learner else "restart with --unbench to resume")
+            self.emit("HALT", f"{name} benched: its last {len(last)} real trades averaged {real * 100:+.1f}% "
+                              f"while practice averaged {practice * 100:+.1f}%. No new real buys; it keeps "
+                              f"practising, and {again}. Open positions are still managed.")
+
+    def _unbench(self, name):
+        """True (and lifts the bench) once practice has re-proven itself since the bench."""
+        st, L, c = self.state["agents"][name], self.learner, self.cfg
+        b = st["bench"]
+        if not (self.acfg[name].get("learn") and L and b.get("picks_at") is not None):
+            return False
+        since = L.picks_since(b["picks_at"])
+        if len(since) >= c["learn_proof"] and sum(since) / len(since) > 0:
+            st["bench"] = None
+            self.emit("RISK", f"{name} is back: {len(since)} new practice picks averaged "
+                              f"{sum(since) / len(since) * 100:+.1f}% since it was benched")
+            return True
+        return False
 
     def _why_not(self, name, p):
         a, c = self.acfg[name], self.cfg
@@ -2660,7 +2982,7 @@ class Engine:
             return False
         if live:
             return self._live_buy_curve(name, q, size)
-        net = size / self.sol_usd * (1 - (c["pump_fee_pct"] + c["pump_extra_slip_pct"]) / 100.0)
+        net = size / self.sol_usd / (1 + self._curve_cost("buy"))
         units = curve_buy(net, q["vsol"], q["vtok"])
         if units <= 0:
             return False
@@ -2679,14 +3001,45 @@ class Engine:
                           + (f", selling style: {style}" if style != "base" else ""))
         return True
 
+    def _direct_usable(self, usd):
+        c, w = self.cfg, self.wallet
+        return bool(self.direct_ok and hasattr(self.live, "direct_buy") and w
+                    and (w.get("sol", 0.0) - c["live_min_sol"]) * self.sol_usd >= usd)
+
+    def _direct_error(self, what, err):
+        """A direct-route problem that is not the market's doing: fall back to Jupiter, and switch
+        the route off for this run if it keeps happening."""
+        self.direct_fails += 1
+        self.emit("WARN", f"direct pump.fun {what} failed ({err[:120]}); using Jupiter instead")
+        if self.direct_fails >= self.cfg["live_direct_max_fails"] and self.direct_ok:
+            self.direct_ok = False
+            self.emit("WARN", "direct pump.fun route switched off for this run after repeated errors. "
+                              "Run  python memebot.py --check  to see why.")
+
     def _live_buy_curve(self, name, q, size):
-        """Buy a pump.fun launch with real USDC. Jupiter routes USDC -> SOL -> the curve."""
+        """Buy a pump.fun launch with real money: straight on pump.fun in SOL with --direct,
+        otherwise USDC through Jupiter (USDC -> SOL -> the curve)."""
         c, st, k = self.cfg, self.state["agents"][name], tkey("solana", q["addr"])
         st["cool"][k] = self.t  # never retry the same token immediately, whatever happens
         self.curve_buys.setdefault(name, deque(maxlen=20)).append(self.t)
         t_signal = time.time()
-        res = self.live.buy(q["addr"], size, q["price"], slippage_bps=c["live_curve_slippage_bps"],
-                            max_dev_pct=c["live_curve_max_dev_pct"], priority=c["live_curve_priority"])
+        res = None
+        if self._direct_usable(size):
+            res = self.live.direct_buy(q["addr"], size / self.sol_usd, self.sol_usd)
+            if res["ok"]:
+                self.direct_fails = 0
+                if self.wallet:
+                    self.wallet["sol"] = self.wallet.get("sol", 0.0) - res.get("spent_sol", 0.0)
+            elif res.get("stage") in ("build", "sim"):
+                self._direct_error("buy", res["err"])
+                res = None
+            elif res.get("stage") == "slip":
+                st["cool"][k] = self.t - c["cooldown_min"] * 60 + 20   # it ran away from us: look again in 20s
+                self.emit("RISK", f"{name} skipped ${q['symbol']}: price moved past the slippage limit")
+                return False
+        if res is None:
+            res = self.live.buy(q["addr"], size, q["price"], slippage_bps=c["live_curve_slippage_bps"],
+                                max_dev_pct=c["live_curve_max_dev_pct"], priority=c["live_curve_priority"])
         if not res["ok"]:
             if res.get("stage") == "tx":
                 self._live_fail(f"{name} buy ${q['symbol']} failed: {res['err']}")
@@ -2698,6 +3051,7 @@ class Engine:
         self.live_fails = 0
         spent, units = res["spent_usd"], res["raw"] / 10 ** res["decimals"]
         fill = spent / units
+        route = res.get("route", "jup")
         st["cash"] -= spent
         st["positions"][k] = dict(
             chain="solana", addr=q["addr"], symbol=q["symbol"], units=units, size=spent, size0=spent,
@@ -2705,14 +3059,18 @@ class Engine:
             last_price=q["price"], last_liq=0.0, last_vsol=q["vsol"], last_vtok=q["vtok"],
             curve_sol=spent / self.sol_usd * (1 - c["pump_fee_pct"] / 100.0), miss=0, venue="curve",
             src="pump", last_seen=self.t, live=True, raw=res["raw"], decimals=res["decimals"],
-            sig=res["sig"], exit_style=self._exit_style(name, q))
+            sig=res["sig"], exit_style=self._exit_style(name, q), route=route)
         tm = res.get("timing") or {}
         took = time.time() - t_signal
         self.fill_times.append(round(took, 2))
-        self.emit("EXEC", f"{name} BUY ${q['symbol']} ${spent:.2f} on pump.fun LIVE, mcap "
+        slip = fill / q["price"] - 1 if q["price"] > 0 else 0.0
+        if self.learner:
+            self.learner.record_fill("buy", slip, took, route)
+        self.emit("EXEC", f"{name} BUY ${q['symbol']} ${spent:.2f} on pump.fun LIVE"
+                          + (" (direct)" if route == "pump" else "") + f", mcap "
                           f"${q['mcap'] / 1000:.1f}k, curve {q['prog']:.0f}%, filled in {took:.1f}s"
                           + (f" (quote {tm['quote']:.1f}s, land {tm['landed']:.1f}s)" if tm else "")
-                          + f", tx {str(res['sig'])[:10]}")
+                          + f", paid {slip * 100:+.1f}% vs the signal price, tx {str(res['sig'])[:10]}")
         return True
 
     def _live_fail(self, msg):
@@ -2758,7 +3116,20 @@ class Engine:
             if self.t < pos.get("retry_at", 0):
                 return  # a recent sell failed: wait out the backoff instead of hammering the APIs
             want = pos["raw"] if full else int(pos["raw"] * frac)
-            res = self.live.sell(pos["addr"], want)
+            res = None
+            if pos.get("route") == "pump" and self.direct_ok and hasattr(self.live, "direct_sell"):
+                res = self.live.direct_sell(pos["addr"], want, self.sol_usd)
+                if res["ok"]:
+                    self.direct_fails = 0
+                    if self.wallet:
+                        self.wallet["sol"] = self.wallet.get("sol", 0.0) + res.get("got_sol", 0.0)
+                elif res.get("stage") in ("build", "sim"):
+                    self._direct_error("sell", res["err"])
+                    res = None
+                else:
+                    res = None   # a failed direct sell: try Jupiter straight away, selling fast matters
+            if res is None:
+                res = self.live.sell(pos["addr"], want)
             if not res["ok"]:
                 if full:
                     pos["pending_exit"] = reason
@@ -2774,6 +3145,10 @@ class Engine:
             if res.get("note"):
                 self.emit("WARN", f"${pos['symbol']}: {res['note']}")
                 full = True  # nothing left in the wallet
+            elif pos.get("venue") == "curve" and self.learner and units * pos["last_price"] > 0:
+                # reality check: what the sell fetched against the price that triggered it
+                self.learner.record_fill("sell", 1 - proceeds / (units * pos["last_price"]),
+                                         route=res.get("route", "jup"))
         else:
             proceeds = 0.0 if writeoff else self._value(pos, units)
         basis = pos["size"] if full else pos["size"] * frac
@@ -2809,6 +3184,9 @@ class Engine:
             st["best"] = dict(pnl=total, symbol=pos["symbol"])
         extra = f", {total:+.2f} in total ({total / size0 * 100:+.1f}%)" if pos.get("realized") else ""
         self.emit("FILL", f"{name} SOLD ${pos['symbol']} {pnl:+.2f} ({reason}){extra}")
+        if pos.get("live") and size0 > 0:
+            st["real_rets"] = (st.get("real_rets", []) + [round(total / size0, 4)])[-50:]
+            self._check_bench(name)
         if pos.get("live") and self.cfg["live_close_empty"]:
             try:
                 if self.live.close_empty(pos["addr"]):
@@ -3008,7 +3386,7 @@ class Engine:
     def _open_shadows(self, cands):
         """Paper-follow every launch that passes the hard checks, to learn what pays off."""
         a, c, L = self._learn_agent(), self.cfg, self.learner
-        cost = (c["pump_fee_pct"] + c["pump_extra_slip_pct"]) / 100.0
+        cost = self._curve_cost("buy")
         for q in cands:
             if len(self.shadows) >= c["shadow_max"]:
                 break
@@ -3046,7 +3424,7 @@ class Engine:
 
     def _shadow_tick(self):
         a, c, L = self._learn_agent(), self.cfg, self.learner
-        cost = (c["pump_fee_pct"] + c["pump_extra_slip_pct"]) / 100.0
+        cost = self._curve_cost("sell")
         styles = {k: dict(a, **v) for k, v in EXIT_PROFILES.items()}
         for key, sh in list(self.shadows.items()):
             q = self.pump.peek(sh["mint"])
@@ -3320,7 +3698,9 @@ class Engine:
                                    blocks=sorted(counts.items(), key=lambda kv: -kv[1])[:3],
                                    pnl=eq - st["start"], pnl_pct=(eq / st["start"] - 1) * 100,
                                    wins=st["wins"], losses=st["losses"], open=len(st["positions"]),
-                                   capped=st["capped"]))
+                                   capped=st["capped"], bench=st.get("bench"),
+                                   real_avg=(sum(st.get("real_rets", [])[-20:]) / len(st["real_rets"][-20:])
+                                             if st.get("real_rets") else None)))
                 for pos in st["positions"].values():
                     positions.append(dict(
                         agent=name, symbol=pos["symbol"], chain=pos["chain"], size=pos["size"],
@@ -3356,6 +3736,8 @@ class Engine:
                             serial=q["creator_launches"] > 0, dup_social=q["dup_social"],
                             rugger=q["creator_rugs"] > 0, rug_wallets=q["rugger_early"], smart=q["smart_early"],
                             ai=(self.brain.get(q["addr"]) if self.brain else None),
+                            dev_age=q["dev_age_h"], vets=q["veteran_frac"], uniq60=q["uniq_60s"],
+                            whale_sold=q["whale_sold_pct"],
                             socials=q["socials"] if q["meta_state"] == 2 else None,
                             held=any(tkey("solana", q["addr"]) in st["positions"]
                                      for st in S["agents"].values()))
@@ -3386,7 +3768,9 @@ class Engine:
                 real_only=bool(agents) and all(a["live"] for a in agents),
                 fills=dict(n=len(self.fill_times), last=self.fill_times[-1] if self.fill_times else None,
                            avg=round(sum(self.fill_times) / len(self.fill_times), 2) if self.fill_times else None),
-                learn=dict(self.learner.summary(), open=len(self.shadows)) if self.learner else None,
+                learn=dict(self.learner.summary(), open=len(self.shadows),
+                           calib=self.learner.calib_summary(self._cost_guess())) if self.learner else None,
+                route=("direct" if self.direct_ok else "direct off (errors)") if self.cfg.get("live_direct") else "jupiter",
                 memory=self.memory.summary() if self.memory else None,
                 brain=self.brain.status() if self.brain else None,
                 themes=self.memory.hot_themes(self.t, 6) if self.memory else [],
@@ -3437,6 +3821,9 @@ def build_report(engine, include_live=False):
              ("Recent average return", pc(S["avg_ret"])),
              ("Blind picks scored", f"{S['picks']} (avg {pc(S['pick_avg'])})"),
              ("Status", "Proven" if S["proven"] else ("Proving itself" if S["ready"] else "Learning"))]
+    cal = L.calib_summary(engine._cost_guess())
+    if cal["buy"]["cost"] is not None or cal["sell"]["cost"] is not None:
+        tiles.append(("Real cost per buy / sell", f"{pc(cal['buy']['cost'])} / {pc(cal['sell']['cost'])}"))
     tiles_html = "".join(f"<div class='tile'><div class='k'>{esc(k)}</div><div class='v'>{esc(v)}</div></div>" for k, v in tiles)
     styles = "".join(
         f"<tr><td>{st}</td><td><b>{esc(e['use'])}</b></td><td>"
@@ -3489,7 +3876,8 @@ td{padding:9px 10px;border-bottom:1px solid rgba(255,255,255,.04)}.u{color:var(-
 </style></head><body>
 <h1>Spark</h1><p class="m">Practice record of a self-learning pump.fun trading bot. Updated {{TIME}}.</p>
 {{BODY}}
-<p class="foot">Practice trades are simulated on live pump.fun data using Spark's own exits and costs (fees and slippage);
+<p class="foot">Practice trades are simulated on live pump.fun data using Spark's own exits and costs (fees and slippage,
+measured from its real fills once it has made a few);
 they are not real-money results. "Blind picks" are trades the model chose before their outcome was known.
 Past results do not predict future ones. Memecoins are extremely risky. Not financial advice.</p>
 </body></html>"""
@@ -3786,11 +4174,24 @@ function renderSpot(s){
     <div><h3>What it trusts</h3><div class="chips">${top||'<span class="mute small">still learning which signals matter</span>'}</div>
       <h3 style="margin-top:12px">How it sells</h3><div class="chips">${["early","mid","late"].map(st=>{const e=(L.exits||{})[st]||{};const m=(e.means||{})[e.use||"base"];
         return `<span class="chip ${e.use&&e.use!=="base"?"good":""}">${st}: <b>${esc(e.use||"base")}</b>${m?` ${pc(m[0])}`:""}</span>`}).join("")}</div>
-      <h3 style="margin-top:12px">Recent practice</h3><div class="small" style="margin:0">${L.win_rate==null?"no results yet":`win rate ${Math.round(L.win_rate*100)}%, average ${pc(L.avg_ret)} per trade`}</div></div>
+      <h3 style="margin-top:12px">Recent practice</h3><div class="small" style="margin:0">${L.win_rate==null?"no results yet":`win rate ${Math.round(L.win_rate*100)}%, average ${pc(L.avg_ret)} per trade`}</div>
+      <h3 style="margin-top:12px">Reality check</h3><div class="small" style="margin:0">${realityTxt(L.calib)}</div></div>
     <div><h3>Memory</h3>${M?`<div class="chips"><span class="chip">${M.judged} launches judged</span><span class="chip good">${M.outcomes.win||0} ran</span><span class="chip bad">${M.outcomes.rug||0} rugged</span>
         <span class="chip bad">${M.ruggers} rugger devs</span><span class="chip bad">${M.rug_wallets} rug wallets</span><span class="chip good">${M.smart} smart wallets</span></div>`:""}
       <h3 style="margin-top:12px">Hot themes</h3><div class="chips">${T.length?T.map(t=>`<span class="chip hot">#${esc(t[0])}</span>`).join(""):'<span class="mute small">none standing out yet</span>'}</div>
       ${B?`<div class="small">AI brain: ${B.enabled?esc(B.model)+", "+B.rated+" rated"+(B.spent?", about $"+B.spent.toFixed(2):""):"off"}</div>`:""}</div>`);
+}
+// how real fills compare with the costs practice trades assume
+function realityTxt(C){
+  if(!C)return "";
+  const pc=v=>(v>=0?"+":"")+(v*100).toFixed(1)+"%";
+  const b=C.buy||{}, s=C.sell||{};
+  if(!b.n&&!s.n)return `practice assumes ${(C.assumed*100).toFixed(1)}% cost per buy and per sell. Real fills are measured once Spark trades live, and practice switches to them.`;
+  const side=(x,word)=>x.n?`${word} ${x.cost==null?"(measuring, "+x.n+"/5)":pc(x.cost)} over ${x.n}`:"";
+  const routes=Object.entries(b.routes||{}).filter(([r,v])=>v.secs!=null).map(([r,v])=>`${r==="pump"?"direct":"Jupiter"} ${v.secs.toFixed(1)}s`).join(" · ");
+  return [side(b,"real buys pay"),side(s,"sells lose")].filter(Boolean).join(", ")+
+    ` vs ${(C.assumed*100).toFixed(1)}% assumed`+((b.cost!=null||s.cost!=null)?"; practice now uses the real numbers":"")+
+    (routes?`<br>typical fill time: ${routes}`:"");
 }
 function brainTxt(B,T){
   let out="";
@@ -3827,7 +4228,9 @@ function renderPump(p){
     q.rug_wallets>=2?`<span class="badge b-bad">${q.rug_wallets} rug wallets</span>`:"",q.smart?`<span class="badge b-mine">${q.smart} smart wallet${q.smart>1?"s":""}</span>`:"",
     q.ai?`<span class="badge ${q.ai.scam>=7?"b-bad":(q.ai.meme+q.ai.narrative>=13?"b-mine":"b-warn")}" title="${esc(q.ai.take)}">AI meme ${q.ai.meme} · scam ${q.ai.scam}</span>`:"",q.copycat?'<span class="badge b-warn">copycat</span>':"",
     q.socials===0?'<span class="badge b-warn">no socials</span>':"",q.snipers>15?`<span class="badge b-warn">snipers ${q.snipers.toFixed(0)}%</span>`:"",
-    q.top>8?`<span class="badge b-warn">top ${q.top.toFixed(0)}%</span>`:""].filter(Boolean).join(" ");
+    q.top>8?`<span class="badge b-warn">top ${q.top.toFixed(0)}%</span>`:"",
+    q.dev_age!=null&&q.dev_age<1?`<span class="badge b-bad" title="the creator's wallet first appeared ${Math.round(q.dev_age*60)} minutes ago">fresh dev wallet</span>`:"",
+    q.whale_sold>5&&q.net<0?`<span class="badge b-warn">big holders dumping</span>`:""].filter(Boolean).join(" ");
   setHTML("#pump",`<table><tr><th>Token</th><th>Age</th><th>MCap</th><th>Curve</th><th>Buyers</th><th>B/S 5m</th><th>Net 5m</th><th></th></tr>`+
     p.hot.map(q=>`<tr><td>$${esc(q.symbol)}</td><td>${dur(q.age)}</td><td>${kmoney(q.mcap)}</td>
       <td><span class="prog"><b style="width:${Math.min(100,q.prog).toFixed(0)}%"></b></span>${q.prog.toFixed(0)}%</td>
@@ -3865,6 +4268,7 @@ function render(s){
   else if(isLive){b.style.display="block";b.className="banner live";
     b.textContent=(s.halted?"LIVE TRADING HALTED after repeated failed transactions. Check open positions and restart. ":"Real funds at risk. ")+
       (s.wallet?"Wallet "+s.wallet.pub+": "+money(s.wallet.usdc)+" USDC, "+s.wallet.sol.toFixed(4)+" SOL.":"Reading wallet balance...")+
+      (s.route&&s.route!=="jupiter"?" Route: "+s.route+".":"")+
       (s.fills&&s.fills.n?` Live fills: average ${s.fills.avg.toFixed(1)}s from signal to filled (last ${s.fills.last.toFixed(1)}s, ${s.fills.n} buys).`:"")}
   else if(s.dex&&s.dex.error&&!demo){b.style.display="block";b.textContent="Market data problem: "+s.dex.error+". The bot keeps retrying; check your internet connection or firewall."}
   else if(s.pump&&!demo&&s.pump.seen>=10&&!s.pump.trades&&(s.pump.connected_for>90||s.pump.rpc)){b.style.display="block";
@@ -3875,8 +4279,8 @@ function render(s){
   else b.style.display="none";
 
   flashNum("#bal",s.total,money(s.total));
-  $("#ballabel").textContent=s.real_only?"Real balance (USDC)":"Balance";
-  $("#balsub").textContent=s.real_only?"started with "+money(s.start,2)+" real USDC, traded by "+s.agents.map(a=>a.name).join(", ")
+  $("#ballabel").textContent=s.real_only?"Real balance":"Balance";
+  $("#balsub").textContent=s.real_only?"started with "+money(s.start,2)+" real money, traded by "+s.agents.map(a=>a.name).join(", ")
     :"started at "+money(s.start,2)+", split across "+s.agents.length+" agents"+(s.mode==="live"?" (paper and live)":"");
   $("#pnl").className="big "+cls(s.pnl); flashNum("#pnl",s.pnl,smoney(s.pnl));
   const srcs=Object.entries(s.by_src||{}).map(([k,v])=>`${SRC[k]||k} ${smoney(v,0)}`).join(", ");
@@ -3910,6 +4314,8 @@ function render(s){
       <div class="meta"><span class="${cls(a.pnl)}">${smoney(a.pnl)} (${pct(a.pnl_pct)})</span><br>${a.wins}W / ${a.losses}L, ${a.open} open${a.capped?"<br>daily cap hit":""}</div>
       <div class="meter"><b style="width:${Math.max(4,a.equity/mx*100)}%;background:${COLORS[i%COLORS.length]}"></b></div>
       ${a.learns&&s.learn?`<div class="learn"><span class="t">${!s.learn.ready?"Learning "+s.learn.n+"/"+s.learn.min_n:(s.learn.proven?"Model proven":"Model proving itself")}</span>${a.live&&!s.learn.proven?"<br>real money waits for proof":""}</div>`:""}
+      ${a.bench?`<div class="learn" style="border-color:rgba(255,92,122,.4);background:rgba(255,92,122,.07)"><span class="t" style="color:var(--down)">Benched</span><br>last ${a.bench.n} real trades averaged ${pct(a.bench.real*100)} vs ${pct(a.bench.practice*100)} in practice. No new real buys; ${a.learns?"it buys again once fresh practice picks prove a profit":"restart with --unbench to resume"}.</div>`:""}
+      ${a.live&&a.real_avg!=null&&!a.bench?`<div class="small" style="margin-top:6px">real trades average ${pct(a.real_avg*100)}</div>`:""}
       <div class="why">${why(a)}</div></div>`}).join(""));
 
   setHTML("#pos",s.positions.length?`<table><tr><th>Agent</th><th>Token</th><th>Feed</th><th>Size</th><th>Now</th><th>Move</th><th>Held</th></tr>`+
@@ -4070,6 +4476,8 @@ def run_checks():
     check("Solana RPC", solana_rpc,
           "put a working key in .env: SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY")
 
+    seen = {}   # a live launch from the feed, for the direct-route test
+
     def onchain_feed():
         ws = WebSocket(RpcPumpFeed.ws_url(), timeout=15)
         ws.connect()
@@ -4084,8 +4492,12 @@ def run_checks():
                 for line in ((msg.get("params") or {}).get("result") or {}).get("value", {}).get("logs") or []:
                     if line.startswith("Program data: "):
                         try:
-                            if RpcPumpFeed.decode(base64.b64decode(line[14:])):
+                            ev = RpcPumpFeed.decode(base64.b64decode(line[14:]))
+                            if ev:
                                 events += 1
+                                if ev["kind"] == "trade":
+                                    seen.setdefault("mint", ev["mint"])
+                                    seen.setdefault("user", ev["user"])
                         except Exception:
                             pass
             if not events:
@@ -4094,6 +4506,12 @@ def run_checks():
         finally:
             ws.close()
     check("On-chain pump.fun feed", onchain_feed, "needs a websocket-capable RPC, e.g. a free Helius key in SOLANA_RPC_URL")
+
+    def dev_ages():
+        who = seen.get("user") or RpcPumpFeed.PROGRAM
+        age, n = PumpWatcher.dev_lookup(who, rpc)
+        return f"wallet {who[:4]}… is {age:.1f}h old ({n} recent transactions)"
+    check("Creator wallet ages", dev_ages, "your RPC refuses getSignaturesForAddress; a free Helius key allows it")
 
     def pumpportal():
         ws = WebSocket(CFG["pump_ws"], timeout=15)
@@ -4123,6 +4541,21 @@ def run_checks():
             ex = SolanaLive(CFG)
             return f"{ex.pub[:4]}…{ex.pub[-4:]}: {ex.usdc():.2f} USDC, {ex.sol():.4f} SOL"
         check("Bot wallet", wallet, "check MEMEBOT_SOLANA_KEY, run  pip install solders, and fund the wallet")
+
+        def direct():
+            if not seen.get("mint"):
+                raise RuntimeError("no live launch to test with (the on-chain feed check must pass first)")
+            ex = SolanaLive(CFG)
+            tx = ex.pumpportal_tx("buy", seen["mint"], 0.001, True, 10)
+            # simulate a 0.001 SOL buy: proves the route works for this wallet; nothing is sent
+            sim = ex._rpc("simulateTransaction", [base64.b64encode(bytes(tx)).decode(), {
+                "encoding": "base64", "sigVerify": False, "replaceRecentBlockhash": True, "commitment": "processed"}])
+            err = (sim.get("value") or {}).get("err")
+            if err:
+                raise RuntimeError(f"built, but the simulated buy failed: {str(err)[:80]}")
+            return "a 0.001 SOL test buy builds and simulates cleanly (not sent)"
+        check("Direct pump.fun route", direct,
+              "only needed for --direct; the wallet needs a little SOL, and pumpportal.fun must be reachable")
     if env["FOMO_API_KEY"]:
         check("Fomo trending", lambda: f"{len(FomoFeed(CFG).fetch())} tokens", "check FOMO_API_KEY at fomoapi.io")
     if env["ANTHROPIC_API_KEY"]:
@@ -4155,13 +4588,23 @@ def start_live(args):
     except Exception as e:
         raise SystemExit(f"Could not read the wallet balance ({e}). Check SOLANA_RPC_URL and your connection.")
     need = args.live_usd * len(names)
+    direct = getattr(args, "direct", False)
+    sol_usd = CFG["sol_usd_fallback"]
+    if direct:
+        try:
+            sol_usd = LiveSource().sol_usd() or sol_usd
+        except Exception:
+            pass
+    spare_sol = max(0.0, sol - CFG["live_min_sol"]) * sol_usd if direct else 0.0
     print(f"\nLIVE TRADING CHECK\n  wallet        {ex.pub}\n  balance       {usdc:,.2f} USDC, {sol:.4f} SOL")
-    print(f"  live agents   {', '.join(names)} ({args.live_usd:,.2f} USDC each, {need:,.2f} USDC at most in total)")
-    print(f"  per order     {CFG['live_min_trade_usd']:.0f}-{CFG['live_max_trade_usd']:.0f} USDC, Solana tokens only, "
-          f"settled in USDC through Jupiter")
-    if usdc < need:
-        raise SystemExit(f"\nThe wallet holds {usdc:,.2f} USDC but {need:,.2f} is needed. "
-                         f"Fund the wallet with USDC or lower --live-usd.")
+    print(f"  live agents   {', '.join(names)} (${args.live_usd:,.2f} each, ${need:,.2f} at most in total)")
+    print(f"  per order     ${CFG['live_min_trade_usd']:.0f}-{CFG['live_max_trade_usd']:.0f}, Solana tokens only, "
+          + ("pump.fun buys paid in SOL straight on pump.fun (--direct), USDC through Jupiter as the backup"
+             if direct else "settled in USDC through Jupiter"))
+    if usdc + spare_sol < need:
+        raise SystemExit(f"\nThe wallet holds {usdc:,.2f} USDC"
+                         + (f" and about ${spare_sol:,.2f} of spare SOL" if direct else "")
+                         + f" but ${need:,.2f} is needed. Fund the wallet or lower --live-usd.")
     if sol < CFG["live_min_sol"]:
         raise SystemExit(f"\nThe wallet holds {sol:.4f} SOL; at least {CFG['live_min_sol']} is needed for network fees.")
     try:
@@ -4238,10 +4681,19 @@ def main():
                     help="with --live: run only the live agents, so the dashboard shows just your real money")
     ap.add_argument("--live-usd", type=float, default=CFG["live_usd"],
                     help="USDC bankroll per live agent: the most each can ever deploy")
+    ap.add_argument("--direct", action="store_true",
+                    help="with --live: buy pump.fun launches straight on pump.fun, paid in SOL (PumpPortal builds "
+                         "the transaction, 0.5%% fee). Faster, and works before Jupiter knows a token. "
+                         "Falls back to USDC through Jupiter when SOL runs short or the route errors")
+    ap.add_argument("--unbench", action="store_true",
+                    help="let live agents that were benched (real trades far behind practice) buy again now")
     args = ap.parse_args()
     if args.check:
         raise SystemExit(0 if run_checks() else 1)
 
+    if args.direct and not args.live:
+        raise SystemExit("--direct needs --live (it changes how real pump.fun buys are made)")
+    CFG["live_direct"] = args.direct
     if args.live_only and not args.live:
         raise SystemExit("--live-only needs --live (it hides the paper agents and shows only real money)")
     if args.live and args.demo:
@@ -4297,6 +4749,11 @@ def main():
                     pump=pump, fomo=fomo, notify=notify)
     if pump and args.demo:
         pump.clock = lambda: engine.t
+    if args.unbench:
+        for name, st in engine.state["agents"].items():
+            if st.get("bench"):
+                st["bench"] = None
+                engine.emit("RISK", f"{name} unbenched by --unbench")
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(engine, args.port))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
