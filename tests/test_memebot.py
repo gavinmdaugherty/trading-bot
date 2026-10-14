@@ -531,6 +531,58 @@ class Themes(unittest.TestCase):
         self.assertLess(later, cat)
 
 
+class LearnedExits(unittest.TestCase):
+    def test_best_style_needs_evidence_and_a_margin(self):
+        L = m.Learner(None)
+        self.assertEqual(L.best_exit("mid"), "base")
+        for _ in range(40):
+            L.record_exit("mid", "base", 0.01)
+            L.record_exit("mid", "swing", 0.05)
+            L.record_exit("mid", "scalp", 0.015)       # better, but not by the 1% margin
+        self.assertEqual(L.best_exit("mid"), "swing")
+        self.assertEqual(L.best_exit("early"), "base")  # no evidence for this stage
+        L2 = m.Learner(None)
+        for _ in range(40):
+            L2.record_exit("late", "base", 0.02)
+            L2.record_exit("late", "scalp", 0.025)
+        self.assertEqual(L2.best_exit("late"), "base")
+
+    def test_style_survives_save_and_reload(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            L = m.Learner(os.path.join(d, "learn.json"))
+            for _ in range(40):
+                L.record_exit("early", "base", -0.02)
+                L.record_exit("early", "runner", 0.04)
+            L.save()
+            self.assertEqual(m.Learner(os.path.join(d, "learn.json")).best_exit("early"), "runner")
+
+    def test_shadows_score_every_style_and_positions_use_the_learned_one(self):
+        eng = demo_engine()
+        w = eng.pump
+        w.handle(dict(txType="create", mint="EX", traderPublicKey="d", symbol="EX", initialBuy=0,
+                      vSolInBondingCurve=40.0, vTokensInBondingCurve=800e6))
+        q = dict(w.get("EX"), buyers=30, last_trade=eng.t, age=60)
+        eng._open_shadows([q])
+        sh = next(iter(eng.shadows.values()))
+        self.assertEqual(sorted(sh["open_styles"]), sorted(m.EXIT_PROFILES))
+        w.handle(dict(txType="buy", mint="EX", traderPublicKey="b", solAmount=5, tokenAmount=1,
+                      vSolInBondingCurve=48.0, vTokensInBondingCurve=667e6))   # about +44%
+        eng._shadow_tick()
+        self.assertNotIn("scalp", sh["open_styles"])                        # scalp took profit at +25%
+        self.assertIn("runner", sh["open_styles"])                          # runner keeps riding
+        # once swing has clearly won for this stage, a new position uses it
+        stage = m.curve_stage(q["prog"])
+        for _ in range(40):
+            eng.learner.record_exit(stage, "base", 0.0)
+            eng.learner.record_exit(stage, "swing", 0.08)
+        self.assertTrue(eng._buy_curve("Spark", dict(q, addr="EX2")))
+        pos = eng.state["agents"]["Spark"]["positions"][m.tkey("solana", "EX2")]
+        self.assertEqual(pos["exit_style"], "swing")
+        eng._check_exit("Spark", m.tkey("solana", "EX2"), pos, pos["ref_price"] * 1.3)  # base tp would sell
+        self.assertIn(m.tkey("solana", "EX2"), eng.state["agents"]["Spark"]["positions"])  # swing holds (tp 150)
+
+
 class FakeLive:
     def __init__(self):
         self.calls = []
@@ -677,9 +729,10 @@ class LiveSpark(unittest.TestCase):
         w.handle(dict(txType="buy", mint="SH", traderPublicKey="b", solAmount=30, tokenAmount=1,
                       vSolInBondingCurve=80.0, vTokensInBondingCurve=400e6))  # price x4: take-profit
         self.eng._shadow_tick()
-        self.assertEqual(len(self.eng.shadows), 0)
-        self.assertEqual(self.eng.learner.n, 1)
+        self.assertEqual(self.eng.learner.n, 1)                      # the buy model learned from Spark's own exits
         self.assertGreater(self.eng.learner.recent[-1][0], 0.5)
+        sh = next(iter(self.eng.shadows.values()))
+        self.assertEqual(sh["open_styles"], ["runner"])               # only the let-it-run style is still riding
 
     def test_proof_counts_each_launch_once(self):
         L = self.eng.learner

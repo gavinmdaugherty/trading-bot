@@ -102,7 +102,7 @@ CFG = dict(
     learn_min=200,               # shadow trades to learn from before the model takes over
     learn_proof=30,              # out-of-sample picks needed before real money follows the model
     learn_edge=0.03,             # buy only when the model expects at least +3% after costs
-    shadow_max=1500,             # shadow trades followed at once
+    shadow_max=2500,             # shadow trades followed at once
     shadow_every_s=20,           # sample the same launch again after this long...
     shadow_per_token=12,         # ...up to this many times
     bundle_window_s=3.0,         # buys this close to the launch count as bundled with it
@@ -224,6 +224,20 @@ RISK = {
                   tp=100, tp1=None, sl=-25, trail_act=35, trail=18, max_hold=10, max_new_per_min=5,
                   lock_at=33, lock_floor=30),   # once +33%, never give back below 1.3x
 }
+# Selling styles Spark compares on every practice trade. "base" is the agent's own exits; the rest
+# override them. Spark learns, per stage of the curve, which style actually returns the most.
+EXIT_PROFILES = {
+    "base": {},
+    "scalp": dict(tp=25, sl=-12, trail_act=12, trail=6, max_hold=4, lock_at=15, lock_floor=10),
+    "swing": dict(tp=150, sl=-30, trail_act=45, trail=22, max_hold=20, lock_at=50, lock_floor=35),
+    "runner": dict(tp=400, sl=-25, trail_act=80, trail=30, max_hold=30, lock_at=60, lock_floor=40),
+}
+
+
+def curve_stage(prog):
+    return "early" if prog < 15 else ("mid" if prog < 45 else "late")
+
+
 # Common quick-buy amounts in SOL: many traders using the same button is normal, not a bot farm.
 PRESET_BUYS = (0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5, 10)
 
@@ -2087,6 +2101,7 @@ class Learner:
         self.mean, self.m2 = [0.0] * k, [0.0] * k   # running feature statistics (Welford)
         self.wins, self.win_sum, self.loss_sum = 0, 0.0, 0.0
         self.picks = []                             # net returns of out-of-sample picks (latest 200)
+        self.exits = {}                             # stage -> style -> [weight, weighted sum of returns]
         self.recent = []                            # (net return, won) of the latest 300 shadows
         if path and os.path.exists(path):
             try:
@@ -2096,6 +2111,7 @@ class Learner:
                 if old == list(self.FEATURES[:len(old)]):  # same features, or new ones added at the end
                     for key in ("w", "b", "n", "mean", "m2", "wins", "win_sum", "loss_sum", "picks", "recent"):
                         setattr(self, key, d[key])
+                    self.exits = d.get("exits", {})
                     pad = k - len(old)
                     self.w, self.mean, self.m2 = self.w + [0.0] * pad, self.mean + [0.0] * pad, self.m2 + [0.0] * pad
             except Exception:
@@ -2105,7 +2121,7 @@ class Learner:
         if not self.path:
             return
         d = {key: getattr(self, key) for key in ("w", "b", "n", "mean", "m2", "wins", "win_sum",
-                                                 "loss_sum", "picks", "recent")}
+                                                 "loss_sum", "picks", "recent", "exits")}
         d["features"] = list(self.FEATURES)
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
@@ -2182,6 +2198,23 @@ class Learner:
         if picked:
             self.picks = (self.picks + [round(ret, 4)])[-200:]
 
+    def record_exit(self, stage, style, ret):
+        book = self.exits.setdefault(stage, {})
+        e = book.setdefault(style, [0.0, 0.0])
+        e[0], e[1] = e[0] * 0.997 + 1, e[1] * 0.997 + ret   # recent results count most
+
+    def exit_means(self, stage):
+        return {k: (v[1] / v[0], v[0]) for k, v in self.exits.get(stage, {}).items() if v[0] > 0}
+
+    def best_exit(self, stage, min_n=30, margin=0.01):
+        """The selling style to use for a new position bought at this stage of the curve. Stays
+        with the agent's own exits until another style has clearly beaten them on enough trades."""
+        m = self.exit_means(stage)
+        if m.get("base", (0, 0))[1] < min_n:
+            return "base"
+        best = max((k for k in m if m[k][1] >= min_n), key=lambda k: m[k][0], default="base")
+        return best if m[best][0] > m["base"][0] + margin else "base"
+
     def summary(self):
         n, avg = self.proof()
         recent = self.recent[-100:]
@@ -2190,7 +2223,10 @@ class Learner:
                     picks=n, pick_avg=avg, proof_n=self.proof_n,
                     win_rate=(sum(1 for r in recent if r[1]) / len(recent)) if recent else None,
                     avg_ret=(sum(r[0] for r in recent) / len(recent)) if recent else None,
-                    top=[(f, round(v, 2)) for f, v in top])
+                    top=[(f, round(v, 2)) for f, v in top],
+                    exits={st: dict(use=self.best_exit(st), means={k: [round(v[0], 4), round(v[1])]
+                                                                    for k, v in self.exit_means(st).items()})
+                           for st in ("early", "mid", "late")})
 
 
 # --------------------------------------------------------------------------- #
@@ -2583,6 +2619,11 @@ class Engine:
         self.emit("EXEC", f"{name} BUY ${p['symbol']} ${size:.2f} on {p['chain']} @ {p['price']:.8g}")
         return True
 
+    def _exit_style(self, name, q):
+        if self.learner and self.acfg[name].get("learn"):
+            return self.learner.best_exit(curve_stage(q["prog"]))
+        return "base"
+
     def _buy_curve(self, name, q):
         a, st, c = self.acfg[name], self.state["agents"][name], self.cfg
         live = a.get("live")
@@ -2605,10 +2646,13 @@ class Engine:
             chain="solana", addr=q["addr"], symbol=q["symbol"], units=units, size=size, size0=size,
             ref_price=size / units, peak=size / units, opened=self.t, entry_liq=None, sell_tax=0.0,
             last_price=q["price"], last_liq=0.0, last_vsol=q["vsol"], last_vtok=q["vtok"],
-            curve_sol=net, miss=0, venue="curve", src="pump", last_seen=self.t)
+            curve_sol=net, miss=0, venue="curve", src="pump", last_seen=self.t,
+            exit_style=self._exit_style(name, q))
         self.curve_buys.setdefault(name, deque(maxlen=20)).append(self.t)
+        style = st["positions"][k]["exit_style"]
         self.emit("EXEC", f"{name} BUY ${q['symbol']} ${size:.2f} on pump.fun, mcap ${q['mcap'] / 1000:.1f}k, "
-                          f"curve {q['prog']:.0f}%, {q['buyers']} buyers, +{q['net_sol_5m']:.1f} SOL/5m")
+                          f"curve {q['prog']:.0f}%, {q['buyers']} buyers, +{q['net_sol_5m']:.1f} SOL/5m"
+                          + (f", selling style: {style}" if style != "base" else ""))
         return True
 
     def _live_buy_curve(self, name, q, size):
@@ -2636,7 +2680,7 @@ class Engine:
             last_price=q["price"], last_liq=0.0, last_vsol=q["vsol"], last_vtok=q["vtok"],
             curve_sol=spent / self.sol_usd * (1 - c["pump_fee_pct"] / 100.0), miss=0, venue="curve",
             src="pump", last_seen=self.t, live=True, raw=res["raw"], decimals=res["decimals"],
-            sig=res["sig"])
+            sig=res["sig"], exit_style=self._exit_style(name, q))
         self.emit("EXEC", f"{name} BUY ${q['symbol']} ${spent:.2f} on pump.fun LIVE, mcap "
                           f"${q['mcap'] / 1000:.1f}k, curve {q['prog']:.0f}%, tx {str(res['sig'])[:10]}")
         return True
@@ -2739,6 +2783,8 @@ class Engine:
 
     def _check_exit(self, name, k, pos, price, liq=None, dev_sold=False):
         a = self.acfg[name]
+        if pos.get("exit_style") in EXIT_PROFILES:  # the selling style learned for this kind of launch
+            a = dict(a, **EXIT_PROFILES[pos["exit_style"]])
         ret = (price / pos["ref_price"] - 1) * 100
         peak_ret = (pos["peak"] / pos["ref_price"] - 1) * 100
         held = (self.t - pos["opened"]) / 60.0
@@ -2942,8 +2988,9 @@ class Engine:
             if pick:  # proof counts each launch once, however often it is sampled
                 self.picked_mints.add(m)
             ref = q["price"] * (1 + cost)  # what a fill would cost, as for a real buy
-            self.shadows[(m, count)] = dict(mint=m, x=x, ref=ref, peak=ref, last=q["price"],
-                                            opened=self.t, picked=pick)
+            self.shadows[(m, count)] = dict(mint=m, x=x, ref=ref, peak=ref, last=q["price"], opened=self.t,
+                                            picked=pick, stage=curve_stage(q["prog"]),
+                                            open_styles=list(EXIT_PROFILES))
             self.shadowed[m] = (self.t, count + 1)
 
     @staticmethod
@@ -2965,6 +3012,7 @@ class Engine:
     def _shadow_tick(self):
         a, c, L = self._learn_agent(), self.cfg, self.learner
         cost = (c["pump_fee_pct"] + c["pump_extra_slip_pct"]) / 100.0
+        styles = {k: dict(a, **v) for k, v in EXIT_PROFILES.items()}
         for key, sh in list(self.shadows.items()):
             q = self.pump.peek(sh["mint"])
             if q and q["price"] > 0:
@@ -2972,12 +3020,15 @@ class Engine:
             price = sh["last"]
             sh["peak"] = max(sh["peak"], price)
             ret, peak_ret = (price / sh["ref"] - 1) * 100, (sh["peak"] / sh["ref"] - 1) * 100
-            why = self._exit_reason(a, ret, peak_ret, (self.t - sh["opened"]) / 60,
-                                    bool(q and q["dev_sold"]))
-            if not why and (q is None or q["migrated"]):
-                why = "ended"
-            if why:
-                L.learn(sh["x"], price * (1 - cost) / sh["ref"] - 1, sh["picked"])
+            held, dev_sold, ended = (self.t - sh["opened"]) / 60, bool(q and q["dev_sold"]), q is None or q["migrated"]
+            net = price * (1 - cost) / sh["ref"] - 1
+            for style in list(sh["open_styles"]):   # every selling style, side by side
+                if ended or self._exit_reason(styles[style], ret, peak_ret, held, dev_sold):
+                    sh["open_styles"].remove(style)
+                    L.record_exit(sh.get("stage", "mid"), style, net)
+                    if style == "base":  # the buy model learns from the agent's own exits
+                        L.learn(sh["x"], net, sh["picked"])
+            if ended or not sh["open_styles"]:
                 del self.shadows[key]
         if len(self.shadowed) > 20000:
             cut = self.t - 7200
@@ -3232,7 +3283,7 @@ class Engine:
                         value=self._value(pos), ret=(pos["last_price"] / pos["ref_price"] - 1) * 100,
                         held=(self.t - pos["opened"]) / 60, src=pos.get("src", "dex"),
                         venue=pos.get("venue", "dex"), scaled=bool(pos.get("tp1_done")),
-                        live=bool(pos.get("live"))))
+                        live=bool(pos.get("live")), style=pos.get("exit_style", "base")))
                 trades.extend(st["trades"][-25:])
                 all_rows.extend(st["trades"])
             trades.sort(key=lambda x: -x["t"])
@@ -3585,6 +3636,8 @@ function renderSpot(s){
       <div class="meterbar"><b style="width:${learnPct}%"></b></div><div class="small" style="margin:0">${Math.min(L.n,L.min_n)}/${L.min_n} to start deciding</div>
       <div class="meterbar p"><b style="width:${proofPct}%"></b></div><div class="small" style="margin:0">proof: ${L.picks}/${L.proof_n} picks, avg ${pc(L.pick_avg)}${L.proven?" ✓":""}</div></div>
     <div><h3>What it trusts</h3><div class="chips">${top||'<span class="mute small">still learning which signals matter</span>'}</div>
+      <h3 style="margin-top:12px">How it sells</h3><div class="chips">${["early","mid","late"].map(st=>{const e=(L.exits||{})[st]||{};const m=(e.means||{})[e.use||"base"];
+        return `<span class="chip ${e.use&&e.use!=="base"?"good":""}">${st}: <b>${esc(e.use||"base")}</b>${m?` ${pc(m[0])}`:""}</span>`}).join("")}</div>
       <h3 style="margin-top:12px">Recent practice</h3><div class="small" style="margin:0">${L.win_rate==null?"no results yet":`win rate ${Math.round(L.win_rate*100)}%, average ${pc(L.avg_ret)} per trade`}</div></div>
     <div><h3>Memory</h3>${M?`<div class="chips"><span class="chip">${M.judged} launches judged</span><span class="chip good">${M.outcomes.win||0} ran</span><span class="chip bad">${M.outcomes.rug||0} rugged</span>
         <span class="chip bad">${M.ruggers} rugger devs</span><span class="chip bad">${M.rug_wallets} rug wallets</span><span class="chip good">${M.smart} smart wallets</span></div>`:""}
@@ -3711,7 +3764,7 @@ function render(s){
       <div class="why">${why(a)}</div></div>`}).join(""));
 
   setHTML("#pos",s.positions.length?`<table><tr><th>Agent</th><th>Token</th><th>Feed</th><th>Size</th><th>Now</th><th>Move</th><th>Held</th></tr>`+
-    s.positions.map(p=>`<tr><td>${esc(p.agent)}</td><td>$${esc(p.symbol)}${p.live?' <span class="badge b-bad">LIVE</span>':""}${p.scaled?' <span class="badge b-mine">½ out</span>':""}</td><td>${badge(p.src)} <span class="mute">${p.venue==="curve"?"curve":esc(p.chain)}</span></td><td>${money(p.size)}</td><td>${money(p.value)}</td><td class="${cls(p.ret)}">${pct(p.ret)}</td><td>${Math.round(p.held)}m</td></tr>`).join("")+"</table>"
+    s.positions.map(p=>`<tr><td>${esc(p.agent)}</td><td>$${esc(p.symbol)}${p.live?' <span class="badge b-bad">LIVE</span>':""}${p.style&&p.style!=="base"?` <span class="badge b-grad">${esc(p.style)}</span>`:""}${p.scaled?' <span class="badge b-mine">½ out</span>':""}</td><td>${badge(p.src)} <span class="mute">${p.venue==="curve"?"curve":esc(p.chain)}</span></td><td>${money(p.size)}</td><td>${money(p.value)}</td><td class="${cls(p.ret)}">${pct(p.ret)}</td><td>${Math.round(p.held)}m</td></tr>`).join("")+"</table>"
     :'<div class="empty">No open positions. Entries appear here once a token passes an agent\'s filters and the safety checks. Each agent card says what is holding it back.</div>');
   setHTML("#trd",s.trades.length?`<table><tr><th>Time</th><th>Agent</th><th>Token</th><th>P&amp;L</th><th>Return</th><th>Exit</th></tr>`+
     s.trades.map(t=>`<tr><td>${hhmm(t.t)}</td><td>${esc(t.agent)}</td><td>${badge(t.src||"dex")} $${esc(t.symbol)}</td><td class="${cls(t.pnl)}">${smoney(t.pnl)}</td><td class="${cls(t.ret)}">${pct(t.ret)}</td><td>${esc(t.reason)}</td></tr>`).join("")+"</table>"

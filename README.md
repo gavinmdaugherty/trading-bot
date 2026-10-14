@@ -60,6 +60,8 @@ Spark trains a small model on what actually happens to pump.fun launches:
 3. **Trading on it:** after 200 shadow trades the model replaces Spark's hand-set thresholds, and Spark buys only when it expects at least +3%.
 4. **Real money needs proof:** Spark LIVE waits until the model's own picks, scored before their results were known, have made money on average over at least 30 trades. A model that keeps losing is never cleared to trade.
 
+**Learned exits.** Every practice trade runs four selling styles side by side on the same launch: scalp, Spark's own exits, swing and runner. Spark keeps a running score for each style at each stage of the curve (early, mid, late), with recent results counting most. A new position uses whichever style has clearly beaten Spark's own exits: at least 30 practice trades and more than 1% better. The style shows as a badge on the position and in the "How it sells" chips.
+
 **Memory.** Spark judges every launch it followed when the launch ends:
 - **ran:** it graduated, or got at least halfway up the curve
 - **rugged:** the creator or the first-seconds wallets sold out, and it gave back most of its gain since launch
