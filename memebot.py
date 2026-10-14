@@ -39,6 +39,7 @@ Standard library only (Python 3.9+); live trading additionally needs `solders`.
 """
 import argparse
 import base64
+import concurrent.futures
 import hashlib
 import json
 import math
@@ -129,6 +130,8 @@ CFG = dict(
     live_min_sol_trade=0.008,    # no new live buys below this much SOL (fees + token account rent)
     live_curve_slippage_bps=1000,   # pump.fun launches move fast: 10% tolerance on curve buys
     live_curve_max_dev_pct=10.0,    # refuse a curve buy if the route price is this far above the curve
+    live_curve_priority="veryHigh",  # Jupiter priority-fee level for curve buys (still capped by the max below)
+    fast_seconds_live=1.0,       # pump.fun loop interval while a live curve agent runs
     live_close_empty=True,       # close emptied token accounts to get their ~0.002 SOL rent back
 )
 
@@ -1791,21 +1794,22 @@ class SolanaLive:
                                         slippageBps=int(slippage_bps), restrictIntermediateTokens="true"))
         return self._http(f"{self.jup}/quote?{q}", headers=self.hdrs)
 
-    def _execute(self, quote):
+    def _execute(self, quote, priority="high"):
         """Build, sign, simulate (preflight), broadcast and wait for confirmation."""
         c = self.cfg
         body = {"quoteResponse": quote, "userPublicKey": self.pub, "dynamicComputeUnitLimit": True,
                 "prioritizationFeeLamports": {"priorityLevelWithMaxLamports": {
-                    "priorityLevel": "high", "maxLamports": int(c["live_max_priority_lamports"])}}}
+                    "priorityLevel": priority, "maxLamports": int(c["live_max_priority_lamports"])}}}
         sw = self._http(f"{self.jup}/swap", body, self.hdrs, timeout=30)
         tx = self._VT.from_bytes(base64.b64decode(sw["swapTransaction"]))
         signed = self._VT(tx.message, [self.kp])
         b64 = base64.b64encode(bytes(signed)).decode()
         sig = self._rpc("sendTransaction", [b64, {"encoding": "base64", "skipPreflight": False,
                                                   "preflightCommitment": "confirmed", "maxRetries": 3}])
-        deadline = time.time() + c["live_confirm_secs"]
+        deadline, polls = time.time() + c["live_confirm_secs"], 0
         while time.time() < deadline:
-            time.sleep(2)
+            time.sleep(0.4 if polls < 25 else 2)   # check often at first: most land within seconds
+            polls += 1
             st = self._rpc("getSignatureStatuses", [[sig], {"searchTransactionHistory": False}])["value"][0]
             if st:
                 if st.get("err"):
@@ -1814,23 +1818,31 @@ class SolanaLive:
                     return sig
         raise TimeoutError(f"not confirmed within {c['live_confirm_secs']}s (signature {sig})")
 
-    def _changed(self, read, before, tries=5):
+    def _changed(self, read, before, tries=20, wait=0.5):
         """Balance reads can lag a moment behind confirmation; poll until the value moves."""
         v = read()
         for _ in range(tries):
             if v != before:
                 return v
-            time.sleep(2)
+            time.sleep(wait)
             v = read()
         return v
 
-    def buy(self, mint, usd, ref_price, slippage_bps=None, max_dev_pct=None):
+    def buy(self, mint, usd, ref_price, slippage_bps=None, max_dev_pct=None, priority="high"):
         c = self.cfg
         slippage_bps = slippage_bps or c["live_slippage_bps"]
         max_dev_pct = max_dev_pct or c["live_max_price_dev_pct"]
+        t0 = time.time()
+        # the quote, the token's decimals and both starting balances are independent: fetch them together
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            f_quote = pool.submit(self._quote, self.USDC, mint, round(usd * 1e6), slippage_bps)
+            f_dec = pool.submit(self.decimals, mint)
+            f_usdc = pool.submit(self.usdc)
+            f_tok = pool.submit(self.token_balance, mint)
+            concurrent.futures.wait([f_quote, f_dec, f_usdc, f_tok])
         try:
-            dec = self.decimals(mint)
-            q = self._quote(self.USDC, mint, round(usd * 1e6), slippage_bps)
+            dec = f_dec.result()
+            q = f_quote.result()
             out = int(q["outAmount"])
             if out <= 0:
                 return dict(ok=False, stage="quote", err="empty quote")
@@ -1840,11 +1852,12 @@ class SolanaLive:
                 return dict(ok=False, stage="quote", err=f"route price {dev:.1f}% above market")
         except Exception as e:
             return dict(ok=False, stage="quote", err=str(e)[:160])
+        t_quote = time.time()
         try:
-            usdc0 = self.usdc()
-            tok0 = self.token_balance(mint)[0]
+            usdc0 = f_usdc.result()
+            tok0 = f_tok.result()[0]
             try:
-                sig = self._execute(q)
+                sig = self._execute(q, priority)
             except TimeoutError as e:
                 time.sleep(15)  # the transaction may still land; check the wallet before giving up
                 if self.token_balance(mint)[0] <= tok0:
@@ -1854,11 +1867,13 @@ class SolanaLive:
             usdc1 = self._changed(self.usdc, usdc0)
         except Exception as e:
             return dict(ok=False, stage="tx", err=str(e)[:200])
+        t_done = time.time()
         raw = tok1 - tok0
         if raw <= 0:
             return dict(ok=False, stage="tx", err="confirmed but no tokens received")
         spent = usdc0 - usdc1
-        return dict(ok=True, spent_usd=spent if spent > 0 else usd, raw=raw, decimals=dec, sig=sig)
+        return dict(ok=True, spent_usd=spent if spent > 0 else usd, raw=raw, decimals=dec, sig=sig,
+                    timing=dict(quote=t_quote - t0, landed=t_done - t_quote, total=t_done - t0))
 
     def close_empty(self, mint):
         """Close this wallet's empty token accounts for `mint`, returning their rent
@@ -2276,6 +2291,7 @@ class Engine:
             self.brain.start()
         self.dex_err, self.dex_ok_t = "", None
         self.pump_warned = False
+        self.fill_times = deque(maxlen=50)   # seconds from signal to a filled live buy
         self.blocks = {}          # agent -> (tokens checked, {reason it didn't buy: count})
         self.phase, self.phase_t, self.next_at = "starting up", time.time(), None
         self.state = self._load() or self._fresh()
@@ -2660,8 +2676,9 @@ class Engine:
         c, st, k = self.cfg, self.state["agents"][name], tkey("solana", q["addr"])
         st["cool"][k] = self.t  # never retry the same token immediately, whatever happens
         self.curve_buys.setdefault(name, deque(maxlen=20)).append(self.t)
+        t_signal = time.time()
         res = self.live.buy(q["addr"], size, q["price"], slippage_bps=c["live_curve_slippage_bps"],
-                            max_dev_pct=c["live_curve_max_dev_pct"])
+                            max_dev_pct=c["live_curve_max_dev_pct"], priority=c["live_curve_priority"])
         if not res["ok"]:
             if res.get("stage") == "tx":
                 self._live_fail(f"{name} buy ${q['symbol']} failed: {res['err']}")
@@ -2681,8 +2698,13 @@ class Engine:
             curve_sol=spent / self.sol_usd * (1 - c["pump_fee_pct"] / 100.0), miss=0, venue="curve",
             src="pump", last_seen=self.t, live=True, raw=res["raw"], decimals=res["decimals"],
             sig=res["sig"], exit_style=self._exit_style(name, q))
+        tm = res.get("timing") or {}
+        took = time.time() - t_signal
+        self.fill_times.append(round(took, 2))
         self.emit("EXEC", f"{name} BUY ${q['symbol']} ${spent:.2f} on pump.fun LIVE, mcap "
-                          f"${q['mcap'] / 1000:.1f}k, curve {q['prog']:.0f}%, tx {str(res['sig'])[:10]}")
+                          f"${q['mcap'] / 1000:.1f}k, curve {q['prog']:.0f}%, filled in {took:.1f}s"
+                          + (f" (quote {tm['quote']:.1f}s, land {tm['landed']:.1f}s)" if tm else "")
+                          + f", tx {str(res['sig'])[:10]}")
         return True
 
     def _live_fail(self, msg):
@@ -3340,6 +3362,8 @@ class Engine:
                 positions=sorted(positions, key=lambda x: -x["size"]), trades=trades[:30],
                 log=S["log"][-80:][::-1], equity=series, pump=pump, fomo=fomo,
                 real_only=bool(agents) and all(a["live"] for a in agents),
+                fills=dict(n=len(self.fill_times), last=self.fill_times[-1] if self.fill_times else None,
+                           avg=round(sum(self.fill_times) / len(self.fill_times), 2) if self.fill_times else None),
                 learn=dict(self.learner.summary(), open=len(self.shadows)) if self.learner else None,
                 memory=self.memory.summary() if self.memory else None,
                 brain=self.brain.status() if self.brain else None,
@@ -3716,7 +3740,8 @@ function render(s){
   if(demo){b.style.display="block";b.textContent="Simulated data. These prices and launches are random and say nothing about real markets."}
   else if(isLive){b.style.display="block";b.className="banner live";
     b.textContent=(s.halted?"LIVE TRADING HALTED after repeated failed transactions. Check open positions and restart. ":"Real funds at risk. ")+
-      (s.wallet?"Wallet "+s.wallet.pub+": "+money(s.wallet.usdc)+" USDC, "+s.wallet.sol.toFixed(4)+" SOL.":"Reading wallet balance...")}
+      (s.wallet?"Wallet "+s.wallet.pub+": "+money(s.wallet.usdc)+" USDC, "+s.wallet.sol.toFixed(4)+" SOL.":"Reading wallet balance...")+
+      (s.fills&&s.fills.n?` Live fills: average ${s.fills.avg.toFixed(1)}s from signal to filled (last ${s.fills.last.toFixed(1)}s, ${s.fills.n} buys).`:"")}
   else if(s.dex&&s.dex.error&&!demo){b.style.display="block";b.textContent="Market data problem: "+s.dex.error+". The bot keeps retrying; check your internet connection or firewall."}
   else if(s.pump&&!demo&&s.pump.seen>=10&&!s.pump.trades&&(s.pump.connected_for>90||s.pump.rpc)){b.style.display="block";
     b.textContent="pump.fun: launches are arriving but no trades yet, so Spark and Crest can't buy. "+
@@ -4018,13 +4043,16 @@ def main():
         if args.pump_rpc:
             pump.start_rpc()
 
+        fast_s = CFG["fast_seconds_live"] if any(a.get("live") and a.get("venue") == "curve"
+                                                  for a in engine.acfg.values()) else CFG["fast_seconds"]
+
         def fast_loop():
             while True:
                 try:
                     engine.fast()
                 except Exception as e:
                     engine._err(f"pump.fun loop error: {e}")
-                time.sleep(CFG["fast_seconds"])
+                time.sleep(fast_s)
         threading.Thread(target=fast_loop, name="fast", daemon=True).start()
     mode = "DEMO" if args.demo else ("LIVE + PAPER" if live else "PAPER")
     feeds = ", ".join(["DexScreener"] + (["pump.fun"] if pump else []) + (["Fomo"] if fomo else []))

@@ -587,7 +587,7 @@ class FakeLive:
     def __init__(self):
         self.calls = []
 
-    def buy(self, mint, usd, ref_price, slippage_bps=None, max_dev_pct=None):
+    def buy(self, mint, usd, ref_price, slippage_bps=None, max_dev_pct=None, priority="high"):
         self.calls.append(("buy", mint, usd, slippage_bps, max_dev_pct))
         return dict(ok=True, spent_usd=usd, raw=int(usd / ref_price * 1e6), decimals=6, sig="SIG")
 
@@ -770,6 +770,49 @@ class LiveSpark(unittest.TestCase):
                             (dict(dup_social=True), "reused social links"), (dict(whale=0.8), "one whale driving it"),
                             (dict(meta_state=1), "checking socials"), (dict(dev_sold=True), "creator sold")]:
             self.assertEqual(self.eng._why_not_curve("Spark", dict(base, **change)), why)
+
+
+class LiveBuySpeed(unittest.TestCase):
+    def ex(self, slow=0.3, quote_fails=False):
+        ex = m.SolanaLive.__new__(m.SolanaLive)
+        ex.cfg = m.CFG
+        bal = {"tok": 0, "usdc": 25.0}
+
+        def wait(v):
+            time.sleep(slow)
+            return v
+
+        def quote(*a):
+            time.sleep(slow)
+            if quote_fails:
+                raise RuntimeError("no route")
+            return {"inAmount": "5000000", "outAmount": str(int(5 / 2e-6 * 1e6))}
+        ex._quote = quote
+        ex.decimals = lambda mint: wait(6)
+        ex.usdc = lambda: wait(bal["usdc"])
+        ex.token_balance = lambda mint: wait((bal["tok"], 6))
+
+        def execute(q, priority="high"):
+            ex.priority_used = priority
+            bal["tok"], bal["usdc"] = 2_400_000_000, 20.0
+            return "SIG"
+        ex._execute = execute
+        return ex
+
+    def test_lookups_run_in_parallel_and_fill_is_timed(self):
+        ex = self.ex(slow=0.3)
+        t = time.time()
+        res = ex.buy("MINTpump", 5.0, 2e-6, priority="veryHigh")
+        self.assertTrue(res["ok"])
+        self.assertLess(res["timing"]["quote"], 0.55)            # four 0.3s lookups took about 0.3s, not 1.2s
+        self.assertEqual(ex.priority_used, "veryHigh")
+        self.assertAlmostEqual(res["spent_usd"], 5.0)
+        self.assertEqual(res["raw"], 2_400_000_000)
+        self.assertLess(time.time() - t, 2.5)
+
+    def test_quote_failure_is_a_quote_failure_not_a_failed_transaction(self):
+        res = self.ex(slow=0.01, quote_fails=True).buy("M", 5.0, 2e-6)
+        self.assertEqual((res["ok"], res["stage"]), (False, "quote"))
 
 
 class CloseEmpty(unittest.TestCase):
