@@ -1208,6 +1208,9 @@ class NewSignals(unittest.TestCase):
         self.create("E", dev="FRESHDEV")
         for i in range(m.CFG["meta_min_buys"]):
             self.trade("E", "buy", f"W{i}", 0.2, 1e6)
+        self.assertEqual(list(self.w.dev_q), [])            # no lookup until Spark is weighing the launch
+        self.w.want_dev("E", "FRESHDEV")
+        self.w.want_dev("E", "FRESHDEV")
         self.assertEqual(list(self.w.dev_q), [("E", "FRESHDEV")])
         with self.w.lock:
             self.w._set_dev("FRESHDEV", (0.2, 3))
@@ -1215,8 +1218,24 @@ class NewSignals(unittest.TestCase):
         self.create("F", dev="FRESHDEV")
         for i in range(m.CFG["meta_min_buys"]):
             self.trade("F", "buy", f"V{i}", 0.2, 1e6)
+        self.w.want_dev("F", "FRESHDEV")
         self.assertEqual(len(self.w.dev_q), 1)              # cached: no second lookup
         self.assertAlmostEqual(self.w.get("F")["dev_age_h"], 0.2)
+
+    def test_engine_asks_for_the_launches_it_is_weighing(self):
+        eng = demo_engine()
+        eng.demo = False                                     # the demo fakes wallet ages; real runs look them up
+        w = eng.pump
+        w.handle(dict(txType="create", mint="LOOK", traderPublicKey="CREATOR1", symbol="LK", name="look",
+                      initialBuy=0, vSolInBondingCurve=30.0, vTokensInBondingCurve=m.PUMP_V_TOK0, pool="pump"))
+        for i in range(12):
+            eng.t += 4
+            w.handle(dict(txType="buy", mint="LOOK", traderPublicKey=f"B{i}", solAmount=0.3, newTokenBalance=2e6,
+                          vSolInBondingCurve=31.0 + i, vTokensInBondingCurve=1.0e9 - i * 4e6, pool="pump"))
+        with w.lock:
+            w.tokens["LOOK"]["dev_age_h"] = w.tokens["LOOK"]["dev_txs"] = None
+        eng._curve_entries()
+        self.assertIn(("LOOK", "CREATOR1"), list(w.dev_q))
 
     def test_dev_lookup_parses_signatures(self):
         seen = {}

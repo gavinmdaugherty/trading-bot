@@ -740,6 +740,7 @@ class PumpWatcher:
         self.dev_q = deque(maxlen=200)
         self.dev_cache = {}      # creator wallet -> (wallet age in hours, transactions seen)
         self.dev_stats = dict(done=0, failed=0, error="")
+        self.dev_pending = set()
 
     # ---- feed ---- #
     def start(self):
@@ -876,6 +877,7 @@ class PumpWatcher:
             with self.lock:
                 while self.dev_q and not job:
                     mint, dev = self.dev_q.pop()   # newest first: fresh launches matter most
+                    self.dev_pending.discard(dev)
                     if mint in self.tokens and dev not in self.dev_cache:
                         job = (mint, dev)
             if not job:
@@ -909,6 +911,17 @@ class PumpWatcher:
         if not times:
             return (0.0, len(sigs))
         return (max(0.0, ((now or time.time()) - min(times)) / 3600), len(sigs))
+
+    def want_dev(self, mint, creator):
+        """Ask for a creator wallet-age lookup. The engine calls this for launches Spark is actually
+        weighing, so the hourly lookup budget goes where it matters; the newest request runs first."""
+        with self.lock:
+            if not creator or creator in self.dev_cache or creator in self.dev_pending:
+                return
+            if len(self.dev_pending) > 400:
+                self.dev_pending.clear()
+            self.dev_pending.add(creator)
+            self.dev_q.append((mint, creator))
 
     def _set_dev(self, dev, info):
         if len(self.dev_cache) > 50000:
@@ -1060,11 +1073,8 @@ class PumpWatcher:
             if t["meta_state"] == 0 and t["n_buys"] >= c["meta_min_buys"] and t["uri"]:
                 t["meta_state"] = 1
                 self.meta_q.append(t["mint"])
-            if t["n_buys"] == c["meta_min_buys"] and t["creator"] and t["dev_age_h"] is None:
-                if t["creator"] in self.dev_cache:
-                    t["dev_age_h"], t["dev_txs"] = self.dev_cache[t["creator"]]
-                else:
-                    self.dev_q.append((t["mint"], t["creator"]))
+            if t["n_buys"] == c["meta_min_buys"] and t["creator"] in self.dev_cache and t["dev_age_h"] is None:
+                t["dev_age_h"], t["dev_txs"] = self.dev_cache[t["creator"]]
         else:
             t["n_sells"] += 1
             if trader and trader == t["creator"] and not t["dev_sold"]:
@@ -2696,7 +2706,7 @@ class Scouts:
         if busy:
             sc -= 0.1   # an old, very active wallet: often a launch bot
         parts = [f"wallet {self._age(age)} old" if age is not None else
-                 ("busy wallet, 100+ recent transactions" if busy else "wallet age not looked up yet")]
+                 ("busy wallet, 100+ recent transactions" if busy else "wallet age queued for lookup")]
         if n:
             parts.append(f"{n} other launch{'es' if n > 1 else ''} in 24h")
         if wins or rugs:
@@ -2795,10 +2805,13 @@ class Scouts:
                     st["notes"].append((q["symbol"], -1.0, "VETO: " + veto[1]))
         return q
 
-    def summary(self):
-        return [dict(name=n, role=r, watches=w, reviewed=self.stats[n]["reviewed"], green=self.stats[n]["green"],
-                     red=self.stats[n]["red"], vetoes=self.stats[n]["vetoes"], notes=list(self.stats[n]["notes"])[::-1])
-                for n, r, w in self.SQUAD]
+    def summary(self, devs=None):
+        out = [dict(name=n, role=r, watches=w, reviewed=self.stats[n]["reviewed"], green=self.stats[n]["green"],
+                    red=self.stats[n]["red"], vetoes=self.stats[n]["vetoes"], notes=list(self.stats[n]["notes"])[::-1])
+               for n, r, w in self.SQUAD]
+        if devs is not None:
+            out[2]["lookups"] = devs
+        return out
 
 
 # --------------------------------------------------------------------------- #
@@ -3796,6 +3809,17 @@ class Engine:
                 self.scouts.set_trends(self._trending_words())
             for q in cands:
                 self.scouts.review(q)
+            if not self.demo:   # creator wallet ages for the launches nearest to a buy
+                a = self._learn_agent() or next(iter(self.acfg.values()), None)
+                asked = 0
+                for q in cands:
+                    if asked >= 3:
+                        break
+                    if q.get("dev_age_h") is None and a and not self._hard_curve_reason(a, q):
+                        tok = self.pump.tokens.get(q["addr"])
+                        if tok and tok["dev_txs"] is None:
+                            self.pump.want_dev(q["addr"], tok["creator"])
+                            asked += 1
         if self.learner:
             self._open_shadows(cands)
         counts = {n: {} for n in names}
@@ -4163,7 +4187,8 @@ class Engine:
                 memory=self.memory.summary() if self.memory else None,
                 brain=self.brain.status() if self.brain else None,
                 themes=self.memory.hot_themes(self.t, 6) if self.memory else [],
-                scouts=dict(squad=self.scouts.summary(), desk=list(self.desk)[::-1], now=self.on_desk)
+                scouts=dict(squad=self.scouts.summary(None if self.demo else self.pump.dev_stats),
+                            desk=list(self.desk)[::-1], now=self.on_desk)
                 if self.scouts else None,
                 fomo_off=self.fomo is None, dex=dict(error=self.dex_err, ok_t=self.dex_ok_t), phase=self.phase, phase_t=self.phase_t,
                 next_at=self.next_at, updated=time.time(), poll=self.cfg["poll_seconds"])
@@ -4614,6 +4639,7 @@ function renderSquad(S){
   const squad=S.squad.map(x=>{const last=x.notes[0];
     return `<div class="scout"><div class="n">${esc(x.name)}</div><div class="r">${esc(x.role)}</div>
       <div class="small" style="margin:4px 0 0">${x.reviewed} reviewed · <span class="up">${x.green}</span> / <span class="down">${x.red}</span>${x.vetoes?` · <span class="down">${x.vetoes} vetoes</span>`:""}</div>
+      ${x.lookups?`<div class="small" style="margin:3px 0 0;color:${x.lookups.failed&&!x.lookups.done?"var(--down)":"var(--mute)"}">wallet ages: ${x.lookups.done} looked up${x.lookups.failed?`, ${x.lookups.failed} failed${x.lookups.error?" ("+esc(x.lookups.error.slice(0,60))+")":""}`:""}</div>`:""}
       <div class="last" title="${esc(x.watches)}">${last?`$${esc(last[0])}: ${esc(last[2])}`:esc(x.watches)}</div></div>`}).join("");
   setHTML("#squad",`<div class="desk"><h3>Spark's desk: weighing now</h3>${desk}
       ${calls?`<h3 style="margin-top:14px">Recent calls</h3><div class="calls">${calls}</div>`:""}</div>
