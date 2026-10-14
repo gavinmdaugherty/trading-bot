@@ -1695,8 +1695,10 @@ class Watchlist(unittest.TestCase):
                              solAmount=0.6, vSolInBondingCurve=30.6, vTokensInBondingCurve=m.PUMP_V_TOK0 - 20e6, pool="pump"))
 
     def trade(self, eng, mint, side, who, sol, bal, amt=0.0):
+        self.n = getattr(self, "n", 0) + 1
         eng.pump.handle(dict(txType=side, mint=mint, traderPublicKey=who, solAmount=sol, tokenAmount=amt,
-                             newTokenBalance=bal, vSolInBondingCurve=33.0, vTokensInBondingCurve=980e6, pool="pump"))
+                             newTokenBalance=bal, vSolInBondingCurve=33.0, vTokensInBondingCurve=980e6, pool="pump",
+                             signature=f"SIG{self.n}"))
 
     def test_snipes_a_watched_creators_launch(self):
         eng = self.engine()
@@ -1796,6 +1798,107 @@ class Watchlist(unittest.TestCase):
         self.create(eng, "SNIPED", "DEVX")
         eng._follow_pass()
         self.assertEqual(eng.state["agents"]["Spark"]["positions"], {})
+
+
+class WalletWatchCopy(unittest.TestCase):
+    W = "7fTREYp5bxYYemWMvdnSrdG2FeqppNUi8QUpSZsNe514"
+    MINT = "GradCoin1111111111111111111111111111111111"
+
+    def tx(self, sol_before, sol_after, tok_before, tok_after, mint=None, wsol=None):
+        mint = mint or self.MINT
+        pre = [dict(accountIndex=3, mint=mint, owner=self.W, uiTokenAmount=dict(amount=str(tok_before), decimals=6))]
+        post = [dict(accountIndex=3, mint=mint, owner=self.W, uiTokenAmount=dict(amount=str(tok_after), decimals=6))]
+        if wsol:
+            pre.append(dict(accountIndex=4, mint=m.WSOL, owner=self.W, uiTokenAmount=dict(amount=str(wsol[0]), decimals=9)))
+            post.append(dict(accountIndex=4, mint=m.WSOL, owner=self.W, uiTokenAmount=dict(amount=str(wsol[1]), decimals=9)))
+        return dict(meta=dict(err=None, preBalances=[int(sol_before * 1e9), 0], postBalances=[int(sol_after * 1e9), 0],
+                              preTokenBalances=pre, postTokenBalances=post),
+                    transaction=dict(message=dict(accountKeys=[dict(pubkey=self.W, signer=True), dict(pubkey="Prog")])))
+
+    def test_parse_buy_and_sell_on_any_exchange(self):
+        buy = m.WalletWatch.parse(self.tx(2.0, 1.5, 0, 1_000_000_000), {self.W}, "S1")
+        self.assertEqual(len(buy), 1)
+        self.assertEqual((buy[0]["kind"], buy[0]["mint"]), ("buy", self.MINT))
+        self.assertAlmostEqual(buy[0]["sol"], 0.5)
+        self.assertAlmostEqual(buy[0]["px_sol"], 0.5 / 1000)
+        sell = m.WalletWatch.parse(self.tx(1.5, 1.7, 1_000_000_000, 250_000_000), {self.W}, "S2")
+        self.assertEqual((sell[0]["kind"], round(sell[0]["frac"], 2)), ("sell", 0.75))
+        # paid with wrapped SOL instead of native SOL
+        wrapped = m.WalletWatch.parse(self.tx(2.0, 1.999, 0, 500_000_000, wsol=(1_000_000_000, 600_000_000)), {self.W})
+        self.assertAlmostEqual(wrapped[0]["sol"], 0.401, places=3)
+        self.assertEqual(m.WalletWatch.parse(self.tx(2.0, 1.5, 0, 10), {"SomeoneElse"}), [])
+
+    def engine(self, live=None):
+        c = dict(m.CFG, live_usd=23.0, demo_watch={self.W: dict(mode="copy", label="trader1")})
+        src, pump = m.DemoSource(), m.DemoPump(c, clock=time.time)
+        eng = m.Engine(c, m.trading_agents(m.AGENTS, False, ["Hawk"] if live else [], True, True), src, demo=True,
+                       pump=pump, live=live, live_names=["Hawk"] if live else (), live_only=bool(live))
+        pump.clock = lambda: eng.t
+        eng.wallet = dict(pub="x", usdc=23.0, sol=0.05)
+        eng._load_watch()
+        return eng
+
+    def push(self, eng, ev):
+        with eng.pump.lock:
+            eng.pump.follow_events.append(dict(ev, t=eng.t))
+
+    def test_graduated_coin_is_copied_through_jupiter_paper(self):
+        eng = self.engine()
+        self.push(eng, dict(kind="buy", mint=self.MINT, wallet=self.W, sol=0.5, px_sol=0.0005, sig="S1", src="wallet"))
+        eng._follow_pass()
+        pos = eng.state["agents"]["Hawk"]["positions"][m.tkey("solana", self.MINT)]
+        self.assertEqual((pos["venue"], pos["follow"]), ("dex", self.W))
+        self.assertIn(m.tkey("solana", self.MINT), eng.universe)            # DEX prices it from now on
+        self.assertIn("bought", eng.follow_log[-1]["note"])
+        self.push(eng, dict(kind="sell", mint=self.MINT, wallet=self.W, sol=0.6, frac=1.0, sig="S2", src="wallet"))
+        eng._follow_pass()
+        self.assertNotIn(m.tkey("solana", self.MINT), eng.state["agents"]["Hawk"]["positions"])
+
+    def test_live_copy_retries_until_jupiter_has_a_route(self):
+        live = FakeLive()
+        tries = []
+
+        def buy(mint, usd, ref, **kw):
+            tries.append(1)
+            if len(tries) < 3:
+                return dict(ok=False, stage="quote", err="no route")
+            return dict(ok=True, spent_usd=usd, raw=int(usd / ref * 1e6), decimals=6, sig="SIG")
+        live.buy = buy
+        eng = self.engine(live=live)
+        self.push(eng, dict(kind="buy", mint=self.MINT, wallet=self.W, sol=0.5, px_sol=0.0005, sig="S1", src="wallet"))
+        eng._follow_pass()
+        self.assertIn("retrying", eng.follow_log[-1]["note"])
+        for _ in range(3):
+            eng.t += 7
+            eng._follow_pass()
+        self.assertEqual(len(tries), 3)
+        pos = eng.state["agents"]["Hawk LIVE"]["positions"][m.tkey("solana", self.MINT)]
+        self.assertTrue(pos["live"])
+        self.assertIn("retries", eng.follow_log[-1]["note"])
+        self.assertEqual(eng.live_fails, 0)
+
+    def test_same_trade_from_both_sources_is_copied_once_and_partial_sells_each_count(self):
+        eng = self.engine()
+        eng.pump.handle(dict(txType="create", mint="CURVE1", traderPublicKey="D", symbol="CV", name="cv", initialBuy=0,
+                             vSolInBondingCurve=30.0, vTokensInBondingCurve=m.PUMP_V_TOK0, pool="pump"))
+        eng.pump.handle(dict(txType="buy", mint="CURVE1", traderPublicKey=self.W, solAmount=0.5, newTokenBalance=10e6,
+                             vSolInBondingCurve=31.0, vTokensInBondingCurve=1.04e9, pool="pump", signature="TX1"))
+        self.push(eng, dict(kind="buy", mint="CURVE1", wallet=self.W, sol=0.5, px_sol=3e-8, sig="TX1", src="wallet"))
+        eng._follow_pass()
+        self.assertEqual(sum(1 for e in eng.follow_log if "bought (" in e["note"]), 1)
+        k = m.tkey("solana", "CURVE1")
+        st = eng.state["agents"]["Hawk"]
+        units = st["positions"][k]["units"]
+        for i, (bal, sig) in enumerate(((7.5e6, "TX2"), (5e6, "TX3"))):          # two quick partial sells
+            eng.pump.handle(dict(txType="sell", mint="CURVE1", traderPublicKey=self.W, solAmount=0.1,
+                                 tokenAmount=2.5e6, newTokenBalance=bal, vSolInBondingCurve=31.0,
+                                 vTokensInBondingCurve=1.04e9, pool="pump", signature=sig))
+        eng._follow_pass()
+        self.assertAlmostEqual(st["positions"][k]["units"], units * 0.75 * (1 - 2.5 / 7.5), places=3)
+
+    def test_wallet_watch_starts_only_for_real_runs_with_copy_wallets(self):
+        eng = self.engine()
+        self.assertIsNone(eng.wallet_watch)                                  # the demo never opens connections
 
 
 if __name__ == "__main__":

@@ -1082,11 +1082,13 @@ class PumpWatcher:
         new_bal = num(m, "newTokenBalance", default=prev + (amt if is_buy else -amt))
         if copier:
             if is_buy and sol >= self.cfg["follow_min_sol"]:
-                self.follow_events.append(dict(kind="buy", mint=t["mint"], wallet=trader, t=now, sol=sol))
+                self.follow_events.append(dict(kind="buy", mint=t["mint"], wallet=trader, t=now, sol=sol,
+                                               sig=m.get("signature")))
             elif not is_buy:
                 sold = amt if amt > 0 else max(0.0, prev - new_bal)
                 frac = 1.0 if prev <= 0 or new_bal <= 0 else min(1.0, sold / prev)
-                self.follow_events.append(dict(kind="sell", mint=t["mint"], wallet=trader, t=now, sol=sol, frac=frac))
+                self.follow_events.append(dict(kind="sell", mint=t["mint"], wallet=trader, t=now, sol=sol, frac=frac,
+                                               sig=m.get("signature")))
         if not is_buy and prev >= 0.01 * PUMP_SUPPLY:  # a 1%+ holder selling
             t["whale_sells"].append((now, amt if amt > 0 else max(0.0, prev - new_bal)))
         elif is_buy and prev >= 0.01 * PUMP_SUPPLY:  # ...or an existing one buying back: nets it out
@@ -1458,6 +1460,145 @@ class RpcPumpFeed:
             user, mint = r.key(), r.key()
             return dict(kind="complete", mint=mint, user=user)
         return None
+
+
+class WalletWatch:
+    """Follows the copy-trade wallets themselves, on any exchange. One Solana RPC websocket holds a
+    logsSubscribe per wallet; each transaction a wallet signs is fetched (getTransaction) and its token
+    balance changes tell what it bought or sold, for how much SOL, wherever the trade happened
+    (pump.fun, PumpSwap, Raydium, Meteora, Jupiter...). Events go to the same queue as the pump.fun
+    feed's, as dict(kind="buy"|"sell", mint, wallet, sol, frac, px_sol, sig)."""
+    QUOTES = (WSOL, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")   # what a wallet pays with
+
+    def __init__(self, watcher, rpc=None):
+        self.w = watcher
+        self.rpc = rpc or os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+        self.wallets = set()
+        self.changed = threading.Event()
+        self.jobs = queue.Queue(maxsize=500)
+        self.seen = set()
+        self.connected, self.error, self.txs = False, "", 0
+
+    def set_wallets(self, wallets):
+        wallets = set(wallets)
+        if wallets != self.wallets:
+            self.wallets = wallets
+            self.changed.set()
+
+    def start(self):
+        threading.Thread(target=self._run, name="wallet-watch", daemon=True).start()
+        for i in range(2):
+            threading.Thread(target=self._fetch_loop, name=f"wallet-tx{i}", daemon=True).start()
+
+    def _run(self):
+        delay = 2
+        while True:
+            if not self.wallets:
+                self.connected = False
+                self.changed.wait(5)
+                self.changed.clear()
+                continue
+            ws = WebSocket(RpcPumpFeed.ws_url(), timeout=20)
+            try:
+                ws.connect()
+                self.changed.clear()
+                for i, wallet in enumerate(sorted(self.wallets)):
+                    ws.send(json.dumps({"jsonrpc": "2.0", "id": 100 + i, "method": "logsSubscribe",
+                                        "params": [{"mentions": [wallet]}, {"commitment": "confirmed"}]}))
+                self.connected, self.error, delay, quiet = True, "", 2, 0
+                self.w.events.append(("PUMP", f"watching {len(self.wallets)} copy-trade wallet"
+                                              f"{'s' if len(self.wallets) > 1 else ''} on-chain"))
+                while not self.changed.is_set():
+                    try:
+                        raw = ws.recv()
+                    except socket.timeout:
+                        quiet += 1
+                        if quiet >= 6:   # wallets can be quiet for a while; ping, and reconnect now and then
+                            raise ConnectionError("no data for 2 minutes")
+                        ws.ping()
+                        continue
+                    quiet = 0
+                    try:
+                        msg = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if msg.get("error"):
+                        raise ConnectionError(f"RPC refused the wallet subscription: {str(msg['error'])[:100]}")
+                    v = ((msg.get("params") or {}).get("result") or {}).get("value") or {}
+                    sig = v.get("signature")
+                    if sig and v.get("err") is None and sig not in self.seen:
+                        self.seen.add(sig)
+                        if len(self.seen) > 20000:
+                            self.seen.clear()
+                        try:
+                            self.jobs.put_nowait((sig, time.time()))
+                        except queue.Full:
+                            pass
+            except Exception as e:
+                self.connected, self.error = False, str(e)[:120]
+                if "no data" not in self.error:
+                    self.w.events.append(("WARN", f"copy-trade wallet watch: {self.error}; retrying in {delay}s"))
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+            finally:
+                ws.close()
+
+    def _fetch_loop(self):
+        while True:
+            sig, t = self.jobs.get()
+            for attempt in range(4):   # a fresh transaction can take a moment to be served
+                try:
+                    d = json.loads(post_json(self.rpc, {"jsonrpc": "2.0", "id": 1, "method": "getTransaction", "params": [
+                        sig, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}]},
+                        timeout=10))
+                    tx = d.get("result")
+                    if tx:
+                        for ev in self.parse(tx, self.wallets, sig):
+                            ev["t"] = self.w.clock()
+                            with self.w.lock:
+                                self.w.follow_events.append(ev)
+                            self.w.wake.set()
+                        self.txs += 1
+                        break
+                except Exception as e:
+                    self.error = f"getTransaction: {str(e)[:90]}"
+                time.sleep(0.6 * (attempt + 1))
+
+    @classmethod
+    def parse(cls, tx, wallets, sig=""):
+        """Buys and sells by the watched wallets in one transaction, from its balance changes."""
+        meta = tx.get("meta") or {}
+        if meta.get("err") is not None:
+            return []
+        keys = [k["pubkey"] if isinstance(k, dict) else k
+                for k in ((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or []]
+        out = []
+        for wallet in wallets:
+            if wallet not in keys:
+                continue
+            i = keys.index(wallet)
+            sol = ((meta.get("postBalances") or [0] * (i + 1))[i] - (meta.get("preBalances") or [0] * (i + 1))[i]) / 1e9
+            bal = {}   # mint -> [before, after, decimals]
+            for side, rows in ((0, meta.get("preTokenBalances") or []), (1, meta.get("postTokenBalances") or [])):
+                for r in rows:
+                    if r.get("owner") != wallet:
+                        continue
+                    ui = r.get("uiTokenAmount") or {}
+                    e = bal.setdefault(r["mint"], [0, 0, int(ui.get("decimals") or 0)])
+                    e[side] += int(ui.get("amount") or 0)
+            sol += (bal.get(WSOL, [0, 0, 9])[1] - bal.get(WSOL, [0, 0, 9])[0]) / 1e9   # wrapped SOL counts as SOL
+            for mint, (before, after, dec) in bal.items():
+                if mint in cls.QUOTES or after == before:
+                    continue
+                tokens = (after - before) / 10 ** dec
+                if tokens > 0 and sol < 0:
+                    out.append(dict(kind="buy", mint=mint, wallet=wallet, sol=-sol, frac=0.0,
+                                    px_sol=-sol / tokens, sig=sig, src="wallet"))
+                elif tokens < 0:
+                    out.append(dict(kind="sell", mint=mint, wallet=wallet, sol=max(sol, 0.0),
+                                    frac=1.0 if after <= 0 or before <= 0 else min(1.0, (before - after) / before),
+                                    px_sol=(max(sol, 0.0) / -tokens) if sol > 0 else None, sig=sig, src="wallet"))
+        return out
 
 
 class _Reader:
@@ -2924,6 +3065,8 @@ class Engine:
         self.follow_log = deque(maxlen=60)      # what Hawk saw its wallets do, and what it did
         self.follow_stats = {}                  # wallet -> dict(seen=, copied=, skipped=, last=)
         self.follow_buys = {}                   # agent -> buy times, for the hourly cap
+        self.follow_seen, self.follow_pending = {}, []
+        self.wallet_watch = None                # on-chain watch of the copy wallets (real runs)
         self.report_t = 0.0
         self.blocks = {}          # agent -> (tokens checked, {reason it didn't buy: count})
         self.phase, self.phase_t, self.next_at = "starting up", time.time(), None
@@ -3804,6 +3947,14 @@ class Engine:
         self.watch, self.watch_bad = watch, bad
         with self.pump.lock:
             self.pump.watched = {a: w["mode"] for a, w in watch.items()}
+        copy = [a for a, w in watch.items() if w["mode"] in ("copy", "both")]
+        if not self.demo and copy and any(a.get("need") == "follow" for a in self.acfg.values()):
+            if self.wallet_watch is None:
+                self.wallet_watch = WalletWatch(self.pump)
+                self.wallet_watch.start()
+            self.wallet_watch.set_wallets(copy)
+        elif self.wallet_watch is not None:
+            self.wallet_watch.set_wallets([])
 
     def _follow_reason(self, q, ev):
         """Red flags that stop a watchlist buy (unless follow_checks is off)."""
@@ -3836,18 +3987,38 @@ class Engine:
 
     def _follow_pass(self):
         """Act on what the watchlist wallets just did: a snipe target launched, a copied wallet bought
-        or sold. Runs on the fast loop, so it reacts within a moment of the trade landing."""
+        or sold. Runs on the fast loop, so it reacts within a moment of the trade landing. Both the
+        pump.fun feed and the wallet watch can report the same trade; it is acted on once."""
         names = [n for n, a in self.acfg.items() if a.get("need") == "follow"]
         self._load_watch()
         events = self.pump.pop_follow()
-        if not names or not events:
+        due = [p for p in self.follow_pending if p["retry_at"] <= self.t]
+        self.follow_pending = [p for p in self.follow_pending if p["retry_at"] > self.t]
+        if not names or not (events or due):
             return
         c = self.cfg
-        for ev in events:
+        fresh = []
+        for ev in events:   # the same trade reported by both sources is acted on once
+            key = (ev["kind"], ev["wallet"], ev["mint"])
+            last = self.follow_seen.get(key)
+            if last:   # same transaction = same trade; without signatures, a short time window decides
+                lt, lsig = last
+                if ev.get("sig") and lsig:
+                    if ev["sig"] == lsig:
+                        continue
+                elif self.t - lt < (3 if ev["kind"] == "sell" else 20):
+                    continue
+            self.follow_seen[key] = (self.t, ev.get("sig"))
+            fresh.append(ev)
+        if len(self.follow_seen) > 5000:
+            self.follow_seen = {k: v for k, v in self.follow_seen.items() if self.t - v[0] < 120}
+        for ev in [p["ev"] for p in due] + fresh:
             q = self.pump.get(ev["mint"])
             sym = q["symbol"] if q and q["symbol"] != "?" else short(ev["mint"])
             who = (self.watch.get(ev["wallet"]) or dict(label=short(ev["wallet"])))["label"]
             if ev["kind"] == "sell":
+                self.follow_pending = [p for p in self.follow_pending
+                                       if not (p["ev"]["mint"] == ev["mint"] and p["ev"]["wallet"] == ev["wallet"])]
                 done = False
                 for name in names:
                     st = self.state["agents"][name]
@@ -3858,34 +4029,82 @@ class Engine:
                         if frac >= 0.05:
                             self._sell(name, k, f"copied {who} selling", frac=frac)
                             done = True
-                if done:
-                    self._follow_note(ev, sym, f"sold {ev['frac'] * 100:.0f}% of ${sym}: we sold too", True)
+                self._follow_note(ev, sym, f"sold {ev['frac'] * 100:.0f}% of ${sym}" + (": we sold too" if done else
+                                  " (we did not hold it)"), done)
                 continue
-            if not q or q["price"] <= 0:
-                continue
+            curve = bool(q and q["price"] > 0 and not q["migrated"] and not q["complete"])
             verb = "launched" if ev["kind"] == "snipe" else f"bought {ev['sol']:.2f} SOL of"
-            red = self._follow_reason(q, ev)
-            bought, whys = [], [red] if red else []
+            if not curve and not ev.get("px_sol"):
+                self._follow_note(ev, sym, f"{verb} ${sym}: skipped, no price yet", False)
+                continue
+            red = self._follow_reason(q, ev) if curve else None
+            bought, whys, retry = [], [red] if red else [], False
             for name in ([] if red else names):   # each Hawk (paper and live) decides for itself
                 st, k = self.state["agents"][name], tkey("solana", ev["mint"])
+                if ev.get("retry") and k not in st["positions"]:
+                    st["cool"].pop(k, None)        # the cooldown came from our own failed attempt
                 recent = self.follow_buys.setdefault(name, deque(maxlen=200))
                 why = (self._live_reason(name) or self._slot_reason(
                     name, k, c["live_min_trade_usd"] if self.acfg[name].get("live") else c["min_trade_usd"]))
                 if not why and sum(1 for t in recent if self.t - t < 3600) >= c["follow_max_per_hour"]:
                     why = f"hourly cap ({c['follow_max_per_hour']} buys)"
-                if not why and not self._buy_curve(name, q, size=c["follow_usd"]):
-                    why = "order not placed"
+                if not why:
+                    ok = (self._buy_curve(name, q, size=c["follow_usd"]) if curve
+                          else self._buy_follow_dex(name, ev, sym, c["follow_usd"]))
+                    if not ok:
+                        why, retry = "no route or order failed", True
                 if why:
                     whys.append(f"{name}: {why}" if len(names) > 1 else why)
                     continue
                 recent.append(self.t)
                 st["positions"][k]["follow"] = ev["wallet"]
                 bought.append(name)
-                self.emit("EXEC", f"{name}: {who} {verb} ${sym}, copied")
+                self.emit("EXEC", f"{name}: {who} {verb} ${sym}, copied" + ("" if curve else " (off the curve, via Jupiter)"))
+            first = ev.get("first_t", self.t)
             if bought:
-                self._follow_note(ev, sym, f"{verb} ${sym}: bought ({', '.join(bought)})", True)
+                self._follow_note(ev, sym, f"{verb} ${sym}: bought ({', '.join(bought)})"
+                                  + (f" after {self.t - first:.0f}s of retries" if ev.get("retry") else ""), True)
+            elif retry and self.t - first < 90:
+                self.follow_pending.append(dict(ev=dict(ev, retry=True, first_t=first), retry_at=self.t + 6))
+                if not ev.get("retry"):
+                    self._follow_note(ev, sym, f"{verb} ${sym}: no route yet, retrying for up to 90s", False)
             else:
                 self._follow_note(ev, sym, f"{verb} ${sym}: skipped, {'; '.join(whys) or 'no Hawk could buy'}", False)
+
+    def _buy_follow_dex(self, name, ev, sym, size):
+        """Copy a buy of a coin that is not on the pump.fun curve (graduated, or another venue), through
+        Jupiter, priced from the copied wallet's own fill. The position is then priced from DEXes."""
+        a, st, c = self.acfg[name], self.state["agents"][name], self.cfg
+        live = a.get("live")
+        min_t = c["live_min_trade_usd"] if live else c["min_trade_usd"]
+        size = min(st["cash"], max(min_t, size))
+        if live:
+            size = min(size, c["live_max_trade_usd"])
+        if size < min_t:
+            return False
+        px = ev["px_sol"] * self.sol_usd
+        k = tkey("solana", ev["mint"])
+        if live:
+            st["cool"][k] = self.t
+            res = self.live.buy(ev["mint"], size, px, slippage_bps=c["live_curve_slippage_bps"],
+                                max_dev_pct=c["live_curve_max_dev_pct"], priority=c["live_curve_priority"])
+            if not res["ok"]:
+                if res.get("stage") == "tx":
+                    self._live_fail(f"{name} buy ${sym} failed: {res['err']}")
+                return False
+            self.live_fails = 0
+            spent, units = res["spent_usd"], res["raw"] / 10 ** res["decimals"]
+            extra = dict(live=True, raw=res["raw"], decimals=res["decimals"], sig=res["sig"], route="jup")
+        else:
+            spent = size
+            units = size / (px * (1 + (c["dex_fee_pct"] + c["extra_slip_pct"]) / 100.0))
+            extra = {}
+        st["cash"] -= spent
+        st["positions"][k] = dict(chain="solana", addr=ev["mint"], symbol=sym, units=units, size=spent, size0=spent,
+                                  ref_price=spent / units, peak=spent / units, opened=self.t, entry_liq=None,
+                                  sell_tax=0.0, last_price=px, last_liq=1e6, miss=0, venue="dex", src="follow", **extra)
+        self._track("solana", ev["mint"], tag=("follow", {"t": self.t}))
+        return True
 
     def _vbook_room(self, a, mint):
         """Could Spark have bought this launch right now? Same limits as a real position."""

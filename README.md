@@ -97,7 +97,12 @@ Saved changes apply within 10 seconds. How Hawk trades the list:
 - Its own exits still apply as a safety net: −30% stop, a profit lock once up 50%, a trailing stop, and a 2-hour limit.
 - Hawk paper-trades whenever the watchlist has wallets. For real money: `--live --live-agents Spark,Hawk` (`--live-usd` is per agent). Add `--direct`, since brand-new launches usually have no Jupiter route yet.
 - The dashboard's Watchlist panel shows each wallet with what Hawk copied and skipped, and why.
-- Copying covers pump.fun bonding-curve trades, which is what the on-chain feed sees. Trades after a coin graduates aren't copied, but Hawk still sells on its own exits.
+- **Copying works on any exchange.** On real runs Hawk watches each copy wallet on-chain through your Solana RPC (one websocket subscription per wallet). It reads every transaction the wallet signs to see what it bought or sold and at what price: pump.fun, PumpSwap, Raydium, Meteora, Jupiter and so on.
+  - pump.fun curve coins go through the usual curve path.
+  - Any other coin is bought through Jupiter, checked against the copied wallet's own fill price, then priced from DEXes.
+  - A buy with no Jupiter route yet is retried every 6 seconds for up to 90 seconds.
+  - The same trade seen by both sources is copied once.
+  - Every buy and sell the wallet makes appears in the Watchlist feed with what Hawk did about it.
 
 ## Spark learns as it goes
 
