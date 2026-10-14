@@ -1492,7 +1492,8 @@ class DemoPump(PumpWatcher):
         rug = r.random() < 0.35
         bundled = rug and r.random() < 0.6
         mint = f"Demo{self.n:05d}pump"
-        dev = r.choice(self.ruggers) if rug and r.random() < 0.5 else r.choice(self.wallets)
+        # serial ruggers come back; everyone else launches from a wallet of their own
+        dev = r.choice(self.ruggers) if rug and r.random() < 0.5 else f"Dev{self.n:07d}"
         s = dict(vsol=PUMP_V_SOL0, vtok=PUMP_V_TOK0, dev=dev, bal={}, born=self.clock(), rug=rug,
                  hype=r.expovariate(1.0) * (1.6 if rug else 1.0), mom=r.gauss(-0.4, 0.6),
                  cap=101.0 if (not rug and r.random() < 0.05) else r.betavariate(1.3, 3.5) * 100,
@@ -1634,7 +1635,7 @@ class DemoFomo:
         self.src, self.rng = src, random.Random(seed)
 
     def fetch(self):
-        toks = [t for t in self.src.tokens.values() if len(t["hist"]) > 5]
+        toks = [t for t in self.src.tokens.values() if len(t["hist"]) > 5 and t["hist"][0] > 0]
         toks.sort(key=lambda t: -(t["hist"][-1] / t["hist"][0] + self.rng.uniform(0, 0.4)))
         return [dict(chain=t["chain"], addr=t["addr"], rank=i + 1, symbol=t["symbol"], holders=None)
                 for i, t in enumerate(toks[:15])]
@@ -1759,12 +1760,15 @@ class DemoSource:
 
     def tick(self, t):
         self.t = t
-        for tok in self.tokens.values():
+        for k, tok in list(self.tokens.items()):
             self._step(tok)
+            # dead or ancient tokens leave the market, as they stop showing up on DexScreener
+            if tok["price"] < 1e-12 or self.t - tok["created"] > 86400:
+                del self.tokens[k]
 
     def _step(self, tok):
         r = self.rng
-        tok["price"] *= math.exp(tok["drift"] + tok["vol"] * r.gauss(0, 1))
+        tok["price"] = max(1e-15, tok["price"] * math.exp(tok["drift"] + tok["vol"] * r.gauss(0, 1)))
         if tok["rug"] and r.random() < 0.03:
             tok["price"] *= 0.08
             tok["liq"] *= 0.1
@@ -1772,7 +1776,9 @@ class DemoSource:
         tok["hist"] = tok["hist"][-61:]
 
     def discover(self, chains):
+        """The tokens listed this round (like DexScreener's latest profiles), not every one ever seen."""
         r = self.rng
+        new = []
         for _ in range(r.choice([0, 1, 1, 2, 3])):
             self.n += 1
             chain = r.choice(chains)
@@ -1783,7 +1789,8 @@ class DemoSource:
             for _ in range(60):
                 self._step(tok)
             self.tokens[(chain, tok["addr"])] = tok
-        return list(self.tokens)
+            new.append((chain, tok["addr"]))
+        return new
 
     def adopt(self, chain, addr, symbol, price, liq):
         """A pump.fun graduate appears as a fresh DEX pool."""
@@ -1802,6 +1809,8 @@ class DemoSource:
             if not tok:
                 continue
             h = tok["hist"]
+            if len(h) < 5 or min(h[0], h[-5]) <= 0:
+                continue
             chg_h1 = (h[-1] / h[0] - 1) * 100
             chg_m5 = (h[-1] / h[-5] - 1) * 100
             up = chg_h1 > 0
