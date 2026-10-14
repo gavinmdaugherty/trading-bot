@@ -1,0 +1,154 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Spark speed teaser</title>
+<style>
+@font-face{font-family:"JBM";src:url(fonts/jetbrains-mono-latin-500-normal.woff2) format("woff2");font-weight:500}
+@font-face{font-family:"JBM";src:url(fonts/jetbrains-mono-latin-700-normal.woff2) format("woff2");font-weight:700}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:1080px;height:1080px;overflow:hidden;background:#05050a}
+body{font-family:"Inter Display","Inter",sans-serif;color:#f2f3ff;-webkit-font-smoothing:antialiased}
+#stage{position:relative;width:1080px;height:1080px;overflow:hidden}
+.grid{position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,.045) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.045) 1px,transparent 1px);
+  background-size:54px 54px;-webkit-mask-image:radial-gradient(ellipse at 50% 45%,#000 25%,transparent 72%)}
+.blob{position:absolute;border-radius:50%;filter:blur(110px)}
+.scene{position:absolute;inset:0;opacity:0}
+.kicker{font:700 20px "JBM";letter-spacing:.32em;text-transform:uppercase;color:#ffcf5c}
+.h{font-weight:800;letter-spacing:-.045em;line-height:1}
+.g{background:linear-gradient(90deg,#ffcf5c,#3dffb5 50%,#6ea8ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+.p{font-size:30px;color:#8d91b3;font-weight:500;line-height:1.35}
+/* pipeline */
+.node{position:absolute;width:150px;height:150px;margin:-75px 0 0 -75px;border-radius:40px;display:grid;place-items:center;text-align:center;
+  background:rgba(22,22,38,.85);border:2px solid rgba(255,255,255,.12);font:700 19px "JBM";letter-spacing:.06em;color:#8d91b3}
+.node.on{color:#06060b;border-color:transparent}
+#line{position:absolute;height:6px;border-radius:6px;background:rgba(255,255,255,.08);top:-3px}
+#fill{position:absolute;left:0;top:0;height:100%;border-radius:6px;background:linear-gradient(90deg,#ffcf5c,#3dffb5);box-shadow:0 0 22px rgba(61,255,181,.6)}
+#pulse{position:absolute;width:30px;height:30px;margin:-15px 0 0 -15px;border-radius:50%;background:#fff;
+  box-shadow:0 0 30px 10px #3dffb5,0 0 80px 30px rgba(61,255,181,.35)}
+.trail{position:absolute;height:10px;margin-top:-5px;border-radius:10px;background:linear-gradient(90deg,transparent,#3dffb5)}
+.chip{display:inline-flex;align-items:center;gap:14px;font-size:38px;font-weight:700;padding:22px 34px;border-radius:999px;
+  border:2px solid rgba(61,255,181,.45);background:rgba(61,255,181,.08);box-shadow:0 0 34px rgba(61,255,181,.18);white-space:nowrap}
+.chip b{font:700 30px "JBM";color:#3dffb5}
+#ring{position:absolute;left:540px;top:690px;transform:translate(-50%,-50%)}
+</style></head><body>
+<div id="stage">
+  <div class="grid"></div>
+  <div class="blob" id="b1" style="width:700px;height:700px;background:#ffcf5c"></div>
+  <div class="blob" id="b2" style="width:700px;height:700px;background:#7c3aed"></div>
+  <div class="blob" id="b3" style="width:600px;height:600px;background:#3dffb5"></div>
+
+  <!-- 1: seconds matter -->
+  <div class="scene" id="s1">
+    <div style="position:absolute;left:0;right:0;top:250px;text-align:center">
+      <div class="kicker">Spark · next upgrade</div>
+      <div class="h" style="font-size:108px;margin-top:34px">In the trenches,<br><span class="g">seconds matter.</span></div>
+    </div>
+    <svg id="ring" width="260" height="260" viewBox="0 0 260 260">
+      <defs><linearGradient id="rg" x1="0" x2="1"><stop offset="0" stop-color="#ffcf5c"/><stop offset="1" stop-color="#3dffb5"/></linearGradient></defs>
+      <circle cx="130" cy="130" r="104" fill="none" stroke="rgba(255,255,255,.08)" stroke-width="14"/>
+      <circle id="arc" cx="130" cy="130" r="104" fill="none" stroke="url(#rg)" stroke-width="14" stroke-linecap="round"
+        stroke-dasharray="0 999" transform="rotate(-90 130 130)" style="filter:drop-shadow(0 0 12px rgba(61,255,181,.6))"/>
+      <line id="hand" x1="130" y1="130" x2="130" y2="44" stroke="#fff" stroke-width="6" stroke-linecap="round"/>
+      <circle cx="130" cy="130" r="10" fill="#fff"/>
+    </svg>
+  </div>
+
+  <!-- 2: signal to buy -->
+  <div class="scene" id="s2">
+    <div style="position:absolute;left:0;right:0;top:130px;text-align:center">
+      <div class="kicker" style="color:#3dffb5">From signal to buy</div>
+      <div class="h" style="font-size:84px;margin-top:26px">Tighter. <span class="g">Faster.</span></div>
+    </div>
+    <div id="pipe" style="position:absolute;left:0;top:600px;width:1080px;height:0">
+      <div id="line"><div id="fill"></div></div>
+      <div class="trail" id="trail"></div>
+      <div class="node" id="n0">SIGNAL</div><div class="node" id="n1">QUOTE</div>
+      <div class="node" id="n2">SIGN</div><div class="node" id="n3">LAND</div>
+      <div id="pulse"></div>
+    </div>
+    <div class="p" id="cap" style="position:absolute;left:0;right:0;top:800px;text-align:center"></div>
+  </div>
+
+  <!-- 3: what's coming -->
+  <div class="scene" id="s3">
+    <div style="position:absolute;left:0;right:0;top:170px;text-align:center">
+      <div class="kicker">What's coming</div>
+      <div class="h" style="font-size:90px;margin-top:28px">Built for <span class="g">speed.</span></div>
+    </div>
+    <div id="chips" style="position:absolute;left:0;right:0;top:470px;display:flex;flex-direction:column;align-items:center;gap:26px">
+      <div class="chip"><b>01</b>Faster fills</div>
+      <div class="chip"><b>02</b>Priority routing</div>
+      <div class="chip"><b>03</b>Less time from signal to buy</div>
+    </div>
+  </div>
+
+  <!-- 4: end card -->
+  <div class="scene" id="s4">
+    <svg id="star" style="position:absolute;left:390px;top:150px" width="300" height="300" viewBox="0 0 1000 1000">
+      <defs><linearGradient id="sg" x1="0.15" y1="0.1" x2="0.85" y2="0.95"><stop offset="0" stop-color="#3dffb5"/><stop offset=".5" stop-color="#6ea8ff"/><stop offset="1" stop-color="#a78bfa"/></linearGradient>
+        <filter id="gl" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="24" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+      <path d="M500 168 C 528 400, 600 472, 832 500 C 600 528, 528 600, 500 832 C 472 600, 400 528, 168 500 C 400 472, 472 400, 500 168 Z" fill="url(#sg)" filter="url(#gl)"/>
+      <circle cx="500" cy="500" r="24" fill="#fff"/></svg>
+    <div style="position:absolute;left:0;right:0;top:500px;text-align:center">
+      <div class="h" style="font-size:150px;background:linear-gradient(90deg,#fff 10%,#bff9e4 45%,#a78bfa 90%);-webkit-background-clip:text;background-clip:text;color:transparent">Spark</div>
+      <div style="font-size:48px;font-weight:700;margin-top:26px;letter-spacing:-.02em">Speed upgrade. <span class="g">Coming soon ⚡</span></div>
+    </div>
+    <div style="position:absolute;left:0;right:0;bottom:60px;text-align:center;font-size:20px;color:#6f7394">In development. Memecoins are extremely risky. Not financial advice.</div>
+  </div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+const clamp=(v,a=0,b=1)=>Math.max(a,Math.min(b,v));
+const ease=x=>1-Math.pow(1-clamp(x),3);
+const inout=x=>{x=clamp(x);return x<.5?4*x*x*x:1-Math.pow(-2*x+2,3)/2};
+const back=x=>{x=clamp(x);const c=1.7;return 1+(c+1)*Math.pow(x-1,3)+c*Math.pow(x-1,2)};
+const SC={s1:[0,3.6],s2:[3.6,9.4],s3:[9.4,12.6],s4:[12.6,16]};
+function vis(id,t){const [a,b]=SC[id];if(t<a||t>b)return 0;return Math.min(id==="s1"?1:clamp((t-a)/.4),id==="s4"?1:clamp((b-t)/.3))}
+const NODE_COL=["#ffcf5c","#9dff8a","#3dffb5","#6ea8ff"];
+
+function render(t){
+  $("#b1").style.transform=`translate(${-250+Math.sin(t*.4)*80}px,${-330+Math.cos(t*.3)*60}px)`;$("#b1").style.opacity=.12;
+  $("#b2").style.transform=`translate(${650+Math.cos(t*.35)*80}px,${-250+Math.sin(t*.4)*70}px)`;$("#b2").style.opacity=.26;
+  $("#b3").style.transform=`translate(${250+Math.sin(t*.3)*120}px,${700+Math.cos(t*.35)*60}px)`;$("#b3").style.opacity=.10;
+  for(const id in SC){const v=vis(id,t),el=$("#"+id);el.style.opacity=v;el.style.display=v>0?"block":"none";
+    if(id!=="s1")el.style.transform=`translateY(${(1-ease((t-SC[id][0])/.7))*24}px)`}
+
+  // 1: a stopwatch sweeps, faster and faster
+  {const k=ease(t/.8), sweep=Math.pow(clamp(t/3.4),1.6);
+   $("#s1 > div").style.transform=`scale(${.94+.06*k})`;
+   $("#arc").setAttribute("stroke-dasharray",(sweep*653)+" 999");
+   $("#hand").setAttribute("transform",`rotate(${sweep*360} 130 130)`);
+   $("#ring").style.opacity=ease((t-.4)/.5)}
+
+  // 2: the path from signal to buy, first at today's pace, then compressed and fast
+  {const u=t-SC.s2[0];
+   const squeeze=inout((u-2.6)/0.9);                 // nodes slide together
+   const gap=250-squeeze*72, x0=540-gap*1.5;
+   const xs=[0,1,2,3].map(i=>x0+i*gap);
+   const pass1=clamp((u-.5)/2.0), pass2=clamp((u-3.7)/.55); // slow pass, then a quick one
+   const fast=u>=3.6, p=fast?pass2:pass1;
+   const seg=p*3, px=xs[0]+(xs[3]-xs[0])*p;
+   $("#line").style.left=xs[0]+"px";$("#line").style.width=(xs[3]-xs[0])+"px";
+   $("#fill").style.width=(p*100)+"%";
+   $("#pulse").style.left=px+"px";$("#pulse").style.top="0px";
+   $("#pulse").style.opacity=(u>.4&&!(u>2.6&&u<3.65)&&p<.999)?1:0;
+   $("#trail").style.left=(px-(fast?260:60))+"px";$("#trail").style.width=(fast?260:60)+"px";
+   $("#trail").style.opacity=fast&&pass2<1&&pass2>0?1:0;
+   [0,1,2,3].forEach(i=>{const n=$("#n"+i),lit=(u>.4&&seg>=i-.05);
+     n.style.left=xs[i]+"px";n.style.top="0px";
+     n.className="node"+(lit?" on":"");
+     n.style.background=lit?NODE_COL[i]:"rgba(22,22,38,.85)";
+     n.style.boxShadow=lit?`0 0 ${fast?50:28}px ${NODE_COL[i]}`:"none";
+     n.style.transform=`scale(${(1-squeeze*.14)*(lit&&Math.abs(seg-i)<.25?1.08:1)})`});
+   $("#cap").textContent=u<2.6?"Every step between seeing a launch and owning it":(u<3.7?"Now squeeze it.":"Less time from signal to buy.");
+   $("#cap").style.color=u>=3.7?"#3dffb5":"#8d91b3"}
+
+  // 3: feature chips pop in
+  {const u=t-SC.s3[0];
+   [...$("#chips").children].forEach((c,i)=>{const k=clamp((u-.35-i*.3)/.45);c.style.opacity=k;c.style.transform=`scale(${k>0?back(k):.6})`})}
+
+  // 4: end card
+  {const u=t-SC.s4[0],k=ease(u/.8);
+   $("#star").style.opacity=k;$("#star").style.transform=`scale(${.7+.3*back(clamp(u/.7))}) rotate(${(1-k)*-40}deg)`;
+   $("#s4 > div").style.opacity=ease((u-.3)/.7)}
+}
+window.render=render;render(0);
+</script></body></html>
