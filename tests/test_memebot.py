@@ -1174,7 +1174,7 @@ class AutoStop(unittest.TestCase):
 class NewSignals(unittest.TestCase):
     def setUp(self):
         self.now = 1000.0
-        self.w = m.PumpWatcher(m.CFG, clock=lambda: self.now)
+        self.w = m.PumpWatcher(dict(m.CFG, traders_warm=0), clock=lambda: self.now)
 
     def create(self, mint, dev="DEV"):
         self.w.handle(dict(txType="create", mint=mint, traderPublicKey=dev, symbol=mint, name=mint,
@@ -1315,7 +1315,41 @@ class DirectRoute(unittest.TestCase):
         st = m.SolanaLive._stage
         self.assertEqual(st("rpc sendTransaction: Transaction simulation failed: custom program error: 0x1772"), "slip")
         self.assertEqual(st("rpc sendTransaction: Transaction simulation failed: AccountNotFound"), "sim")
-        self.assertEqual(st("transaction failed on-chain: {'InstructionError': [2, 'X']}"), "tx")
+        self.assertEqual(st("transaction failed on-chain: {'InstructionError': [2, 'X']}"), "reverted")
+        self.assertEqual(st("transaction failed on-chain: {'InstructionError': [2, {'Custom': 6002}]}"), "slip")
+        self.assertEqual(st("not confirmed within 60s (signature abc)"), "tx")
+
+    def test_uncertain_direct_sell_is_not_sold_again_through_jupiter(self):
+        self.assertTrue(self.eng._buy_curve("Spark LIVE", self.q))
+        self.live.direct_sell = lambda mint, raw, usd: self.live.calls.append(("direct_sell",)) or dict(
+            ok=False, stage="tx", err="not confirmed within 60s")
+        self.eng._sell("Spark LIVE", self.k, "stop-loss")
+        self.assertEqual([c[0] for c in self.live.calls], ["direct_buy", "direct_sell"])   # no Jupiter sell
+        pos = self.eng.state["agents"]["Spark LIVE"]["positions"][self.k]
+        self.assertGreater(pos["retry_at"], self.eng.t)
+
+    def test_reverted_direct_sell_falls_back_to_jupiter(self):
+        self.assertTrue(self.eng._buy_curve("Spark LIVE", self.q))
+        self.live.direct_sell = lambda mint, raw, usd: dict(ok=False, stage="slip", err="0x1773")
+        self.eng._sell("Spark LIVE", self.k, "stop-loss")
+        self.assertEqual(self.live.calls[-2][0], "sell")
+        self.assertNotIn(self.k, self.eng.state["agents"]["Spark LIVE"]["positions"])
+
+    def test_unreadable_proceeds_are_estimated_not_zero(self):
+        self.assertTrue(self.eng._buy_curve("Spark LIVE", self.q))
+        self.live.direct_sell = lambda mint, raw, usd: dict(ok=True, got_usd=None, got_sol=None, sig="S",
+                                                            sold_raw=raw, route="pump")
+        st = self.eng.state["agents"]["Spark LIVE"]
+        before = st["cash"]
+        self.eng._sell("Spark LIVE", self.k, "stop-loss")
+        self.assertGreater(st["cash"] - before, 3.0)                        # about the position's value, not 0
+
+    def test_no_usdc_for_the_backup_is_a_skip_not_a_fault(self):
+        self.live.direct = dict(ok=False, stage="build", err="HTTP 500")
+        self.eng.wallet["usdc"] = 0.0
+        self.assertFalse(self.eng._buy_curve("Spark LIVE", self.q))
+        self.assertEqual([c[0] for c in self.live.calls], ["direct_buy"])
+        self.assertEqual(self.eng.live_fails, 0)
 
 
 class DirectAccounting(unittest.TestCase):
@@ -1356,6 +1390,25 @@ class DirectAccounting(unittest.TestCase):
         self.assertTrue(res["ok"])
         self.assertEqual(ex.built[-1][:4], ("sell", "MINT", "100%", False))
         self.assertAlmostEqual(res["got_sol"], 0.09)
+
+    def test_sell_stops_after_an_uncertain_send_and_widens_after_a_safe_one(self):
+        ex = self.ex()
+        ex.direct_buy("MINT", 0.1, 150.0)
+        ex.built.clear()
+        ex._send = lambda signed: (_ for _ in ()).throw(RuntimeError(
+            "rpc sendTransaction: Transaction simulation failed: custom program error: 0x1773"))
+        res = ex.direct_sell("MINT", 3_000_000_000, 150.0)
+        self.assertEqual((res["stage"], len(ex.built)), ("slip", 3))            # tried all three tolerances
+        ex.built.clear()
+        ex._send = lambda signed: (_ for _ in ()).throw(RuntimeError("network error: reset after send"))
+        res = ex.direct_sell("MINT", 3_000_000_000, 150.0)
+        self.assertEqual((res["stage"], len(ex.built)), ("tx", 1))              # unknown outcome: stop at once
+
+    def test_wallet_read_failure_before_sending_is_a_build_failure(self):
+        ex = self.ex()
+        ex.lamports = lambda: (_ for _ in ()).throw(RuntimeError("HTTP 429"))
+        res = ex.direct_buy("MINT", 0.1, 150.0)
+        self.assertEqual(res["stage"], "build")
 
     def test_partial_sell_sends_token_amount(self):
         ex = self.ex()
@@ -1400,7 +1453,7 @@ def urllib_parse_qsl(s):
 class ScoutSquad(unittest.TestCase):
     def setUp(self):
         self.now = 1000.0
-        self.w = m.PumpWatcher(m.CFG, clock=lambda: self.now)
+        self.w = m.PumpWatcher(dict(m.CFG, traders_warm=0), clock=lambda: self.now)
         self.sc = m.Scouts()
 
     def launch(self, mint="S1"):
@@ -1438,6 +1491,30 @@ class ScoutSquad(unittest.TestCase):
         self.assertEqual(q["cluster_n"], 6)
         self.assertEqual(q["scout_veto"][0], "Atlas")
         self.assertEqual(q["top10_fresh"], 6)
+
+    def test_fresh_wallet_count_waits_until_enough_wallets_are_known(self):
+        self.w.cfg = dict(self.w.cfg, traders_warm=50)
+        self.launch()
+        for i in range(6):
+            self.buy(f"NEW{i}", 1.0, 30e6)
+        q = self.sc.review(self.w.get("S1"))
+        self.assertEqual((q["top10_fresh"], q["traders_warm"]), (0, False))
+        self.assertIn("warming up", q["scouts"]["Atlas"][1])
+
+    def test_busy_creator_wallet_is_not_called_fresh(self):
+        old = m.post_json
+        m.post_json = lambda url, body, timeout=15: json.dumps(
+            {"result": [{"blockTime": 9_000 + i} for i in range(100)]}).encode()
+        try:
+            age, n = m.PumpWatcher.dev_lookup("BUSY", "https://rpc", now=9_200)
+        finally:
+            m.post_json = old
+        self.assertEqual((age, n), (None, 100))
+        self.launch()
+        with self.w.lock:
+            self.w._set_dev("DEV", (age, n))
+        q = self.sc.review(self.w.get("S1"))
+        self.assertIn("busy wallet", q["scouts"]["Cinder"][1])
 
     def test_launch_rush_is_left_to_the_sniper_checks(self):
         self.launch()

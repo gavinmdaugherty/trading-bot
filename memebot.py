@@ -41,6 +41,7 @@ import argparse
 import base64
 import concurrent.futures
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -113,6 +114,7 @@ CFG = dict(
     sniper_window_s=20.0,        # buyers in the first 20s count as snipers
     meta_min_buys=12,            # fetch a launch's metadata (socials) once it has this many buys
     dev_lookups_per_hour=90,     # creator wallet-age lookups through your RPC (about 10 Helius credits each)
+    traders_warm=2000,           # wallets seen before "fresh wallet" counts mean anything (after a start)
     ipfs_fallback=["https://dweb.link/ipfs/", "https://gateway.pinata.cloud/ipfs/"],
     # ---- Fomo (fomo.family) trending board, through FOMO API ----
     fomo_api="https://api.fomoapi.io/v2/leaderboard/tokens/trending",
@@ -890,14 +892,18 @@ class PumpWatcher:
             time.sleep(gap)
 
     @staticmethod
-    def dev_lookup(wallet, rpc=None, now=None):
-        """(age of the wallet in hours, transactions seen) from its newest 100 signatures."""
+    def dev_lookup(wallet, rpc=None, now=None, limit=100):
+        """(age of the wallet in hours, transactions seen) from its newest signatures. A wallet with
+        `limit` or more has a longer history than one page shows: its age is unknown (None), and it is
+        certainly not fresh."""
         rpc = rpc or os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
         d = json.loads(post_json(rpc, {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
-                                       "params": [wallet, {"limit": 100, "commitment": "confirmed"}]}, timeout=10))
+                                       "params": [wallet, {"limit": limit, "commitment": "confirmed"}]}, timeout=10))
         if d.get("error"):
             raise RuntimeError(str(d["error"])[:100])
         sigs = d.get("result") or []
+        if len(sigs) >= limit:
+            return (None, len(sigs))
         times = [x["blockTime"] for x in sigs if x.get("blockTime")]
         if not times:
             return (0.0, len(sigs))
@@ -1017,8 +1023,9 @@ class PumpWatcher:
         if trader:  # how many different launches this wallet trades: real trenchers vs fresh sybils
             seen = self.traders.get(trader)
             if seen is None:
-                if len(self.traders) > 300000:
-                    self.traders.clear()
+                if len(self.traders) > 300000:   # forget the oldest third, keep the rest
+                    for k in list(itertools.islice(self.traders, 100000)):
+                        del self.traders[k]
                 self.traders[trader] = [t["mint"], 1]
             elif seen[0] != t["mint"]:
                 seen[0], seen[1] = t["mint"], seen[1] + 1
@@ -1117,8 +1124,10 @@ class PumpWatcher:
         ranked = sorted(((v, k) for k, v in hold.items() if k != t["creator"]), reverse=True)
         others = [v for v, _ in ranked]
         top10w = [k for _, k in ranked[:10]]
-        # top holders who never traded another launch: fresh wallets, often one person's sybils
-        fresh10 = sum(1 for k in top10w if self.traders.get(k, (None, 1))[1] <= 1)
+        # top holders who never traded another launch: fresh wallets, often one person's sybils. Right
+        # after a start every wallet looks fresh, so this waits until enough wallets have been seen.
+        warm = len(self.traders) >= self.cfg["traders_warm"]
+        fresh10 = sum(1 for k in top10w if self.traders.get(k, (None, 1))[1] <= 1) if warm else 0
         # top holders whose first buys landed within the same 1.5 seconds, after the launch rush (the
         # sniper and bundle checks cover that): a coordinated group, often one person's wallet farm
         rush = t["created"] + self.cfg["sniper_window_s"]
@@ -1168,11 +1177,12 @@ class PumpWatcher:
                  dup_social=t["dup_social"],
                  ath_drop=(price_sol / t["ath"] - 1) * 100 if t["ath"] else 0.0,
                  uniq_60s=len(uniq60), buyers_per_min=len(t["buyers"]) / max((now - t["created"]) / 60, 1.0),
-                 veteran_frac=vets / len(uniq) if uniq else 0.0, smart_now=smart_now,
+                 veteran_frac=vets / len(uniq) if uniq and len(self.traders) >= self.cfg["traders_warm"] else 0.0,
+                 smart_now=smart_now,
                  whale_sold_pct=whale_sold, dev_age_h=t["dev_age_h"], dev_txs=t["dev_txs"],
                  buys_30s=b30, buys_prev60=bprev, sells_60s=s60,
                  size_60s=(sol60 / b60) if b60 else 0.0, size_5m=(bsol / b) if b else 0.0,
-                 top10_fresh=fresh10, top10_n=len(top10w), cluster_n=cl_n if cl_n >= 2 else 0,
+                 top10_fresh=fresh10, top10_n=len(top10w), traders_warm=warm, cluster_n=cl_n if cl_n >= 2 else 0,
                  cluster_pct=cl_amt / PUMP_SUPPLY * 100 if cl_n >= 2 else 0.0)
         q["score"] = (q["net_sol_5m"] + 0.25 * q["uniq_5m"] - (25 if q["dev_sold"] else 0)
                       - 2 * max(0.0, top - 8) - 0.5 * max(0.0, -q["ath_drop"] - 20)
@@ -2053,13 +2063,31 @@ class SolanaLive:
 
     @staticmethod
     def _stage(err):
-        """slip: the price moved past the slippage limit (pump.fun errors 6002/6003), which is the
-        market, not a fault. sim: any other simulation (preflight) refusal; nothing happened on-chain.
-        tx: anything else, which may have reached the chain."""
+        """What a failed direct trade means:
+          slip      the price moved past the slippage limit (pump.fun 6002/6003), at preflight or
+                    on-chain; nothing changed hands. That is the market, not a fault.
+          sim       preflight (simulation) refused it; nothing was sent.
+          reverted  it landed but failed on-chain; nothing changed hands except the fee.
+          tx        unknown: it may or may not have landed. Never retry blindly after this."""
         e = err.lower()
-        if "0x1772" in e or "0x1773" in e or "toomuchsolrequired" in e or "toolittlesolreceived" in e:
+        if any(k in e for k in ("0x1772", "0x1773", "toomuchsolrequired", "toolittlesolreceived",
+                                "'custom': 6002", "'custom': 6003")):
             return "slip"
-        return "sim" if ("simulation failed" in e or "preflight" in e) else "tx"
+        if "simulation failed" in e or "preflight" in e:
+            return "sim"
+        if "failed on-chain" in e:
+            return "reverted"
+        return "tx"
+
+    def _retry(self, fn, tries=3, wait=1.0):
+        """A wallet read that must not fail after a trade has landed."""
+        for i in range(tries):
+            try:
+                return fn()
+            except Exception:
+                if i == tries - 1:
+                    raise
+                time.sleep(wait)
 
     def direct_buy(self, mint, sol, sol_usd):
         """Buy straight on pump.fun with SOL: one request to build, no quote round trip, and it works
@@ -2072,26 +2100,32 @@ class SolanaLive:
             f_sol = pool.submit(self.lamports)
             f_tok = pool.submit(self.token_accounts, mint)
             concurrent.futures.wait([f_tx, f_sol, f_tok])
-        try:
+        try:   # nothing has been sent yet, so any failure here is a clean "build" failure
             tx = f_tx.result()
+            lam0, (tok0, _, rent0) = f_sol.result(), f_tok.result()
         except Exception as e:
             return dict(ok=False, stage="build", err=str(e)[:160])
         t_built = time.time()
         try:
-            lam0, (tok0, _, rent0) = f_sol.result(), f_tok.result()
+            sig = self._send(self._VT(tx.message, [self.kp]))
+        except TimeoutError as e:
+            time.sleep(15)   # it may still land: look at the wallet before calling it lost
             try:
-                sig = self._send(self._VT(tx.message, [self.kp]))
-            except TimeoutError as e:
-                time.sleep(15)
-                if self.token_balance(mint)[0] <= tok0:
-                    raise
-                sig = str(e)[-90:]
-            tok1 = self._changed(lambda: self.token_balance(mint)[0], tok0)
-            lam1 = self._changed(self.lamports, lam0)
-            _, dec, rent1 = self.token_accounts(mint)
+                landed = self.token_balance(mint)[0] > tok0
+            except Exception:
+                landed = False
+            if not landed:
+                return dict(ok=False, stage="tx", err=str(e)[:200])
+            sig = str(e)[-90:]
         except Exception as e:
             err = str(e)[:200]
             return dict(ok=False, stage=self._stage(err), err=err)
+        try:   # it landed: measure what it cost and what it bought
+            tok1 = self._retry(lambda: self._changed(lambda: self.token_balance(mint)[0], tok0))
+            lam1 = self._retry(lambda: self._changed(self.lamports, lam0))
+            _, dec, rent1 = self._retry(lambda: self.token_accounts(mint))
+        except Exception as e:
+            return dict(ok=False, stage="tx", err=f"bought (tx {str(sig)[:12]}) but could not read the wallet: {str(e)[:100]}")
         t_done = time.time()
         if tok1 - tok0 <= 0:
             return dict(ok=False, stage="tx", err="confirmed but no tokens received")
@@ -2102,38 +2136,51 @@ class SolanaLive:
                     timing=dict(quote=t_built - t0, landed=t_done - t_built, total=t_done - t0))
 
     def direct_sell(self, mint, raw_expected, sol_usd):
+        """Sell on pump.fun (or its PumpSwap pool after graduation) for SOL. A wider slippage is tried
+        only after a failure that provably moved nothing; an uncertain one stops here, so a sale
+        that may have landed is never sold a second time."""
         c = self.cfg
         try:
             raw_now, dec, _ = self.token_accounts(mint)
             lam0 = self.lamports()
         except Exception as e:
-            return dict(ok=False, stage="tx", err=str(e)[:160])
+            return dict(ok=False, stage="build", err=str(e)[:160])
         if raw_now <= 0:
             return dict(ok=True, got_usd=0.0, got_sol=0.0, sig=None, sold_raw=0, route="pump",
                         note="wallet holds none of this token, closed at 0")
         amount = min(raw_now, raw_expected) if raw_expected else raw_now
         dec = 6 if dec is None else dec
         size = "100%" if amount >= raw_now else f"{amount / 10 ** dec:.{dec}f}"
-        last = dict(ok=False, stage="tx", err="unknown error")
+        last = dict(ok=False, stage="build", err="no sell attempted")
         for bps in c["live_sell_slippage_bps"]:
             try:
                 tx = self.pumpportal_tx("sell", mint, size, False, bps / 100)
             except Exception as e:
-                return dict(ok=False, stage="build", err=str(e)[:160])
+                return dict(last, err=str(e)[:160]) if last["stage"] == "build" else last
             try:
+                sig = self._send(self._VT(tx.message, [self.kp]))
+            except TimeoutError as e:
+                time.sleep(15)
                 try:
-                    sig = self._send(self._VT(tx.message, [self.kp]))
-                except TimeoutError as e:
-                    time.sleep(15)
-                    if self.token_balance(mint)[0] >= raw_now:
-                        raise
-                    sig = str(e)[-90:]
-                lam1 = self._changed(self.lamports, lam0)
-                got = max(0.0, (lam1 - lam0) / 1e9)
-                return dict(ok=True, got_usd=got * sol_usd, got_sol=got, sig=sig, sold_raw=amount, route="pump")
+                    landed = self.token_balance(mint)[0] < raw_now
+                except Exception:
+                    landed = None
+                if not landed:   # not landed, or can't tell: stop, the engine retries later from a fresh balance
+                    return dict(ok=False, stage="tx", err=str(e)[:160])
+                sig = str(e)[-90:]
             except Exception as e:
                 err = str(e)[:160]
                 last = dict(ok=False, stage=self._stage(err), err=err)
+                if last["stage"] == "tx":
+                    return last
+                continue   # slip / sim / reverted: nothing sold, try a wider tolerance
+            try:
+                lam1 = self._retry(lambda: self._changed(self.lamports, lam0))
+                got = max(0.0, (lam1 - lam0) / 1e9)
+            except Exception:
+                got = None   # sold, but the proceeds could not be read: the engine estimates them
+            return dict(ok=True, got_usd=None if got is None else got * sol_usd, got_sol=got, sig=sig,
+                        sold_raw=amount, route="pump")
         return last
 
     def close_empty(self, mint):
@@ -2605,7 +2652,8 @@ class Scouts:
     def atlas(self, q):
         n, fresh, cl, clp = q.get("top10_n", 0), q.get("top10_fresh", 0), q.get("cluster_n", 0), q.get("cluster_pct", 0.0)
         sc = 0.4 - min(q["top10_pct"] / 40, 1) * 0.6 - (fresh / n if n else 0) * 0.5 - (0.5 if cl >= 4 else 0.2 if cl == 3 else 0)
-        note = f"top 10 hold {q['top10_pct']:.0f}% (largest {q['top_pct']:.1f}%), {fresh} of {n} are fresh wallets"
+        note = f"top 10 hold {q['top10_pct']:.0f}% (largest {q['top_pct']:.1f}%), " + (
+            f"{fresh} of {n} are fresh wallets" if q.get("traders_warm", True) else "fresh-wallet check warming up")
         if cl >= 3:
             note += f"; {cl} of them bought within 1.5s, holding {clp:.0f}%"
         veto = (f"{cl} top holders bought in the same moment and hold {clp:.0f}%" if cl >= 5 and clp >= 15 else None)
@@ -2630,7 +2678,11 @@ class Scouts:
         if age is not None:
             sc += 0.3 if age >= 168 else (0.1 if age >= 24 else (-0.4 if age < 1 else -0.1))
         sc += 0.4 * min(wins, 2) / 2 - 0.8 * min(rugs, 1) - 0.3 * min(n, 2) / 2 - max(0.0, q["dev_pct"] - 5) / 10
-        parts = [f"wallet {self._age(age)} old" if age is not None else "wallet age not looked up yet"]
+        busy = age is None and (q.get("dev_txs") or 0) >= 100
+        if busy:
+            sc -= 0.1   # an old, very active wallet: often a launch bot
+        parts = [f"wallet {self._age(age)} old" if age is not None else
+                 ("busy wallet, 100+ recent transactions" if busy else "wallet age not looked up yet")]
         if n:
             parts.append(f"{n} other launch{'es' if n > 1 else ''} in 24h")
         if wins or rugs:
@@ -2697,9 +2749,10 @@ class Scouts:
             note += f", graduates in about {left / rate:.0f} min at this pace"
         return self._c(sc), note, None
 
-    def review(self, q):
+    def review(self, q, count=True):
         """Attach every scout's report to the launch: q["scouts"], q["scout_scores"],
-        q["scout_green"], q["scout_red"] and q["scout_veto"] (name, reason) or None."""
+        q["scout_green"], q["scout_red"] and q["scout_veto"] (name, reason) or None.
+        count=False (the dashboard's own look) leaves the scouts' records alone."""
         out, veto, scores = {}, None, {}
         for name in self.NAMES:
             sc, note, v = getattr(self, name.lower())(q)
@@ -2711,7 +2764,7 @@ class Scouts:
                  scout_green=sum(1 for v in scores.values() if v >= self.GREEN),
                  scout_red=sum(1 for v in scores.values() if v <= self.RED))
         first = q["addr"] not in self.seen
-        if first or (veto and not self.seen[q["addr"]]):
+        if count and (first or (veto and not self.seen[q["addr"]])):
             if len(self.seen) > 20000:
                 self.seen.clear()
             self.seen[q["addr"]] = bool(veto)
@@ -3263,11 +3316,20 @@ class Engine:
                 st["cool"][k] = self.t - c["cooldown_min"] * 60 + 20   # it ran away from us: look again in 20s
                 self.emit("RISK", f"{name} skipped ${q['symbol']}: price moved past the slippage limit")
                 return False
+        if res is None and c.get("live_direct") and self.wallet and self.wallet.get("usdc", 0.0) < size:
+            # the Jupiter backup pays in USDC; without it there is nothing to fall back on
+            st["cool"][k] = self.t - c["cooldown_min"] * 60 + 20
+            if self.t - getattr(self, "usdc_warn_t", -1e12) > 300:
+                self.usdc_warn_t = self.t
+                self.emit("RISK", f"{name} skipped ${q['symbol']}: not enough spare SOL for a direct buy and no "
+                                  f"USDC for the Jupiter backup (wallet {self.wallet.get('sol', 0):.3f} SOL, "
+                                  f"{self.wallet.get('usdc', 0):.2f} USDC)")
+            return False
         if res is None:
             res = self.live.buy(q["addr"], size, q["price"], slippage_bps=c["live_curve_slippage_bps"],
                                 max_dev_pct=c["live_curve_max_dev_pct"], priority=c["live_curve_priority"])
         if not res["ok"]:
-            if res.get("stage") == "tx":
+            if res.get("stage") in ("tx", "reverted"):
                 self._live_fail(f"{name} buy ${q['symbol']} failed: {res['err']}")
             else:
                 # no route yet is normal for a seconds-old launch: try again in 20s, not in an hour
@@ -3348,13 +3410,18 @@ class Engine:
                 res = self.live.direct_sell(pos["addr"], want, self.sol_usd)
                 if res["ok"]:
                     self.direct_fails = 0
-                    if self.wallet:
-                        self.wallet["sol"] = self.wallet.get("sol", 0.0) + res.get("got_sol", 0.0)
+                    if res.get("got_usd") is None:   # sold, but the proceeds could not be read
+                        res["got_usd"] = self._value(pos, units)
+                        self.emit("WARN", f"${pos['symbol']} sold (tx {str(res.get('sig'))[:10]}) but the SOL received "
+                                          f"could not be read; booked at the estimated ${res['got_usd']:.2f}")
+                    elif self.wallet:
+                        self.wallet["sol"] = self.wallet.get("sol", 0.0) + (res.get("got_sol") or 0.0)
                 elif res.get("stage") in ("build", "sim"):
                     self._direct_error("sell", res["err"])
                     res = None
-                else:
-                    res = None   # a failed direct sell: try Jupiter straight away, selling fast matters
+                elif res.get("stage") in ("slip", "reverted"):
+                    res = None   # provably nothing sold: try Jupiter straight away, selling fast matters
+                # stage "tx": it may have landed, so no second sale now; the backoff retries from a fresh balance
             if res is None:
                 res = self.live.sell(pos["addr"], want)
             if not res["ok"]:
@@ -4024,7 +4091,8 @@ class Engine:
                             socials=q["socials"] if q["meta_state"] == 2 else None,
                             held=any(tkey("solana", q["addr"]) in st["positions"]
                                      for st in S["agents"].values()))
-                       for q in (self.scouts.review(q) if self.scouts else q for q in self.pump.top(self.t, 12))]
+                       for q in (self.scouts.review(q, count=False) if self.scouts else q
+                                 for q in self.pump.top(self.t, 12))]
                 pump = dict(ps, hot=hot, sol_usd=self.sol_usd, demo=self.demo)
             fomo = None
             if self.fomo:
