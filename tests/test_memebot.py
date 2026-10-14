@@ -501,7 +501,7 @@ class LiveSpark(unittest.TestCase):
         q = dict(w.get("SH"), buyers=30, last_trade=self.eng.t, age=60)
         self.eng._open_shadows([q])
         self.assertEqual(len(self.eng.shadows), 1)
-        self.eng._open_shadows([q])                          # not again within 45s
+        self.eng._open_shadows([q])                          # not again straight away
         self.assertEqual(len(self.eng.shadows), 1)
         w.handle(dict(txType="buy", mint="SH", traderPublicKey="b", solAmount=30, tokenAmount=1,
                       vSolInBondingCurve=80.0, vTokensInBondingCurve=400e6))  # price x4: take-profit
@@ -509,6 +509,24 @@ class LiveSpark(unittest.TestCase):
         self.assertEqual(len(self.eng.shadows), 0)
         self.assertEqual(self.eng.learner.n, 1)
         self.assertGreater(self.eng.learner.recent[-1][0], 0.5)
+
+    def test_proof_counts_each_launch_once(self):
+        L = self.eng.learner
+        x = m.Learner.features(dict(self.q(), age=60, real_sol=20, uniq_5m=20, buys_5m=40, sells_5m=10,
+                                    buys_60s=8, holders=40, top_pct=2, top10_pct=15, bundle_pct=1,
+                                    sniper_pct=2, dev_pct=1, whale=0.1, same_amt=0, ath_drop=0, socials=1))
+        for _ in range(L.min_n):
+            L.learn(x, 0.5, False)
+        w = self.eng.pump
+        w.handle(dict(txType="create", mint="ONE", traderPublicKey="d", symbol="ONE", initialBuy=0,
+                      vSolInBondingCurve=50.0, vTokensInBondingCurve=640e6))
+        q = dict(w.get("ONE"), buyers=40, last_trade=self.eng.t, age=60)
+        for _ in range(5):
+            self.eng._open_shadows([dict(q, last_trade=self.eng.t)])
+            self.eng.t += self.cfg["shadow_every_s"] + 1
+        sh = list(self.eng.shadows.values())
+        self.assertEqual(len(sh), 5)
+        self.assertEqual(sum(1 for v in sh if v["picked"]), 1)
 
     def test_live_blocked_when_wallet_sol_low(self):
         self.eng.wallet = dict(pub="x", usdc=15.0, sol=0.001)

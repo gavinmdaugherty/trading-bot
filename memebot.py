@@ -98,7 +98,9 @@ CFG = dict(
     learn_min=200,               # shadow trades to learn from before the model takes over
     learn_proof=30,              # out-of-sample picks needed before real money follows the model
     learn_edge=0.03,             # buy only when the model expects at least +3% after costs
-    shadow_max=300,              # shadow trades followed at once
+    shadow_max=1500,             # shadow trades followed at once
+    shadow_every_s=20,           # sample the same launch again after this long...
+    shadow_per_token=12,         # ...up to this many times
     bundle_window_s=3.0,         # buys this close to the launch count as bundled with it
     sniper_window_s=20.0,        # buyers in the first 20s count as snipers
     meta_min_buys=12,            # fetch a launch's metadata (socials) once it has this many buys
@@ -1852,7 +1854,7 @@ class Engine:
         self.sol_usd, self.sol_t = cfg["sol_usd_fallback"], -1e12
         self.fomo_t, self.fomo_board, self.fomo_err = -1e12, [], ""
         self.curve_buys = {}
-        self.learner, self.shadows, self.shadowed = None, {}, {}
+        self.learner, self.shadows, self.shadowed, self.picked_mints = None, {}, {}, set()
         if pump and any(a.get("learn") for a in self.acfg.values()):
             self.learner = Learner(None if demo else cfg["learn_file"], cfg["learn_min"], cfg["learn_proof"])
         self.dex_err, self.dex_ok_t = "", None
@@ -2524,13 +2526,16 @@ class Engine:
             m = q["addr"]
             last, count = self.shadowed.get(m, (-1e12, 0))
             # sample a launch at several moments, since a real buy can come at any of them
-            if count >= 6 or self.t - last < 45 or self._hard_curve_reason(a, q):
+            if count >= c["shadow_per_token"] or self.t - last < c["shadow_every_s"] or self._hard_curve_reason(a, q):
                 continue
             x = Learner.features(q)
             ev = L.ev(x) if L.ready() else None
+            pick = ev is not None and ev >= c["learn_edge"] and m not in self.picked_mints
+            if pick:  # proof counts each launch once, however often it is sampled
+                self.picked_mints.add(m)
             ref = q["price"] * (1 + cost)  # what a fill would cost, as for a real buy
             self.shadows[(m, count)] = dict(mint=m, x=x, ref=ref, peak=ref, last=q["price"],
-                                            opened=self.t, picked=ev is not None and ev >= c["learn_edge"])
+                                            opened=self.t, picked=pick)
             self.shadowed[m] = (self.t, count + 1)
 
     @staticmethod
@@ -2569,6 +2574,7 @@ class Engine:
         if len(self.shadowed) > 20000:
             cut = self.t - 7200
             self.shadowed = {m: v for m, v in self.shadowed.items() if v[0] > cut}
+            self.picked_mints &= set(self.shadowed)
 
     def _curve_entries(self):
         names = [n for n, a in self.acfg.items() if a.get("venue") == "curve"]
