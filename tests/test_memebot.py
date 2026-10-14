@@ -1616,5 +1616,47 @@ class DataFiles(unittest.TestCase):
         self.assertEqual(cfg["state_file"], os.path.join(here, "state.json"))
 
 
+class MemoryPage(unittest.TestCase):
+    def test_page_lists_ruggers_live_launches_and_csv(self):
+        eng = demo_engine()
+        for _ in range(40):
+            eng.cycle()
+            if eng.memory.summary()["ruggers"] >= 2:
+                break
+        page = m.build_memory_page(eng.memory, pump=eng.pump)
+        self.assertIn("Rug creators", page)
+        self.assertIn("https://solscan.io/account/", page)
+        self.assertIn("id='q'", page)
+        rows, total = eng.memory.listing("ruggers")
+        self.assertTrue(total >= 2 and all(r[2] >= 1 for r in rows))
+        self.assertEqual(rows, sorted(rows, key=lambda r: (-r[2], -r[4])))
+        csv = m.memory_csv(eng.memory, "ruggers")
+        self.assertTrue(csv.startswith("address,launches,rugged,ran,last_seen_utc\n"))
+        self.assertEqual(len(csv.strip().split("\n")), total + 1)
+        self.assertIn("off in this run", m.build_memory_page(None))
+
+    def test_memory_routes(self):
+        eng = demo_engine()
+        eng.cycle()
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), m.make_handler(eng, 0))
+        port = srv.server_address[1]
+        srv.RequestHandlerClass = m.make_handler(eng, port)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            for path, ctype in (("/memory", "text/html"), ("/memory.csv?kind=smart", "text/csv")):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                c.request("GET", path)
+                r = c.getresponse()
+                self.assertEqual(r.status, 200, path)
+                self.assertTrue(r.getheader("Content-Type").startswith(ctype))
+                r.read()
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            c.request("GET", "/memory.csv?kind=nope")
+            self.assertEqual(c.getresponse().status, 404)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -109,7 +109,11 @@ Spark trains a small model on what actually happens to pump.fun launches:
 - **rugged:** the creator or the first-seconds wallets sold out, and it gave back most of its gain since launch
 - **dud:** anything else
 
-Each verdict is credited to the creator and to every wallet that bought in the first 20 seconds. From that, Spark skips creators who rugged before and launches where several known rug wallets bought early. Wallets that keep getting into runners early count as "smart money", and the model learns how much weight to give them. The memory is saved in `memory.json` (kept out of git) and builds up across restarts.
+Each verdict is credited to the creator and to every wallet that bought in the first 20 seconds. Open **http://127.0.0.1:8000/memory** (or "see every wallet" on the dashboard) for everything Spark remembers:
+- **ruggers live right now:** launches being watched whose creator rugged before, or that known rug wallets bought into early
+- every **rug creator**, **rug-linked wallet** and **smart wallet**, with launches, rugs, runners, rug rate and when it was last seen
+- each wallet linked to Solscan and its pump.fun profile, with a CSV download per list
+- a search box: paste any wallet to see whether Spark knows it From that, Spark skips creators who rugged before and launches where several known rug wallets bought early. Wallets that keep getting into runners early count as "smart money", and the model learns how much weight to give them. The memory is saved in `memory.json` (kept out of git) and builds up across restarts.
 
 **Hot themes.** Every judged launch also credits the words in its name and ticker. Spark tracks which themes are running lately compared with the average; a theme's record halves every 6 hours, so stale narratives fade. A launch's theme strength is one of the model's signals.
 
@@ -128,6 +132,9 @@ The hard rug checks always apply. What Spark has learned is saved in `learn.json
 - pump.fun entries and exits run on a 2-second loop. The DEX loop runs every 30 seconds.
 
 ## Dashboard
+
+- Spark's learning panel shows its stage: **Learning** (practice trades out of 200), **Proving** (a gauge of its blind picks' average against the 0% line it must beat), then **Buy mode**. The live banner says plainly whether Spark can spend real money yet.
+- The page refreshes every 2 seconds, adds only new lines to the activity log, updates panels you have scrolled past only when you scroll back to them, and pauses while the tab is in the background.
 
 - A status line shows what the bot is doing right now, how fresh the data is and when the next scan runs. Status lights show the state of DexScreener, pump.fun and Fomo, and a banner explains any connection problem.
 - Each agent card shows why it isn't buying, for example "too young (40), bundled launch (3)".

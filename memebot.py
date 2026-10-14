@@ -686,6 +686,23 @@ class Memory:
             f.write(data)
         os.replace(tmp, self.path)
 
+    def listing(self, kind, limit=2000):
+        """Rows for the /memory page: (address, launches, rugs, runners, last seen), worst or best first.
+        kind: "ruggers" (creators with a rug), "rug_wallets" or "smart" (early-buyer wallets)."""
+        with self.lock:
+            if kind == "ruggers":
+                rows = [(a, *e) for a, e in self.creators.items() if e[1]]
+                rows.sort(key=lambda r: (-r[2], -r[4]))
+            elif kind == "rug_wallets":
+                rows = [(a, *e) for a, e in self.wallets.items() if self._rugger(e)]
+                rows.sort(key=lambda r: (-r[2], -r[4]))
+            elif kind == "smart":
+                rows = [(a, *e) for a, e in self.wallets.items() if self._smart(e)]
+                rows.sort(key=lambda r: (-r[3], -r[4]))
+            else:
+                raise ValueError(kind)
+        return rows[:limit], len(rows)
+
     def summary(self):
         now = time.time()
         if getattr(self, "_sum", None) and now - self._sum[0] < 30:
@@ -4273,6 +4290,105 @@ def build_report(engine, include_live=False):
     return _REPORT.replace("{{BODY}}", body).replace("{{TIME}}", esc(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")))
 
 
+MEMORY_KINDS = (("ruggers", "Rug creators", "Creators with at least one launch that rugged: the creator or the "
+                 "first-seconds wallets sold out and it gave back most of its gain. Spark never buys their launches."),
+                ("rug_wallets", "Rug-linked wallets", "Wallets that keep buying in the first seconds of launches that "
+                 "rug (at least 2, and at least half of those they got into early)."),
+                ("smart", "Smart wallets", "Wallets that keep getting into runners early (at least 2, and at least "
+                 "half of those they got into early)."))
+
+
+def build_memory_page(memory, limit=2000, pump=None):
+    """Everything Spark remembers about wallets, as one page (served at /memory): ruggers launching
+    right now, then rug creators, rug-linked wallets and smart wallets, with a search box."""
+    import html as _h
+    esc = lambda v: _h.escape(str(v))
+    when = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+    def links(a):
+        return (f"<a class='mono' href='https://solscan.io/account/{esc(a)}' target='_blank' rel='noopener'>{esc(a)}</a>"
+                f" <a class='tiny' href='https://pump.fun/profile/{esc(a)}' target='_blank' rel='noopener'>pump.fun</a>")
+    if memory is None:
+        body = "<p class='m'>Memory is off in this run (pump.fun is not being watched).</p>"
+    else:
+        S = memory.summary()
+        o = S["outcomes"]
+        tiles = [("Launches judged", f"{S['judged']:,}"), ("Ran", f"{o.get('win', 0):,}"), ("Rugged", f"{o.get('rug', 0):,}"),
+                 ("Rug creators", f"{S['ruggers']:,}"), ("Rug wallets", f"{S['rug_wallets']:,}"), ("Smart wallets", f"{S['smart']:,}")]
+        body = ("<div class='tiles'>" + "".join(f"<div class='tile'><div class='k'>{k}</div><div class='v'>{v}</div></div>"
+                                                for k, v in tiles) + "</div>"
+                + "<p class='m'>" + ("Demo data: this memory is simulated and is not saved." if memory.path is None else
+                                      f"Saved in {esc(memory.path)}.") + "</p>"
+                + "<input id='q' placeholder='Paste a wallet address to check it, or type part of one' autocomplete='off'>"
+                + "<p class='m' id='qr'></p>")
+        # launches being watched right now that carry a known red flag
+        live = []
+        now = pump.clock() if pump is not None else time.time()
+        if pump is not None:
+            with pump.lock:
+                toks = [(m, t["symbol"], t["creator"], dict(t["early"]), t["created"], t["vsol"], t["vtok"])
+                        for m, t in pump.tokens.items() if t["from_create"] and not t["migrated"]]
+            for mint, sym, creator, early, created, vsol, vtok in toks:
+                n, rugs, wins = memory.creator(creator)
+                rugw = memory.crowd(early)[1]
+                if rugs or rugw >= 2:
+                    mcap = vsol / vtok * PUMP_SUPPLY * pump.sol_usd if vtok else 0.0
+                    live.append((rugs, rugw, mint, sym, creator, n, wins, created, mcap))
+            live.sort(key=lambda r: (-r[0], -r[1], -r[7]))
+        body += ("<h2 id='live'>Ruggers live right now (" + str(len(live)) + ")</h2><p class='m'>Launches Spark is "
+                 "watching whose creator rugged before, or that two or more known rug wallets bought in their first "
+                 "seconds. Spark will not buy these.</p>")
+        if live:
+            body += ("<table class='f'><tr><th>Launch</th><th>Age</th><th>MCap</th><th>Creator</th><th>Creator record</th>"
+                     "<th>Rug wallets in early</th></tr>" + "".join(
+                         f"<tr><td><a href='https://pump.fun/coin/{esc(mint)}' target='_blank' rel='noopener'>${esc(sym)}</a></td>"
+                         f"<td>{max(0, now - created) / 60:.0f}m</td><td>${mcap / 1000:.1f}k</td><td>{links(creator)}</td>"
+                         + (f"<td><span class='d'>{rugs} rugged</span> of {n}" + (f", <span class='u'>{wins} ran</span>" if wins else "")
+                            if n else "<td class='m'>no record") + f"</td><td class='{'d' if rugw else ''}'>{rugw}</td></tr>"
+                         for rugs, rugw, mint, sym, creator, n, wins, created, mcap in live[:200]) + "</table>")
+        else:
+            body += "<p class='m'>None right now.</p>"
+        for kind, title, note in MEMORY_KINDS:
+            rows, total = memory.listing(kind, limit)
+            body += (f"<h2 id='{kind}'>{title} ({total:,})</h2><p class='m'>{note} "
+                     f"<a href='/memory.csv?kind={kind}'>Download CSV</a></p>")
+            if not rows:
+                body += "<p class='m'>None yet.</p>"
+                continue
+            body += ("<table class='f'><tr><th>Wallet</th><th>Launches</th><th>Rugged</th><th>Ran</th><th>Rug rate</th>"
+                     "<th>Last seen (UTC)</th></tr>"
+                     + "".join(f"<tr><td>{links(a)}</td><td>{n}</td><td class='{'d' if r else ''}'>{r}</td>"
+                               f"<td class='{'u' if w else ''}'>{w}</td><td>{r / n * 100 if n else 0:.0f}%</td><td>{when(t)}</td></tr>"
+                               for a, n, r, w, t in rows) + "</table>")
+            if total > len(rows):
+                body += f"<p class='m'>Showing the first {len(rows):,}; the CSV has all {total:,}.</p>"
+        body += """<script>
+const q=document.getElementById('q'),qr=document.getElementById('qr');
+q.addEventListener('input',()=>{const v=q.value.trim().toLowerCase();let hits=0;
+  document.querySelectorAll('table.f tr').forEach((tr,i)=>{if(!tr.querySelector('td'))return;
+    const show=!v||tr.textContent.toLowerCase().includes(v);tr.style.display=show?'':'none';if(v&&show)hits++});
+  qr.textContent=v?(hits?hits+' match'+(hits>1?'es':'')+' below.':(v.length>=32?'Spark has no record of this wallet: it has not been seen as a creator or early buyer of a judged launch.':'No match.')):''});
+</script>"""
+    page = _REPORT.replace("<title>Spark: practice record</title>", "<title>Spark: memory</title>")
+    page = page.replace("<h1>Spark</h1><p class=\"m\">Practice record of a self-learning pump.fun trading bot. Updated {{TIME}}.</p>",
+                        "<h1>Spark's memory</h1><p class=\"m\">Every wallet Spark has learned about. Updated {{TIME}}.</p>")
+    page = page.split('<p class="foot">')[0] + "</body></html>"
+    page = page.replace("</style>", ".mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;color:#cfd3ff;"
+                                    "text-decoration:none;word-break:break-all}a{color:#3dffb5}a:hover{text-decoration:underline}"
+                                    ".tiny{font-size:11px;color:#8b8fae;margin-left:6px}"
+                                    "#q{width:100%;margin:14px 0 4px;padding:12px 14px;border-radius:12px;border:1px solid rgba(255,255,255,.14);"
+                                    "background:#14142a;color:#eef0ff;font:14px ui-monospace,Menlo,Consolas,monospace}</style>")
+    return page.replace("{{BODY}}", body).replace("{{TIME}}", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+
+
+def memory_csv(memory, kind):
+    rows, _ = memory.listing(kind, limit=10 ** 9)
+    out = ["address,launches,rugged,ran,last_seen_utc"]
+    out += [f"{a},{n},{r},{w},{datetime.fromtimestamp(t, timezone.utc).strftime('%Y-%m-%d %H:%M')}"
+            for a, n, r, w, t in rows]
+    return "\n".join(out) + "\n"
+
+
 _REPORT = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Spark: practice record</title><style>
 :root{--bg:#06060b;--p:#14142a;--l:rgba(255,255,255,.09);--t:#eef0ff;--m:#8b8fae;--u:#3dffb5;--d:#ff5c7a}
@@ -4374,6 +4490,8 @@ button.pill:focus-visible{outline:2px solid var(--up);outline-offset:2px}
 .banner.live{border-color:rgba(255,59,92,.45);background:linear-gradient(90deg,rgba(255,59,92,.16),rgba(255,59,92,.05));color:#ffc2cd}
 
 .grid{display:grid;gap:14px}
+/* panels below the fold are skipped by the browser until scrolled to */
+.grid.feeds,.grid.agents,.grid.tables,.squad{content-visibility:auto;contain-intrinsic-size:auto 560px}
 .stats{grid-template-columns:1.2fr 1fr 1fr 1fr}
 .mid{grid-template-columns:1.3fr 1fr;margin-top:14px}
 .feeds{grid-template-columns:1.4fr 1fr;margin-top:14px}
@@ -4464,6 +4582,17 @@ td:first-child{font-weight:600}
 .scout .n{font-weight:700;font-size:13px}.scout .r{color:var(--mute);font-size:10.5px;text-transform:uppercase;letter-spacing:.08em}
 .scout .last{margin-top:5px;color:var(--mute);overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical}
 .calls{margin-top:12px;font-size:12px;line-height:1.5;max-height:150px;overflow:auto}
+.steps{display:flex;gap:6px;margin:10px 0 8px;flex-wrap:wrap}
+.steps span{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:4px 10px;border-radius:999px;
+  border:1px solid var(--line2);color:var(--mute)}
+.steps span.done{color:var(--up);border-color:rgba(61,255,181,.35)}
+.steps span.now{color:#06060b;background:var(--violet);border-color:transparent}
+.steps span.now:last-child{background:var(--up)}
+.gauge{position:relative;height:12px;border-radius:999px;margin-top:4px;
+  background:linear-gradient(90deg,rgba(255,92,122,.35),rgba(255,92,122,.12) 48%,rgba(61,255,181,.12) 52%,rgba(61,255,181,.35))}
+.gauge .zero{position:absolute;left:50%;top:-4px;bottom:-4px;width:2px;background:rgba(255,255,255,.55)}
+.gauge b{position:absolute;top:50%;width:16px;height:16px;margin:-8px 0 0 -8px;border-radius:50%;box-shadow:0 0 12px currentColor;border:2px solid #06060b}
+.gscale{display:flex;justify-content:space-between;font:600 10px var(--mono);color:var(--mute);margin:3px 0 6px}
 .learn{font-size:11.5px;margin-top:9px;padding:7px 9px;border-radius:10px;background:rgba(61,255,181,.06);border:1px solid rgba(61,255,181,.22);line-height:1.45}
 .learn .t{color:var(--pump);font-weight:700}
 .why{font-size:11.5px;color:var(--mute);margin-top:9px;line-height:1.45;min-height:16px}
@@ -4542,7 +4671,15 @@ const hhmm=t=>new Date(t*1000).toTimeString().slice(0,8);
 const dur=s=>s<60?Math.round(s)+"s":(s<3600?Math.round(s/60)+"m":(s/3600).toFixed(1)+"h");
 let last=null, lastOk=0, lastSeries="", inflight=false, skew=0;
 // replace a block's HTML only when it changed, and keep the reader's scroll position
-function setHTML(sel,html){const el=$(sel); if(el._h===html)return; const top=el.scrollTop; el.innerHTML=html; el._h=html; el.scrollTop=top}
+// replace a block's HTML only when it changed, and keep the reader's scroll position. Blocks scrolled
+// out of view keep the newest HTML aside and apply it when they come back into view.
+const seen=new Map(), io=("IntersectionObserver" in window)?new IntersectionObserver(es=>es.forEach(e=>{
+  seen.set(e.target,e.isIntersecting); if(e.isIntersecting&&e.target._pending!=null){const h=e.target._pending;e.target._pending=null;applyHTML(e.target,h)}}),{rootMargin:"300px"}):null;
+function applyHTML(el,html){if(el._h===html)return; const top=el.scrollTop; el.innerHTML=html; el._h=html; el.scrollTop=top}
+function setHTML(sel,html){const el=$(sel);
+  if(io&&!seen.has(el)){io.observe(el);seen.set(el,true)}
+  if(io&&seen.get(el)===false){el._pending=html;return}
+  el._pending=null; applyHTML(el,html)}
 
 function drawChart(series){
   const cv=$("#chart"),dpr=window.devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;
@@ -4577,6 +4714,16 @@ function flashNum(sel,v,text){
     el.classList.add(v>prevNum[sel]?"flash-up":"flash-down")}
   prevNum[sel]=v;
 }
+// the log only ever gains lines at the top: add those instead of rebuilding all 80
+function renderLog(log){
+  const el=$("#log"), keys=log.map(e=>e.t+"|"+e.tag+"|"+e.msg);
+  const line=e=>`<div><span style="color:#a68f95">${hhmm(e.t)}</span> <span class="tag t-${esc(e.tag)}">[${esc(e.tag)}]</span> ${esc(e.msg)}</div>`;
+  const old=el._keys||[], at=old.length?keys.indexOf(old[0]):-1;
+  if(at<0||keys.length<old.length&&at>0){el.innerHTML=log.map(line).join("");el._keys=keys;return}
+  if(at>0){const top=el.scrollTop;el.insertAdjacentHTML("afterbegin",log.slice(0,at).map(line).join(""));el.scrollTop=top}
+  while(el.children.length>keys.length)el.lastElementChild.remove();
+  el._keys=keys;
+}
 function renderTape(s){
   const items=[];
   (s.pump&&s.pump.hot||[]).slice(0,10).forEach(q=>items.push(`<span><b>pump</b><span class="${cls(q.net)}">$${esc(q.symbol)} ${q.net>=0?"+":""}${q.net.toFixed(1)} SOL</span> <span class="mute">${q.prog.toFixed(0)}% · ${kmoney(q.mcap)}</span></span>`));
@@ -4585,31 +4732,45 @@ function renderTape(s){
   if(!items.length)return;
   const html=items.join("");
   const tr=$("#tapetrack");
-  if(tr._h!==html){tr.innerHTML=html+html; tr._h=html; tr.style.animationDuration=Math.max(30,items.length*5)+"s"}
+  // rebuilding the ticker restarts its scroll, so refresh it at most every 20 seconds
+  if(tr._h!==html&&(!tr._h||Date.now()-(tr._t||0)>20000)){tr.innerHTML=html+html; tr._h=html; tr._t=Date.now(); tr.style.animationDuration=Math.max(30,items.length*5)+"s"}
 }
 function renderSpot(s){
   const L=s.learn, el=$("#spot");
   if(!L){el.style.display="none";return}
   el.style.display="grid";
   const pc=v=>v==null?"-":(v>=0?"+":"")+(v*100).toFixed(1)+"%";
-  const state=!L.ready?"Learning":(L.proven?"Proven: trading on what it learned":"Proving itself");
-  const learnPct=Math.min(100,L.n/L.min_n*100), proofPct=Math.min(100,L.picks/L.proof_n*100);
+  const stage=!L.ready?0:(L.proven?2:1);
+  const state=["Step 1: learning","Step 2: proving itself","Buy mode: trading on what it learned"][stage];
+  const learnPct=Math.min(100,L.n/L.min_n*100);
   const M=s.memory, B=s.brain, T=s.themes||[];
   const top=(L.top||[]).map(([f,w])=>`<span class="chip ${w>0?"good":"bad"}">${esc(f.replace(/_/g," "))} <b>${w>0?"+":""}${w}</b></span>`).join("");
   setHTML("#spot",`<div class="brain">SPARK<br>BRAIN</div>
     <div><h3>Learning <a href="/report" target="_blank" style="color:var(--up);text-decoration:none;margin-left:8px;text-transform:none;letter-spacing:0">shareable report ↗</a></h3><div class="state" style="color:${L.proven?"var(--up)":(L.ready?"var(--violet)":"var(--text)")}">${state}</div>
       <div class="small" style="margin:0">${L.n.toLocaleString()} practice trades learned · ${L.open} running now</div>
-      <div class="meterbar"><b style="width:${learnPct}%"></b></div><div class="small" style="margin:0">${Math.min(L.n,L.min_n)}/${L.min_n} to start deciding</div>
-      <div class="meterbar p"><b style="width:${proofPct}%"></b></div><div class="small" style="margin:0">proof: ${L.picks}/${L.proof_n} picks, avg ${pc(L.pick_avg)}${L.proven?" ✓":""}</div></div>
+      <div class="steps">${["Learning","Proving","Buy mode"].map((t,i)=>`<span class="${i<stage?"done":(i===stage?"now":"")}">${i<stage?"✓ ":""}${t}</span>`).join("")}</div>
+      ${stage===0?`<div class="meterbar"><b style="width:${learnPct}%"></b></div><div class="small" style="margin:0">${L.n}/${L.min_n} practice trades before it starts picking</div>`:proofGauge(L)}</div>
     <div><h3>What it trusts</h3><div class="chips">${top||'<span class="mute small">still learning which signals matter</span>'}</div>
       <h3 style="margin-top:12px">How it sells</h3><div class="chips">${["early","mid","late"].map(st=>{const e=(L.exits||{})[st]||{};const m=(e.means||{})[e.use||"base"];
         return `<span class="chip ${e.use&&e.use!=="base"?"good":""}">${st}: <b>${esc(e.use||"base")}</b>${m?` ${pc(m[0])}`:""}</span>`}).join("")}</div>
       <h3 style="margin-top:12px">Recent practice</h3><div class="small" style="margin:0">${L.win_rate==null?"no results yet":`win rate ${Math.round(L.win_rate*100)}%, average ${pc(L.avg_ret)} per trade`}</div>
       <h3 style="margin-top:12px">Reality check</h3><div class="small" style="margin:0">${realityTxt(L.calib)}</div></div>
-    <div><h3>Memory</h3>${M?`<div class="chips"><span class="chip">${M.judged} launches judged</span><span class="chip good">${M.outcomes.win||0} ran</span><span class="chip bad">${M.outcomes.rug||0} rugged</span>
+    <div><h3>Memory ${M?'<a href="/memory" target="_blank" style="color:var(--up);text-decoration:none;margin-left:8px;text-transform:none;letter-spacing:0">see every wallet ↗</a>':""}</h3>${M?`<div class="chips"><span class="chip">${M.judged} launches judged</span><span class="chip good">${M.outcomes.win||0} ran</span><span class="chip bad">${M.outcomes.rug||0} rugged</span>
         <span class="chip bad">${M.ruggers} rugger devs</span><span class="chip bad">${M.rug_wallets} rug wallets</span><span class="chip good">${M.smart} smart wallets</span></div>`:""}
       <h3 style="margin-top:12px">Hot themes</h3><div class="chips">${T.length?T.map(t=>`<span class="chip hot">#${esc(t[0])}</span>`).join(""):'<span class="mute small">none standing out yet</span>'}</div>
       ${B?`<div class="small">AI brain: ${B.enabled?esc(B.model)+", "+B.rated+" rated"+(B.spent?", about $"+B.spent.toFixed(2):""):"off"}</div>`:""}</div>`);
+}
+// step 2 and 3: how far the blind picks are from proving a profit (the line Spark must beat is 0%)
+function proofGauge(L){
+  const pc=v=>(v>=0?"+":"")+(v*100).toFixed(1)+"%";
+  const span=0.25, x=v=>Math.max(0,Math.min(100,(v+span)/(2*span)*100));
+  const enough=L.picks>=L.proof_n, avg=L.pick_avg||0, ok=L.proven;
+  const msg=!enough?`${L.picks}/${L.proof_n} blind picks so far (average ${pc(avg)}). Buy mode needs ${L.proof_n} picks averaging above 0%.`
+    :(ok?`Blind picks average ${pc(avg)} over the last ${Math.min(L.picks,100)}: real money is trading.`
+        :`Blind picks average ${pc(avg)} over the last ${Math.min(L.picks,100)}. Buy mode starts when this climbs above 0%.`);
+  return `<div class="gauge"><i class="zero"></i><b style="left:${x(avg)}%;background:${ok?"var(--up)":(avg>0?"var(--amber)":"var(--down)")}"></b></div>
+    <div class="gscale"><span>${pc(-span)}</span><span>0%</span><span>${pc(span)}</span></div>
+    <div class="small" style="margin:0;color:${ok?"var(--up)":"var(--mute)"}">${msg}</div>`;
 }
 // how real fills compare with the costs practice trades assume
 function realityTxt(C){
@@ -4722,6 +4883,7 @@ function render(s){
     b.textContent=(s.halted?"LIVE TRADING HALTED after repeated failed transactions. Check open positions and restart. ":"Real funds at risk. ")+
       (s.wallet?"Wallet "+s.wallet.pub+": "+money(s.wallet.usdc)+" USDC, "+s.wallet.sol.toFixed(4)+" SOL.":"Reading wallet balance...")+
       (s.route&&s.route!=="jupiter"?" Route: "+s.route+".":"")+
+      (s.learn&&s.agents.some(a=>a.live&&a.learns)?(s.learn.proven?" Spark is in BUY MODE.":(s.learn.ready?" Spark is proving itself: no real buys yet.":" Spark is learning: no real buys yet.")):"")+
       (s.fills&&s.fills.n?` Live fills: average ${s.fills.avg.toFixed(1)}s from signal to filled (last ${s.fills.last.toFixed(1)}s, ${s.fills.n} buys).`:"")}
   else if(s.dex&&s.dex.error&&!demo){b.style.display="block";b.textContent="Market data problem: "+s.dex.error+". The bot keeps retrying; check your internet connection or firewall."}
   else if(s.pump&&!demo&&s.pump.seen>=10&&!s.pump.trades&&(s.pump.connected_for>90||s.pump.rpc)){b.style.display="block";
@@ -4750,7 +4912,7 @@ function render(s){
   if(sig!==lastSeries){lastSeries=sig; drawChart(s.equity)}
   if(s.equity.length>1){const a=s.equity[0][0],z=s.equity[s.equity.length-1][0];$("#range").textContent=hhmm(a)+" to "+hhmm(z)}
   $("#logn").textContent=s.log.length+" recent events";
-  setHTML("#log",s.log.map(e=>`<div><span style="color:#a68f95">${hhmm(e.t)}</span> <span class="tag t-${esc(e.tag)}">[${esc(e.tag)}]</span> ${esc(e.msg)}</div>`).join(""));
+  renderLog(s.log);
 
   demo_mode=demo; renderPump(s.pump); renderFomo(s.fomo,s.fomo_off); renderTape(s); renderSpot(s); renderSquad(s.scouts);
   const d=s.dex||{}; $("#ddot").className="dot"+(d.error?" off":(d.ok_t||demo?"":" dead"));
@@ -4766,7 +4928,7 @@ function render(s){
       <div class="eq">${money(a.equity)}</div>
       <div class="meta"><span class="${cls(a.pnl)}">${smoney(a.pnl)} (${pct(a.pnl_pct)})</span><br>${a.wins}W / ${a.losses}L, ${a.open} open${a.capped?"<br>daily cap hit":""}</div>
       <div class="meter"><b style="width:${Math.max(4,a.equity/mx*100)}%;background:${COLORS[i%COLORS.length]}"></b></div>
-      ${a.learns&&s.learn?`<div class="learn"><span class="t">${!s.learn.ready?"Learning "+s.learn.n+"/"+s.learn.min_n:(s.learn.proven?"Model proven":"Model proving itself")}</span>${a.live&&!s.learn.proven?"<br>real money waits for proof":""}</div>`:""}
+      ${a.learns&&s.learn?`<div class="learn"><span class="t">${!s.learn.ready?"Step 1: learning "+s.learn.n+"/"+s.learn.min_n:(s.learn.proven?"BUY MODE":"Step 2: proving, picks avg "+(s.learn.pick_avg>=0?"+":"")+(s.learn.pick_avg*100).toFixed(1)+"%")}</span>${a.live?(s.learn.proven?"<br>real money is trading":"<br>real money waits for buy mode"):""}</div>`:""}
       ${a.bench?`<div class="learn" style="border-color:rgba(255,92,122,.4);background:rgba(255,92,122,.07)"><span class="t" style="color:var(--down)">Benched</span><br>last ${a.bench.n} real trades averaged ${pct(a.bench.real*100)} vs ${pct(a.bench.practice*100)} in practice. No new real buys; ${a.learns?"it buys again once fresh practice picks prove a profit":"restart with --unbench to resume"}.</div>`:""}
       ${a.live&&a.real_avg!=null&&!a.bench?`<div class="small" style="margin-top:6px">real trades average ${pct(a.real_avg*100)}</div>`:""}
       <div class="why">${why(a)}</div></div>`}).join(""));
@@ -4796,7 +4958,7 @@ function tick(){
 
 
 async function poll(){
-  if(inflight)return; inflight=true;
+  if(inflight||document.hidden)return; inflight=true;   // no work while the tab is in the background
   const ctl=new AbortController(), to=setTimeout(()=>ctl.abort(),6000);
   try{const r=await fetch("/state.json",{cache:"no-store",signal:ctl.signal});
     if(!r.ok)throw new Error("HTTP "+r.status);
@@ -4808,6 +4970,7 @@ async function poll(){
 $("#pause").addEventListener("click",async()=>{await fetch("/api/pause",{method:"POST",headers:{"X-MemeBot":"1"}}); poll()});
 window.addEventListener("resize",()=>last&&drawChart(last.equity));
 poll(); setInterval(poll,2000); setInterval(tick,1000);
+document.addEventListener("visibilitychange",()=>{if(!document.hidden)poll()});
 </script>
 </body></html>
 """
@@ -4854,6 +5017,20 @@ def make_handler(engine, port):
                 with engine.lock:
                     page = build_report(engine, engine.cfg.get("report_live", False))
                 self._send(200, page.encode(), "text/html; charset=utf-8")
+            elif path == "/memory":
+                self._send(200, build_memory_page(engine.memory, pump=engine.pump).encode(), "text/html; charset=utf-8")
+            elif path == "/memory.csv":
+                kind = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("kind", ["ruggers"])[0]
+                if engine.memory is None or kind not in {k for k, _, _ in MEMORY_KINDS}:
+                    return self._send(404, b"not found", "text/plain")
+                body = memory_csv(engine.memory, kind).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header("Content-Disposition", f'attachment; filename="spark-{kind}.csv"')
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
             elif path in ("/", "/index.html"):
                 self._send(200, HTML.encode(), "text/html; charset=utf-8")
             else:
