@@ -2619,8 +2619,9 @@ class Scouts:
         sc = (0.35 * math.log2(max(accel, 0.125)) + 0.2 * ((size / size5 - 1) if size5 else 0)
               - 0.4 * max(0.0, sells / buys - 0.6) + (0.2 if q.get("uniq_60s", 0) >= 8 else 0))
         pace = "speeding up" if accel > 1.2 else ("slowing down" if accel < 0.8 else "steady")
-        note = (f"{b30} buys in the last 30s vs {prev} in the minute before ({pace}, {accel:.1f}x), "
-                f"{q.get('uniq_60s', 0)} buyers and {sells} sells last minute, avg buy {size:.2f} SOL")
+        pl = lambda n, w: f"{n} {w}" + ("" if n == 1 else "s")
+        note = (f"{pl(b30, 'buy')} in the last 30s vs {prev} in the minute before ({pace}, {accel:.1f}x), "
+                f"{pl(q.get('uniq_60s', 0), 'buyer')} and {pl(sells, 'sell')} last minute, avg buy {size:.2f} SOL")
         return self._c(sc), note, None
 
     def cinder(self, q):
@@ -4601,7 +4602,7 @@ function render(s){
   flashNum("#bal",s.total,money(s.total));
   $("#ballabel").textContent=s.real_only?"Real balance":"Balance";
   $("#balsub").textContent=s.real_only?"started with "+money(s.start,2)+" real money, traded by "+s.agents.map(a=>a.name).join(", ")
-    :"started at "+money(s.start,2)+", split across "+s.agents.length+" agents"+(s.mode==="live"?" (paper and live)":"");
+    :"started at "+money(s.start,2)+(s.agents.length===1?", traded by "+s.agents[0].name:", split across "+s.agents.length+" agents")+(s.mode==="live"?" (paper and live)":"");
   $("#pnl").className="big "+cls(s.pnl); flashNum("#pnl",s.pnl,smoney(s.pnl));
   const srcs=Object.entries(s.by_src||{}).map(([k,v])=>`${SRC[k]||k} ${smoney(v,0)}`).join(", ");
   $("#pnlsub").textContent=pct(s.pnl_pct)+" since start"+(srcs?" · closed: "+srcs:"");
