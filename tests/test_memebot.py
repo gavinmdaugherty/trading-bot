@@ -1773,6 +1773,24 @@ class Watchlist(unittest.TestCase):
         self.assertEqual(len(snap["follow"]["wallets"]), 2)
         self.assertTrue(snap["follow"]["on"])
 
+    def test_restart_with_open_positions_and_a_watchlist(self):
+        # the watchlist must not clash with re-following open positions at startup
+        eng = self.engine()
+        self.create(eng, "KEEP", "DEVX")
+        eng._follow_pass()
+        state = eng.state
+        c = dict(m.CFG, demo_watch=eng.cfg["demo_watch"])
+        src, pump = m.DemoSource(), m.DemoPump(c, clock=time.time)
+        orig = m.Engine._load
+        m.Engine._load = lambda self: state
+        try:
+            eng2 = m.Engine(c, [a for a in m.AGENTS if a["name"] in ("Spark", "Hawk")], src, demo=True, pump=pump)
+        finally:
+            m.Engine._load = orig
+        self.assertIn("KEEP", eng2.pump.tokens)
+        eng2._load_watch()
+        self.assertEqual(eng2.pump.watched["DEVX"], "snipe")
+
     def test_spark_does_not_trade_the_watchlist_path(self):
         eng = self.engine()
         self.create(eng, "SNIPED", "DEVX")

@@ -764,7 +764,7 @@ class PumpWatcher:
         self.want_rpc = False
         self.memory = None
         self.wake = threading.Event()   # set on every launch or trade, so Spark decides as data lands
-        self.follow = {}                 # watchlist: wallet -> "snipe" | "copy" | "both"
+        self.watched = {}                # watchlist: wallet -> "snipe" | "copy" | "both"
         self.follow_events = deque(maxlen=500)
         self.traders = {}        # wallet -> [last mint traded, launches traded]: veterans vs fresh wallets
         self.dev_q = deque(maxlen=200)
@@ -1042,12 +1042,12 @@ class PumpWatcher:
         if dev and init > 0:
             t["holders"][dev] = init
         self.seen += 1
-        if self.follow.get(dev) in ("snipe", "both"):
+        if self.watched.get(dev) in ("snipe", "both"):
             self.follow_events.append(dict(kind="snipe", mint=mint, wallet=dev, t=now, sol=num(m, "solAmount")))
 
     def _on_trade(self, m, is_buy, now):
         t = self.tokens.get(m["mint"])
-        copier = self.follow.get(m.get("traderPublicKey") or "") in ("copy", "both")
+        copier = self.watched.get(m.get("traderPublicKey") or "") in ("copy", "both")
         if not t and copier and is_buy:   # a copied wallet buying a coin we were not following: follow it now
             t = self._new(m["mint"], now)
         if not t:
@@ -3803,7 +3803,7 @@ class Engine:
                 self.emit("RISK", "watchlist: now following " + ", ".join(added))
         self.watch, self.watch_bad = watch, bad
         with self.pump.lock:
-            self.pump.follow = {a: w["mode"] for a, w in watch.items()}
+            self.pump.watched = {a: w["mode"] for a, w in watch.items()}
 
     def _follow_reason(self, q, ev):
         """Red flags that stop a watchlist buy (unless follow_checks is off)."""
