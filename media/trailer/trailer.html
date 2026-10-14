@@ -170,8 +170,11 @@ function rnd(i){const s=Math.sin(i*127.1+311.7)*43758.5453;return s-Math.floor(s
 const fmt=n=>Math.round(n).toLocaleString("en-US");
 
 // scene windows [start, end]; crossfade 0.5s
-const SC={intro:[0,4.2],watch:[3.8,10.4],rugs:[10,16.6],learn:[16.2,22.6],mem:[22.2,27.6],dashs:[27.2,32.8],end:[32.4,37]};
-function vis(id,t){const [a,b]=SC[id];if(t<a||t>b)return 0;return Math.min(clamp((t-a)/.5),id==="end"?1:clamp((b-t)/.5))}
+// back-to-back scenes: the outgoing one fades out before its boundary, the next fades in after it,
+// so two scenes never share the screen
+const SC={intro:[0,4.0],watch:[4.0,10.2],rugs:[10.2,16.4],learn:[16.4,22.4],mem:[22.4,27.4],dashs:[27.4,32.6],end:[32.6,37]};
+function vis(id,t){const [a,b]=SC[id];if(t<a||t>b)return 0;
+  return Math.min(id==="intro"?1:clamp((t-a)/.45),id==="end"?1:clamp((b-t)/.35))}
 
 // build static content
 const SYMS=["PEPECAT","AIDOG","FROGGY","MOONCAT","GROKBOI","BONKER","WAGMI","SNEK","CHAD","GIGA","TURBO","BRRR","SOLLY","MEOWX","DEGEN","HONK"];
