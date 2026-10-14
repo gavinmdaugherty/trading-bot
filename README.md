@@ -67,6 +67,13 @@ Spark trains a small model on what actually happens to pump.fun launches:
 
 Each verdict is credited to the creator and to every wallet that bought in the first 20 seconds. From that, Spark skips creators who rugged before and launches where several known rug wallets bought early. Wallets that keep getting into runners early count as "smart money", and the model learns how much weight to give them. The memory is saved in `memory.json` (kept out of git) and builds up across restarts.
 
+**Hot themes.** Every judged launch also credits the words in its name and ticker. Spark tracks which themes are running lately compared with the average; a theme's record halves every 6 hours, so stale narratives fade. A launch's theme strength is one of the model's signals.
+
+**AI brain (optional).** With `pip install anthropic` and `ANTHROPIC_API_KEY=...` in `.env`, Claude reads promising launches (15+ buyers, past the hard checks): name, ticker, description and socials, plus the current hot themes. It scores each one 0–10 for memeability, narrative fit and scam-likeness. Those scores are model features, so Spark learns from results how much to trust them. A scam score of 9 or more is an outright veto. Each launch is rated once, capped at 30 an hour.
+- **Model:** the default is Claude Opus 5.5, about $0.01 per rating, so roughly $7 a day at the full cap. Set `MEMEBOT_BRAIN_MODEL=claude-haiku-5-5` to cut that about 40×, or `MEMEBOT_BRAIN_PER_HOUR` to change the cap.
+- **Refusals:** on Opus and Sonnet models, server-side refusal fallbacks are switched on (`fallbacks: "default"`).
+- **Untrusted text:** token text is treated as untrusted data in the prompt.
+
 The hard rug checks always apply. What Spark has learned is saved in `learn.json` (kept out of git), so it survives restarts. Delete that file to start learning from scratch.
 
 ## Better fills and exits
