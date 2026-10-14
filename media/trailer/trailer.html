@@ -1,0 +1,268 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Spark trailer</title>
+<style>
+@font-face{font-family:"JBM";src:url(fonts/jetbrains-mono-latin-500-normal.woff2) format("woff2");font-weight:500}
+@font-face{font-family:"JBM";src:url(fonts/jetbrains-mono-latin-700-normal.woff2) format("woff2");font-weight:700}
+:root{--bg:#05050a;--text:#f2f3ff;--mute:#8d91b3;--up:#3dffb5;--down:#ff5c7a;--blue:#6ea8ff;--violet:#a78bfa;--pink:#ff5ea8;--amber:#ffcf5c}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:1920px;height:1080px;overflow:hidden;background:var(--bg)}
+body{font-family:"Inter Display","Inter",sans-serif;color:var(--text);-webkit-font-smoothing:antialiased}
+#stage{position:relative;width:1920px;height:1080px;overflow:hidden;background:var(--bg)}
+.grid{position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.04) 1px,transparent 1px);
+  background-size:60px 60px;-webkit-mask-image:radial-gradient(ellipse at 50% 40%,#000 25%,transparent 72%)}
+.blob{position:absolute;border-radius:50%;filter:blur(120px)}
+.scene{position:absolute;inset:0;opacity:0}
+.mono{font-family:"JBM",monospace}
+.kicker{font:700 22px "JBM",monospace;letter-spacing:.32em;text-transform:uppercase;color:var(--up)}
+.h{font-weight:800;font-size:96px;letter-spacing:-.045em;line-height:1}
+.h .g{background:linear-gradient(90deg,#3dffb5,#6ea8ff 55%,#a78bfa);-webkit-background-clip:text;background-clip:text;color:transparent}
+.p{font-size:32px;color:var(--mute);font-weight:500;letter-spacing:-.01em;line-height:1.35}
+.panel{background:rgba(22,22,38,.72);border:1px solid rgba(255,255,255,.09);border-radius:26px;
+  box-shadow:0 30px 80px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.06)}
+/* intro */
+#word{position:absolute;left:0;right:0;top:395px;text-align:center;font-weight:800;font-size:220px;letter-spacing:-.06em;
+  background:linear-gradient(90deg,#fff 10%,#bff9e4 45%,#a78bfa 90%);-webkit-background-clip:text;background-clip:text;color:transparent}
+#tag{position:absolute;left:0;right:0;top:665px;text-align:center}
+#flash{position:absolute;width:24px;height:24px;border-radius:50%;background:#fff;box-shadow:0 0 40px 12px #3dffb5,0 0 120px 40px rgba(61,255,181,.5)}
+.pt{position:absolute;width:5px;height:5px;border-radius:50%;background:#3dffb5;box-shadow:0 0 12px #3dffb5}
+/* feed */
+.row{position:absolute;left:0;right:0;height:72px;display:flex;align-items:center;gap:26px;padding:0 30px;border-bottom:1px solid rgba(255,255,255,.05);font-size:25px}
+.row .sym{width:190px;font-weight:700}
+.row .age{width:70px;color:var(--mute);font:500 22px "JBM"}
+.row .bar{width:170px;height:9px;border-radius:9px;background:rgba(255,255,255,.08);overflow:hidden}
+.row .bar b{display:block;height:100%;border-radius:9px;background:linear-gradient(90deg,#3dffb5,#ffcf5c,#ff5ea8);background-size:170px 100%}
+.row .pc{width:70px;font:500 22px "JBM";color:var(--mute)}
+.row .net{width:150px;font:700 23px "JBM";text-align:right}
+.counter{font:700 64px "JBM";letter-spacing:-.03em}
+.clabel{font-size:20px;color:var(--mute);text-transform:uppercase;letter-spacing:.14em;font-weight:600;margin-top:4px}
+/* checks */
+.check{display:flex;align-items:center;gap:20px;font-size:30px;font-weight:600;height:74px;padding:0 30px;border-bottom:1px solid rgba(255,255,255,.05)}
+.check .ic{width:44px;height:44px;border-radius:50%;display:grid;place-items:center;font:700 24px "JBM";flex:none}
+.check .ic.ok{background:rgba(61,255,181,.14);color:var(--up);box-shadow:0 0 18px rgba(61,255,181,.35)}
+.check .ic.bad{background:rgba(255,92,122,.16);color:var(--down);box-shadow:0 0 22px rgba(255,92,122,.5)}
+.check .v{margin-left:auto;font:500 24px "JBM";color:var(--mute)}
+#stamp{position:absolute;font:800 66px "Inter Display";letter-spacing:.06em;color:var(--down);border:6px solid var(--down);border-radius:18px;padding:8px 28px;
+  box-shadow:0 0 40px rgba(255,92,122,.45),inset 0 0 30px rgba(255,92,122,.2);text-shadow:0 0 24px rgba(255,92,122,.6);background:rgba(20,6,10,.6)}
+/* learning */
+.mbar{height:18px;border-radius:18px;background:rgba(255,255,255,.07);overflow:hidden}
+.mbar b{display:block;height:100%;border-radius:18px;background:linear-gradient(90deg,#3dffb5,#6ea8ff);box-shadow:0 0 22px rgba(61,255,181,.55)}
+.mbar.p b{background:linear-gradient(90deg,#a78bfa,#ff5ea8);box-shadow:0 0 22px rgba(167,139,250,.55)}
+.sig{display:flex;align-items:center;gap:18px;font-size:24px;font-weight:600;height:56px}
+.sig .nm{width:250px;color:var(--mute)}
+.sig .track{flex:1;height:14px;position:relative}
+.sig .track::before{content:"";position:absolute;left:50%;top:-6px;bottom:-6px;width:2px;background:rgba(255,255,255,.15)}
+.sig .b{position:absolute;top:0;height:14px;border-radius:7px}
+/* memory chips */
+.chip{position:absolute;padding:20px 32px;border-radius:999px;font-size:34px;font-weight:700;white-space:nowrap;border:2px solid;backdrop-filter:blur(6px)}
+.chip.bad{color:#ffb3c1;border-color:rgba(255,92,122,.55);background:rgba(255,92,122,.10);box-shadow:0 0 30px rgba(255,92,122,.22)}
+.chip.good{color:#b6ffe3;border-color:rgba(61,255,181,.55);background:rgba(61,255,181,.10);box-shadow:0 0 30px rgba(61,255,181,.22)}
+.chip.hot{color:#ffc2e0;border-color:rgba(255,94,168,.55);background:rgba(255,94,168,.10);box-shadow:0 0 30px rgba(255,94,168,.22)}
+/* dashboard */
+#dashwrap{position:absolute;left:50%;top:685px;width:1290px;height:806px;transform-origin:50% 50%}
+#dash{width:100%;height:100%;border-radius:22px;border:1px solid rgba(255,255,255,.14);box-shadow:0 50px 140px rgba(0,0,0,.7),0 0 120px rgba(110,168,255,.18);
+  background:url(dash.png) center/cover}
+.demo{position:absolute;right:0;top:-46px;font:700 18px "JBM";color:#ffd7a6;background:rgba(40,25,8,.85);border:1px solid rgba(255,176,87,.5);
+  padding:6px 14px;border-radius:999px;letter-spacing:.08em}
+/* end */
+#end .w{position:absolute;left:0;right:0;top:340px;text-align:center;font-weight:800;font-size:200px;letter-spacing:-.06em;
+  background:linear-gradient(90deg,#fff 10%,#bff9e4 45%,#a78bfa 90%);-webkit-background-clip:text;background-clip:text;color:transparent}
+#end .t{position:absolute;left:0;right:0;top:600px;text-align:center;font-size:46px;font-weight:700;letter-spacing:-.02em}
+#end .d{position:absolute;left:0;right:0;bottom:70px;text-align:center;font-size:21px;color:#6f7394;font-weight:500}
+.caps{position:absolute;left:0;right:0;top:700px;display:flex;justify-content:center;gap:16px}
+.cap{font:600 22px "Inter";color:var(--mute);border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:10px 20px;background:rgba(255,255,255,.03)}
+</style></head><body>
+<div id="stage">
+  <div class="grid"></div>
+  <div class="blob" id="b1" style="width:900px;height:900px;background:#3dffb5"></div>
+  <div class="blob" id="b2" style="width:800px;height:800px;background:#7c3aed"></div>
+  <div class="blob" id="b3" style="width:700px;height:700px;background:#ff5ea8"></div>
+
+  <!-- 1 intro -->
+  <div class="scene" id="intro"><div id="flash"></div><div id="pts"></div>
+    <div id="word">Spark</div>
+    <div id="tag"><div class="p" style="font-size:40px;color:#c9cdf0">The pump.fun trading bot that <span style="color:#3dffb5">learns</span>.</div></div></div>
+
+  <!-- 2 watch -->
+  <div class="scene" id="watch">
+    <div style="position:absolute;left:130px;top:250px;width:640px">
+      <div class="kicker">01 · Watch</div>
+      <div class="h" style="margin-top:28px">Every launch.<br><span class="g">Every trade.</span></div>
+      <div class="p" style="margin-top:34px">Reads pump.fun straight from the chain, the second it happens.</div>
+      <div style="display:flex;gap:70px;margin-top:60px">
+        <div><div class="counter" id="c1">0</div><div class="clabel">launches seen</div></div>
+        <div><div class="counter" id="c2" style="color:#3dffb5">0</div><div class="clabel">trades read</div></div></div>
+    </div>
+    <div class="panel" id="feed" style="position:absolute;left:900px;top:170px;width:880px;height:740px;overflow:hidden">
+      <div style="height:70px;display:flex;align-items:center;gap:12px;padding:0 30px;border-bottom:1px solid rgba(255,255,255,.08);font:700 18px JBM;color:#8d91b3;letter-spacing:.14em">
+        <span style="width:12px;height:12px;border-radius:50%;background:#3dffb5;box-shadow:0 0 14px #3dffb5" id="live"></span>LIVE · PUMP.FUN</div>
+      <div id="rows" style="position:absolute;left:0;right:0;top:70px;bottom:0"></div></div>
+  </div>
+
+  <!-- 3 skip rugs -->
+  <div class="scene" id="rugs">
+    <div style="position:absolute;left:130px;top:280px;width:640px">
+      <div class="kicker" style="color:#ff5c7a">02 · Protect</div>
+      <div class="h" style="margin-top:28px">Skips the<br><span style="color:#ff5c7a;text-shadow:0 0 40px rgba(255,92,122,.5)">rugs.</span></div>
+      <div class="p" style="margin-top:34px">Bundles, dumping devs, serial ruggers, fake socials. Caught before a cent goes in.</div>
+    </div>
+    <div class="panel" style="position:absolute;left:900px;top:190px;width:880px;height:700px">
+      <div style="height:110px;display:flex;align-items:center;gap:22px;padding:0 30px;border-bottom:1px solid rgba(255,255,255,.08)">
+        <div style="width:62px;height:62px;border-radius:18px;background:linear-gradient(135deg,#ffcf5c,#ff5ea8)"></div>
+        <div><div style="font-size:36px;font-weight:800">$MOONCAT</div><div class="mono" style="font-size:20px;color:#8d91b3">41s old · curve 18% · 63 buyers</div></div></div>
+      <div id="checks"></div>
+      <div id="stamp">SKIPPED</div>
+    </div>
+  </div>
+
+  <!-- 4 learn -->
+  <div class="scene" id="learn">
+    <div style="position:absolute;left:130px;top:250px;width:680px">
+      <div class="kicker" style="color:#a78bfa">03 · Learn</div>
+      <div class="h" style="margin-top:28px">Gets smarter<br><span class="g">every launch.</span></div>
+      <div class="p" style="margin-top:34px">Hundreds of practice trades an hour train its model. Real money waits until it proves itself.</div>
+    </div>
+    <div class="panel" style="position:absolute;left:900px;top:170px;width:880px;height:740px;padding:44px">
+      <div class="clabel" style="margin:0">practice trades learned</div>
+      <div class="counter" id="c3" style="font-size:92px;margin-top:6px">0</div>
+      <div style="display:flex;justify-content:space-between;font-size:22px;color:#8d91b3;margin-top:28px;font-weight:600"><span>Learning</span><span class="mono" id="l1">0/200</span></div>
+      <div class="mbar" style="margin-top:10px"><b id="m1" style="width:0"></b></div>
+      <div style="display:flex;justify-content:space-between;font-size:22px;color:#8d91b3;margin-top:24px;font-weight:600"><span>Proof (picks scored blind)</span><span class="mono" id="l2">0/30</span></div>
+      <div class="mbar p" style="margin-top:10px"><b id="m2" style="width:0"></b></div>
+      <div class="clabel" style="margin-top:40px">what it learned to trust</div>
+      <div id="sigs" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+  <!-- 5 memory -->
+  <div class="scene" id="mem">
+    <div style="position:absolute;left:0;right:0;top:170px;text-align:center">
+      <div class="kicker" style="color:#ff5ea8">04 · Remember</div>
+      <div class="h" style="margin-top:28px">It never forgets<br><span class="g">a face.</span></div>
+      <div class="p" style="margin-top:26px">Rugger devs, bundle wallets, smart money and what's trending, remembered across restarts.</div>
+    </div>
+    <div id="chips"></div>
+  </div>
+
+  <!-- 6 dashboard -->
+  <div class="scene" id="dashs">
+    <div style="position:absolute;left:0;right:0;top:78px;text-align:center">
+      <div class="kicker" style="color:#6ea8ff">05 · Command center</div>
+      <div class="h" style="margin-top:22px;font-size:80px">Watch it think, live.</div>
+    </div>
+    <div id="dashwrap"><div id="dash"></div><div class="demo">DEMO DATA</div></div>
+  </div>
+
+  <!-- 7 end -->
+  <div class="scene" id="end">
+    <div class="w">Spark</div>
+    <div class="t">Trade the trenches <span style="background:linear-gradient(90deg,#3dffb5,#6ea8ff);-webkit-background-clip:text;background-clip:text;color:transparent">smarter.</span></div>
+    <div class="caps"><span class="cap">Live on-chain feed</span><span class="cap">Rug filters</span><span class="cap">Self-learning</span><span class="cap">Wallet memory</span></div>
+    <div class="d">Memecoins are extremely risky. Spark does not guarantee profits. Not financial advice.</div>
+  </div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+const clamp=(v,a=0,b=1)=>Math.max(a,Math.min(b,v));
+const ease=x=>1-Math.pow(1-clamp(x),3);                    // easeOutCubic
+const inout=x=>{x=clamp(x);return x<.5?4*x*x*x:1-Math.pow(-2*x+2,3)/2};
+const back=x=>{x=clamp(x);const c=1.6;return 1+(c+1)*Math.pow(x-1,3)+c*Math.pow(x-1,2)};
+function rnd(i){const s=Math.sin(i*127.1+311.7)*43758.5453;return s-Math.floor(s)}
+const fmt=n=>Math.round(n).toLocaleString("en-US");
+
+// scene windows [start, end]; crossfade 0.5s
+const SC={intro:[0,4.2],watch:[3.8,10.4],rugs:[10,16.6],learn:[16.2,22.6],mem:[22.2,27.6],dashs:[27.2,32.8],end:[32.4,37]};
+function vis(id,t){const [a,b]=SC[id];if(t<a||t>b)return 0;return Math.min(clamp((t-a)/.5),id==="end"?1:clamp((b-t)/.5))}
+
+// build static content
+const SYMS=["PEPECAT","AIDOG","FROGGY","MOONCAT","GROKBOI","BONKER","WAGMI","SNEK","CHAD","GIGA","TURBO","BRRR","SOLLY","MEOWX","DEGEN","HONK"];
+const rows=$("#rows");
+for(let i=0;i<14;i++){const r=document.createElement("div");r.className="row";
+  const prog=Math.round(4+rnd(i)*70), net=(rnd(i+50)*14-3).toFixed(1);
+  r.innerHTML=`<span class="sym">$${SYMS[i%SYMS.length]}</span><span class="age">${Math.round(5+rnd(i+9)*80)}s</span>
+    <span class="bar"><b style="width:${prog}%"></b></span><span class="pc">${prog}%</span>
+    <span class="net" style="color:${net>=0?"#3dffb5":"#ff5c7a"}">${net>=0?"+":""}${net} SOL</span>`;
+  rows.appendChild(r)}
+const CHECKS=[["Creator still holding","ok","2.1%"],["Top holder","ok","3.4%"],["Serial launcher","ok","first launch"],
+  ["Socials","ok","X + Telegram"],["Bundled supply","bad","34%"],["Known rug wallets","bad","4 in early"]];
+$("#checks").innerHTML=CHECKS.map(c=>`<div class="check"><span class="ic ${c[1]}">${c[1]==="ok"?"✓":"✕"}</span>${c[0]}<span class="v">${c[2]}</span></div>`).join("");
+const SIGS=[["Net inflow",.72],["Smart wallets",.55],["Holder spread",.38],["Bundle size",-.8],["Sniper share",-.6]];
+$("#sigs").innerHTML=SIGS.map(s=>`<div class="sig"><span class="nm">${s[0]}</span><span class="track"><span class="b"></span></span></div>`).join("");
+const CHIPS=[["Rugger devs","bad",390,610],["Rug wallets","bad",1540,610],["Smart money","good",720,690],["Bundlers","bad",1210,700],
+  ["#cat","hot",560,830],["#ai","hot",1380,830],["#frog","hot",960,880],["Runners","good",1640,800],["Copycats","bad",290,790]];
+$("#chips").innerHTML=CHIPS.map(c=>`<div class="chip ${c[1]}">${c[0]}</div>`).join("");
+const pts=$("#pts");for(let i=0;i<28;i++){const d=document.createElement("div");d.className="pt";pts.appendChild(d)}
+
+function render(t){
+  // backdrop drifts slowly
+  $("#b1").style.transform=`translate(${-300+Math.sin(t*.21)*120}px,${-420+Math.cos(t*.17)*80}px)`;$("#b1").style.opacity=.13;
+  $("#b2").style.transform=`translate(${1350+Math.cos(t*.19)*120}px,${-380+Math.sin(t*.23)*90}px)`;$("#b2").style.opacity=.26;
+  $("#b3").style.transform=`translate(${700+Math.sin(t*.15)*160}px,${720+Math.cos(t*.2)*70}px)`;$("#b3").style.opacity=.12;
+  for(const id in SC){const v=vis(id,t);const el=$("#"+id);el.style.opacity=v;el.style.display=v>0?"block":"none";
+    if(id!=="intro"&&id!=="end")el.style.transform=`translateY(${(1-ease(clamp((t-SC[id][0])/.8)))*30}px)`}
+
+  // 1 intro: a spark streaks in, bursts, the wordmark ignites
+  {const cx=960,cy=505,k=inout(t/1.0),f=$("#flash");
+   const x=150+(cx-150)*k, y=930-(930-cy)*k-Math.sin(k*Math.PI)*120;
+   const burst=clamp((t-1.0)/.45);
+   f.style.left=(x-12)+"px";f.style.top=(y-12)+"px";
+   f.style.opacity=t<1?1:1-burst;f.style.transform=`scale(${t<1?.6+k*.6:1.2+burst*6})`;
+   [...pts.children].forEach((d,i)=>{const ang=i/28*Math.PI*2+rnd(i)*.3, dist=ease(clamp((t-1)/1.3))*(180+rnd(i+3)*360);
+     d.style.left=(cx+Math.cos(ang)*dist)+"px";d.style.top=(cy+Math.sin(ang)*dist*.6)+"px";
+     d.style.opacity=t<1?0:clamp(1-(t-1)/1.4);d.style.background=i%3?"#3dffb5":(i%2?"#a78bfa":"#ff5ea8")});
+   const w=$("#word"),wk=ease((t-1.02)/.7);
+   w.style.opacity=wk;w.style.transform=`scale(${.9+.1*wk})`;w.style.letterSpacing=(-.02-.04*wk)+"em";
+   w.style.filter=`drop-shadow(0 0 ${40*(1-wk)+18}px rgba(61,255,181,${.55-.3*wk}))`;
+   const tg=$("#tag"),tk=ease((t-1.8)/.7);tg.style.opacity=tk;tg.style.transform=`translateY(${(1-tk)*20}px)`;
+   const out=clamp((t-3.7)/.5);$("#intro").style.transform=`scale(${1+out*.06})`}
+
+  // 2 watch: live feed scrolls, counters climb
+  {const u=t-SC.watch[0];
+   $("#c1").textContent=fmt(ease((u-.4)/5.5)*1284);$("#c2").textContent=fmt(ease((u-.4)/5.5)*48920);
+   $("#feed").style.transform=`translateX(${(1-ease(u/.9))*90}px)`;
+   $("#live").style.opacity=.45+.55*Math.abs(Math.sin(u*3));
+   const n=rows.children.length,H=72,sp=78;
+   [...rows.children].forEach((r,i)=>{let y=((i*H+u*sp)%(n*H))-H;r.style.top=y+"px";
+     r.style.opacity=clamp((y+H)/H)*clamp((670-y)/90);
+     r.style.background=y<H*.9&&y>-H?`rgba(61,255,181,${.10*clamp(1-(y+H)/(H*1.9))})`:"transparent"})}
+
+  // 3 rugs: checks tick in, two fail, SKIPPED stamp
+  {const u=t-SC.rugs[0];
+   [...$("#checks").children].forEach((c,i)=>{const k=ease((u-.7-i*.5)/.45);c.style.opacity=k;c.style.transform=`translateX(${(1-k)*30}px)`;
+     c.style.background=CHECKS[i][1]==="bad"&&k>0?`rgba(255,92,122,${.09*k})`:"transparent"});
+   const st=$("#stamp"),sk=clamp((u-4.0)/.38);
+   st.style.left="250px";st.style.top="560px";st.style.opacity=sk>0?1:0;
+   st.style.transform=`rotate(-11deg) scale(${sk<1?2.4-1.4*back(sk):1})`;
+   const shake=u>4.3&&u<4.6?Math.sin(u*90)*6*(1-(u-4.3)/.3):0;
+   st.parentElement.style.transform=`translateX(${shake}px)`}
+
+  // 4 learn: practice trades count up, learning and proof fill, signals grow
+  {const u=t-SC.learn[0],n=ease((u-.3)/4.3)*1284;
+   $("#c3").textContent=fmt(n);
+   $("#l1").textContent=Math.min(200,Math.round(n))+"/200";$("#m1").style.width=Math.min(100,n/2)+"%";
+   const picks=Math.round(ease((u-2.0)/2.6)*30);$("#l2").textContent=picks+"/30";$("#m2").style.width=(picks/30*100)+"%";
+   [...$("#sigs").children].forEach((d,i)=>{const w=SIGS[i][1],k=ease((u-1.6-i*.28)/.7),b=d.querySelector(".b"),pc=Math.abs(w)*50*k;
+     b.style.width=pc+"%";b.style.left=(w>0?50:50-pc)+"%";
+     b.style.background=w>0?"linear-gradient(90deg,#3dffb5,#6ea8ff)":"linear-gradient(90deg,#ff5ea8,#ff5c7a)";
+     b.style.boxShadow=w>0?"0 0 14px rgba(61,255,181,.5)":"0 0 14px rgba(255,92,122,.5)"})}
+
+  // 5 memory: chips pop in and float
+  {const u=t-SC.mem[0];
+   [...$("#chips").children].forEach((c,i)=>{const k=clamp((u-.5-i*.2)/.5);
+     c.style.left=CHIPS[i][2]+"px";c.style.top=(CHIPS[i][3]+Math.sin(t*1.3+i)*7)+"px";
+     c.style.opacity=k;c.style.transform=`translate(-50%,-50%) scale(${k>0?back(k):0})`})}
+
+  // 6 dashboard: tilts up from the floor, then a slow push in
+  {const u=t-SC.dashs[0],k=ease(u/2.0),z=1+clamp((u-2)/3.6)*.05;
+   $("#dashwrap").style.transform=`translate(-50%,-50%) perspective(2200px) rotateX(${(1-k)*28}deg) translateY(${(1-k)*160}px) scale(${(.86+.14*k)*z})`;
+   $("#dashwrap").style.opacity=k}
+
+  // 7 end card
+  {const u=t-SC.end[0],e=$("#end");
+   const wk=ease((u-.1)/.8);e.querySelector(".w").style.opacity=wk;e.querySelector(".w").style.transform=`scale(${.94+.06*wk})`;
+   e.querySelector(".w").style.filter=`drop-shadow(0 0 ${30*(1-wk)+16}px rgba(61,255,181,.35))`;
+   const tk=ease((u-.6)/.7);e.querySelector(".t").style.opacity=tk;e.querySelector(".t").style.transform=`translateY(${(1-tk)*18}px)`;
+   [...e.querySelectorAll(".cap")].forEach((c,i)=>{const k=ease((u-1.0-i*.12)/.5);c.style.opacity=k;c.style.transform=`translateY(${(1-k)*14}px)`});
+   e.querySelector(".d").style.opacity=ease((u-1.6)/.7)}
+}
+window.render=render; render(0);
+</script></body></html>

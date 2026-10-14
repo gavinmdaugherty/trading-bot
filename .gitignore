@@ -6,3 +6,6 @@ __pycache__/
 .env
 learn.json
 memory.json
+
+# rendered videos (re-render with: python media/trailer/cap.py video media/spark-trailer.mp4)
+media/*.mp4
