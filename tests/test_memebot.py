@@ -360,6 +360,84 @@ class Learning(unittest.TestCase):
         self.assertFalse(L.proven())
 
 
+class SparkMemory(unittest.TestCase):
+    def launch(self, w, mint, dev, early):
+        """A launch that pumps on early buys, then the early wallets dump it."""
+        w.handle(dict(txType="create", mint=mint, traderPublicKey=dev, symbol=mint, initialBuy=0,
+                      vSolInBondingCurve=30.0, vTokensInBondingCurve=m.PUMP_V_TOK0))
+        vt = m.PUMP_V_TOK0
+        for i, b in enumerate(early + [f"x{mint}{i}" for i in range(10)]):
+            vt -= 20e6
+            w.handle(dict(txType="buy", mint=mint, traderPublicKey=b, solAmount=1, tokenAmount=20e6,
+                          newTokenBalance=20e6, vTokensInBondingCurve=vt))
+        return vt
+
+    def test_rugs_are_remembered_and_flagged_next_time(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "memory.json")
+            now = [0.0]
+            w = m.PumpWatcher(m.CFG, clock=lambda: now[0])
+            w.memory = m.Memory(path)
+            bundle = ["B1", "B2", "B3"]
+            vt = self.launch(w, "R1", "DEV", bundle)
+            for b in bundle:                                   # the bundle dumps everything
+                vt += 20e6
+                w.handle(dict(txType="sell", mint="R1", traderPublicKey=b, solAmount=1, tokenAmount=20e6,
+                              newTokenBalance=0, vTokensInBondingCurve=vt))
+            for i in range(10):
+                vt += 20e6
+                w.handle(dict(txType="sell", mint="R1", traderPublicKey=f"xR1{i}", solAmount=1,
+                              tokenAmount=20e6, newTokenBalance=0, vTokensInBondingCurve=vt))
+            self.assertEqual(m.Memory.judge(w.tokens["R1"]), "rug")
+            w._drop("R1")
+            self.assertEqual(w.memory.creator("DEV"), (1, 1, 0))
+            w.memory.save(force=True)
+            # after a restart, the same creator and the same bundle wallets launch again
+            w2 = m.PumpWatcher(m.CFG, clock=lambda: now[0])
+            w2.memory = m.Memory(path)
+            for b in bundle:
+                w2.memory.record("other", [b], "rug", 1.0)    # they have done it before, twice
+            self.launch(w2, "R2", "DEV", bundle)
+            q = w2.get("R2")
+            self.assertEqual(q["creator_rugs"], 1)
+            self.assertEqual(q["rugger_early"], 3)
+            eng = demo_engine()
+            self.assertEqual(eng._hard_curve_reason(eng.acfg["Spark"], dict(q, age=60, last_trade=eng.t)),
+                             "creator rugged before")
+
+    def test_graduation_is_a_win_and_smart_wallets_count(self):
+        w = m.PumpWatcher(m.CFG, clock=lambda: 0.0)
+        w.memory = m.Memory(None)
+        for n in range(2):
+            self.launch(w, f"G{n}", f"D{n}", ["SMART"])
+            w.handle(dict(mint=f"G{n}", txType="migrate"))
+        self.assertEqual(w.memory.outcomes["win"], 2)
+        self.launch(w, "G9", "D9", ["SMART"])
+        self.assertEqual(w.get("G9")["smart_early"], 1)
+
+    def test_learner_keeps_its_learning_when_features_are_added(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "learn.json")
+            L = m.Learner(path)
+            q = Learning.q(creator_wins=1, creator_rugs=0, smart_early=2, rugger_early=0)
+            for _ in range(50):
+                L.learn(m.Learner.features(q), 0.2, False)
+            L.save()
+            with open(path) as f:
+                data = json.load(f)
+            k = 20                                            # pretend it was saved before memory existed
+            data["features"] = data["features"][:k]
+            for key in ("w", "mean", "m2"):
+                data[key] = data[key][:k]
+            with open(path, "w") as f:
+                json.dump(data, f)
+            L2 = m.Learner(path)
+            self.assertEqual(L2.n, 50)
+            self.assertEqual(len(L2.w), len(m.Learner.FEATURES))
+
+
 class FakeLive:
     def __init__(self):
         self.calls = []

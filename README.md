@@ -60,6 +60,13 @@ Spark trains a small model on what actually happens to pump.fun launches:
 3. **Trading on it:** after 200 shadow trades the model replaces Spark's hand-set thresholds, and Spark buys only when it expects at least +3%.
 4. **Real money needs proof:** Spark LIVE waits until the model's own picks, scored before their results were known, have made money on average over at least 30 trades. A model that keeps losing is never cleared to trade.
 
+**Memory.** Spark judges every launch it followed when the launch ends:
+- **ran:** it graduated, or got at least halfway up the curve
+- **rugged:** the creator or the first-seconds wallets sold out, and it gave back most of its gain since launch
+- **dud:** anything else
+
+Each verdict is credited to the creator and to every wallet that bought in the first 20 seconds. From that, Spark skips creators who rugged before and launches where several known rug wallets bought early. Wallets that keep getting into runners early count as "smart money", and the model learns how much weight to give them. The memory is saved in `memory.json` (kept out of git) and builds up across restarts.
+
 The hard rug checks always apply. What Spark has learned is saved in `learn.json` (kept out of git), so it survives restarts. Delete that file to start learning from scratch.
 
 ## Better fills and exits

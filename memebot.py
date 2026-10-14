@@ -95,6 +95,7 @@ CFG = dict(
     pump_writeoff_secs=1800,     # no price at all for this long: close at the last known value
     grad_window_min=120,         # a graduation counts as "fresh" for this long
     learn_file="learn.json",     # what Spark has learned, kept across restarts
+    memory_file="memory.json",   # creators and wallets Spark remembers (ruggers, smart money)
     learn_min=200,               # shadow trades to learn from before the model takes over
     learn_proof=30,              # out-of-sample picks needed before real money follows the model
     learn_edge=0.03,             # buy only when the model expects at least +3% after costs
@@ -490,6 +491,117 @@ class WebSocket:
 # --------------------------------------------------------------------------- #
 # pump.fun watcher
 # --------------------------------------------------------------------------- #
+class Memory:
+    """What Spark remembers about pump.fun wallets, across restarts.
+
+    Each followed launch that drew real interest is judged when it ends (graduated or ran
+    = win, creator sold and it collapsed = rug, otherwise dud). The verdict is credited to its
+    creator and to every wallet that bought in its first seconds. Over time this separates
+    serial ruggers and their bundle wallets from wallets that keep getting into runners early.
+    """
+
+    def __init__(self, path=None, max_wallets=100_000, max_creators=50_000):
+        self.path, self.max_wallets, self.max_creators = path, max_wallets, max_creators
+        self.lock = threading.Lock()
+        self.creators, self.wallets = {}, {}   # address -> [launches, rugs, wins, last seen]
+        self.outcomes = {"win": 0, "rug": 0, "dud": 0}
+        self.dirty, self.saved_t = False, 0.0
+        if path and os.path.exists(path):
+            try:
+                with open(path) as f:
+                    d = json.load(f)
+                self.creators, self.wallets = d["creators"], d["wallets"]
+                self.outcomes.update(d.get("outcomes", {}))
+            except Exception:
+                pass
+
+    @staticmethod
+    def judge(t):
+        """win / rug / dud for a launch that is no longer followed."""
+        if t["migrated"] or t["complete"]:
+            return "win"
+        k = PUMP_V_SOL0 * PUMP_V_TOK0
+        peak_prog = curve_progress(math.sqrt(k / t["ath"])) if t["ath"] > 0 else 0.0
+        if peak_prog >= 50:
+            return "win"
+        price = t["vsol"] / t["vtok"] if t["vtok"] else 0.0
+        bought = sum(t["early"].values())
+        kept = sum(min(t["holders"].get(w, 0.0), b) for w, b in t["early"].items())
+        early_dumped = bought > 0 and kept < 0.3 * bought   # the first-seconds wallets sold out
+        # on the curve a full dump only returns the price to where it started, so judge how much
+        # of the gain since launch was given back, not the fall from the peak
+        p0 = PUMP_V_SOL0 / PUMP_V_TOK0
+        kept_gain = (price - p0) / (t["ath"] - p0) if t["ath"] > p0 * 1.05 else 1.0
+        if (t["dev_sold"] or early_dumped) and kept_gain <= 0.3:
+            return "rug"
+        return "dud"
+
+    def record(self, creator, early, outcome, now):
+        with self.lock:
+            for book, addrs in ((self.creators, [creator] if creator else []), (self.wallets, early)):
+                for a in addrs:
+                    e = book.setdefault(a, [0, 0, 0, now])
+                    e[0] += 1
+                    e[1] += outcome == "rug"
+                    e[2] += outcome == "win"
+                    e[3] = now
+            self.outcomes[outcome] = self.outcomes.get(outcome, 0) + 1
+            self.dirty = True
+            for book, cap in ((self.creators, self.max_creators), (self.wallets, self.max_wallets)):
+                if len(book) > cap:  # forget the least recently seen tenth
+                    for a in sorted(book, key=lambda a: book[a][3])[:len(book) - int(cap * 0.9)]:
+                        del book[a]
+
+    def creator(self, addr):
+        with self.lock:
+            e = self.creators.get(addr)
+            return (e[0], e[1], e[2]) if e else (0, 0, 0)
+
+    @staticmethod
+    def _smart(e):
+        return e[2] >= 2 and e[2] >= 0.5 * e[0]
+
+    @staticmethod
+    def _rugger(e):
+        return e[1] >= 2 and e[1] >= 0.5 * e[0]
+
+    def crowd(self, addrs):
+        """(smart wallets, rug-linked wallets) among these early buyers."""
+        smart = rug = 0
+        with self.lock:
+            for a in addrs:
+                e = self.wallets.get(a)
+                if e:
+                    smart += self._smart(e)
+                    rug += self._rugger(e)
+        return smart, rug
+
+    def save(self, force=False):
+        if not self.path or not self.dirty or (not force and time.time() - self.saved_t < 300):
+            return
+        with self.lock:
+            data = json.dumps(dict(creators=self.creators, wallets=self.wallets, outcomes=self.outcomes))
+            self.dirty, self.saved_t = False, time.time()
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(data)
+        os.replace(tmp, self.path)
+
+    def summary(self):
+        now = time.time()
+        if getattr(self, "_sum", None) and now - self._sum[0] < 30:
+            return self._sum[1]
+        with self.lock:
+            out = dict(creators=len(self.creators), wallets=len(self.wallets),
+                       ruggers=sum(1 for e in self.creators.values() if e[1]),
+                       rug_wallets=sum(1 for e in self.wallets.values() if self._rugger(e)),
+                       smart=sum(1 for e in self.wallets.values() if self._smart(e)),
+                       judged=sum(self.outcomes.values()), outcomes=dict(self.outcomes))
+        self._sum = (now, out)
+        return out
+
+
+
 class PumpWatcher:
     """Follows pump.fun in real time through PumpPortal's free data websocket.
 
@@ -523,6 +635,7 @@ class PumpWatcher:
         self.recent_q = deque()
         self.rpc = None
         self.want_rpc = False
+        self.memory = None
 
     # ---- feed ---- #
     def start(self):
@@ -785,6 +898,7 @@ class PumpWatcher:
             if t["migrated"]:
                 return
             t["migrated"] = True
+            self._remember(t, "win")
             price_sol = t["vsol"] / t["vtok"] if t["vtok"] else 0.0
             self.migrations.append(dict(mint=mint, symbol=t["symbol"], price_sol=price_sol,
                                         vsol=t["vsol"]))
@@ -826,6 +940,11 @@ class PumpWatcher:
         copycat = any(o != t["mint"] and o in self.tokens and self.tokens[o]["created"] < t["created"]
                       for o in self.by_symbol.get(sym, ()))
         meta = t["meta"] or {}
+        if self.memory:
+            _, c_rugs, c_wins = self.memory.creator(t["creator"])
+            smart, rugw = self.memory.crowd(t["early"])
+        else:
+            c_rugs = c_wins = smart = rugw = 0
         usd = self.sol_usd
         q = dict(chain="solana", addr=t["mint"], symbol=t["symbol"], name=t["name"], venue="curve",
                  price=price_sol * usd, price_sol=price_sol, vsol=t["vsol"], vtok=t["vtok"],
@@ -841,13 +960,14 @@ class PumpWatcher:
                  same_amt=(max(sizes.values()) / b) if b >= 6 and sizes else 0.0,
                  whale=(big / bsol) if bsol > 0 else 0.0, copycat=copycat,
                  creator_launches=t["creator_launches"], meta_state=t["meta_state"],
+                 creator_rugs=c_rugs, creator_wins=c_wins, smart_early=smart, rugger_early=rugw,
                  socials=meta.get("socials", 0), meta_failed=bool(meta.get("failed")),
                  dup_social=t["dup_social"],
                  ath_drop=(price_sol / t["ath"] - 1) * 100 if t["ath"] else 0.0)
         q["score"] = (q["net_sol_5m"] + 0.25 * q["uniq_5m"] - (25 if q["dev_sold"] else 0)
                       - 2 * max(0.0, top - 8) - 0.5 * max(0.0, -q["ath_drop"] - 20)
                       - 1.5 * max(0.0, bundle - 5) - (10 if copycat or q["dup_social"] else 0)
-                      - (5 if q["creator_launches"] else 0))
+                      - (5 if q["creator_launches"] else 0) - 15 * min(c_rugs, 1) - 3 * rugw + 2 * smart)
         return q
 
     def get(self, mint):
@@ -882,8 +1002,14 @@ class PumpWatcher:
             if mint not in self.tokens:
                 self._new(mint, self.clock(), symbol=symbol)
 
+    def _remember(self, t, outcome=None):
+        if self.memory and t["from_create"] and not t.get("remembered") and len(t["buyers"]) >= 10:
+            t["remembered"] = True
+            self.memory.record(t["creator"], list(t["early"]), outcome or Memory.judge(t), self.clock())
+
     def _drop(self, mint):
         t = self.tokens.pop(mint)
+        self._remember(t)
         self.unsub_q.add(mint)
         same = self.by_symbol.get(t["symbol"].lower())
         if same:
@@ -1095,6 +1221,7 @@ class DemoPump(PumpWatcher):
         self.connected = True
         self.wallets = [f"Wallet{i:05d}" for i in range(4000)]
         self.ruggers = [f"Rugger{i:03d}" for i in range(25)]
+        self.bundlers = [f"Bundler{i:03d}" for i in range(80)]
 
     def start(self):
         pass
@@ -1146,14 +1273,18 @@ class DemoPump(PumpWatcher):
         sym = f"PF{r.randrange(1, self.n)}" if self.n > 5 and r.random() < 0.08 else f"PF{self.n}"
         self._msg(mint, s, txType="create", traderPublicKey=dev, symbol=sym,
                   name=f"Pump demo {self.n}", initialBuy=init, solAmount=init_sol, uri="demo://meta")
-        if bundled:  # the bundle buys in the launch block, before anyone can subscribe: no messages
+        if bundled:  # the bundle buys in the launch block; half the time they are not seen (as on PumpPortal)
+            seen = r.random() < 0.5
             for _ in range(r.randint(4, 10)):
-                w, sol = r.choice(self.wallets), r.uniform(0.5, 2.0)
+                w, sol = r.choice(self.bundlers), r.uniform(0.5, 2.0)
                 out = curve_buy(sol * 0.99, s["vsol"], s["vtok"])
                 s["vsol"] += sol
                 s["vtok"] -= out
                 s["bal"][w] = s["bal"].get(w, 0.0) + out
                 s["bundle"].append(w)
+                if seen:
+                    self._msg(mint, s, txType="buy", traderPublicKey=w, solAmount=sol, tokenAmount=out,
+                              newTokenBalance=s["bal"][w])
 
     def _step(self, mint, s, now):
         r = self.rng
@@ -1712,7 +1843,8 @@ class Learner:
     """
     FEATURES = ("age", "prog", "real_sol", "buyers", "uniq_5m", "bs_ratio", "net_sol", "buys_60s",
                 "holders", "top_pct", "top10_pct", "bundle_pct", "sniper_pct", "dev_pct", "whale",
-                "same_amt", "ath_drop", "socials", "mcap", "churn")
+                "same_amt", "ath_drop", "socials", "mcap", "churn",
+                "creator_wins", "creator_rugs", "smart_early", "rugger_early")
 
     def __init__(self, path=None, min_n=200, proof_n=30):
         self.path, self.min_n, self.proof_n = path, min_n, proof_n
@@ -1727,9 +1859,12 @@ class Learner:
             try:
                 with open(path) as f:
                     d = json.load(f)
-                if d.get("features") == list(self.FEATURES):
+                old = d.get("features") or []
+                if old == list(self.FEATURES[:len(old)]):  # same features, or new ones added at the end
                     for key in ("w", "b", "n", "mean", "m2", "wins", "win_sum", "loss_sum", "picks", "recent"):
                         setattr(self, key, d[key])
+                    pad = k - len(old)
+                    self.w, self.mean, self.m2 = self.w + [0.0] * pad, self.mean + [0.0] * pad, self.m2 + [0.0] * pad
             except Exception:
                 pass
 
@@ -1752,7 +1887,9 @@ class Learner:
                 math.log1p(q["holders"]), q["top_pct"] / 10, q["top10_pct"] / 50, q["bundle_pct"] / 20,
                 q["sniper_pct"] / 30, q["dev_pct"] / 10, q["whale"], q["same_amt"], q["ath_drop"] / 50,
                 1.0 if q["socials"] else 0.0, math.log1p(q["mcap"] / 1000),
-                q["buys_5m"] / max(q["uniq_5m"], 1) / 5]
+                q["buys_5m"] / max(q["uniq_5m"], 1) / 5,
+                min(q.get("creator_wins", 0), 5) / 5, min(q.get("creator_rugs", 0), 5) / 5,
+                math.log1p(q.get("smart_early", 0)), math.log1p(q.get("rugger_early", 0))]
 
     def _z(self, x):
         out = []
@@ -1855,6 +1992,10 @@ class Engine:
         self.fomo_t, self.fomo_board, self.fomo_err = -1e12, [], ""
         self.curve_buys = {}
         self.learner, self.shadows, self.shadowed, self.picked_mints = None, {}, {}, set()
+        self.memory = None
+        if pump:
+            self.memory = Memory(None if demo else cfg["memory_file"])
+            pump.memory = self.memory
         if pump and any(a.get("learn") for a in self.acfg.values()):
             self.learner = Learner(None if demo else cfg["learn_file"], cfg["learn_min"], cfg["learn_proof"])
         self.dex_err, self.dex_ok_t = "", None
@@ -1923,6 +2064,11 @@ class Engine:
                 self.learner.save()
             except Exception as e:
                 self.emit("WARN", f"could not save learn.json: {str(e)[:80]}")
+        if self.memory:
+            try:
+                self.memory.save()
+            except Exception as e:
+                self.emit("WARN", f"could not save memory.json: {str(e)[:80]}")
         tmp = self.cfg["state_file"] + ".tmp"
         with open(tmp, "w") as f:
             json.dump(self.state, f)
@@ -2117,6 +2263,10 @@ class Engine:
             return "creator holds too much"
         if q["creator_launches"] > a.get("max_creator_launches", 99):
             return "serial launcher"
+        if q.get("creator_rugs", 0) >= 1:
+            return "creator rugged before"
+        if q.get("rugger_early", 0) >= a.get("max_rug_wallets", 3):
+            return "known rug wallets bought early"
         if q["bundle_pct"] > a.get("max_bundle_pct", 100):
             return "bundled launch"
         if q["sniper_pct"] > a.get("max_sniper_pct", 100):
@@ -2849,6 +2999,7 @@ class Engine:
                             net=q["net_sol_5m"], top=q["top_pct"], dev_sold=q["dev_sold"],
                             bundle=q["bundle_pct"], snipers=q["sniper_pct"], copycat=q["copycat"],
                             serial=q["creator_launches"] > 0, dup_social=q["dup_social"],
+                            rugger=q["creator_rugs"] > 0, rug_wallets=q["rugger_early"], smart=q["smart_early"],
                             socials=q["socials"] if q["meta_state"] == 2 else None,
                             held=any(tkey("solana", q["addr"]) in st["positions"]
                                      for st in S["agents"].values()))
@@ -2878,6 +3029,7 @@ class Engine:
                 log=S["log"][-80:][::-1], equity=series, pump=pump, fomo=fomo,
                 real_only=bool(agents) and all(a["live"] for a in agents),
                 learn=dict(self.learner.summary(), open=len(self.shadows)) if self.learner else None,
+                memory=self.memory.summary() if self.memory else None,
                 fomo_off=self.fomo is None, dex=dict(error=self.dex_err, ok_t=self.dex_ok_t), phase=self.phase, phase_t=self.phase_t,
                 next_at=self.next_at, updated=time.time(), poll=self.cfg["poll_seconds"])
 
@@ -3077,6 +3229,10 @@ function drawChart(series){
 }
 
 let demo_mode=false;
+function memTxt(M){
+  return `<br><span class="t">Memory</span> ${M.judged} launches judged (${M.outcomes.win||0} ran, ${M.outcomes.rug||0} rugged): `+
+    `${M.ruggers} rugger devs, ${M.rug_wallets} rug wallets, ${M.smart} smart wallets remembered`;
+}
 function learnTxt(L,live){
   const pc=v=>v==null?"-":(v>=0?"+":"")+(v*100).toFixed(1)+"%";
   const base=`${L.n} shadow trades learned, ${L.open} following now`+(L.win_rate==null?"":`, recent win rate ${Math.round(L.win_rate*100)}%, avg ${pc(L.avg_ret)}`);
@@ -3096,7 +3252,8 @@ function renderPump(p){
   if(!p.hot.length){setHTML("#pump",`<div class="empty">${p.connected?"Waiting for launches with real buying...":"Connecting to PumpPortal... "+esc(p.error||"")}</div>`);return}
   const flags=q=>[q.held?'<span class="badge b-mine">held</span>':"",q.dev_sold?'<span class="badge b-bad">dev sold</span>':"",
     q.bundle>8?`<span class="badge b-bad">bundle ${q.bundle.toFixed(0)}%</span>`:"",q.serial?'<span class="badge b-bad">serial dev</span>':"",
-    q.dup_social?'<span class="badge b-bad">reused socials</span>':"",q.copycat?'<span class="badge b-warn">copycat</span>':"",
+    q.dup_social?'<span class="badge b-bad">reused socials</span>':"",q.rugger?'<span class="badge b-bad">rugger dev</span>':"",
+    q.rug_wallets>=2?`<span class="badge b-bad">${q.rug_wallets} rug wallets</span>`:"",q.smart?`<span class="badge b-mine">${q.smart} smart wallet${q.smart>1?"s":""}</span>`:"",q.copycat?'<span class="badge b-warn">copycat</span>':"",
     q.socials===0?'<span class="badge b-warn">no socials</span>':"",q.snipers>15?`<span class="badge b-warn">snipers ${q.snipers.toFixed(0)}%</span>`:"",
     q.top>8?`<span class="badge b-warn">top ${q.top.toFixed(0)}%</span>`:""].filter(Boolean).join(" ");
   setHTML("#pump",`<table><tr><th>Token</th><th>Age</th><th>MCap</th><th>Curve</th><th>Buyers</th><th>B/S 5m</th><th>Net 5m</th><th></th></tr>`+
@@ -3179,7 +3336,7 @@ function render(s){
       <div class="eq">${money(a.equity)}</div>
       <div class="meta"><span class="${cls(a.pnl)}">${smoney(a.pnl)} (${pct(a.pnl_pct)})</span><br>${a.wins}W / ${a.losses}L, ${a.open} open${a.capped?"<br>daily cap hit":""}</div>
       <div class="meter"><b style="width:${Math.max(4,a.equity/mx*100)}%;background:${COLORS[i%COLORS.length]}"></b></div>
-      ${a.learns&&s.learn?`<div class="learn">${learnTxt(s.learn,a.live)}</div>`:""}
+      ${a.learns&&s.learn?`<div class="learn">${learnTxt(s.learn,a.live)}${s.memory?memTxt(s.memory):""}</div>`:""}
       <div class="why">${why(a)}</div></div>`}).join(""));
 
   setHTML("#pos",s.positions.length?`<table><tr><th>Agent</th><th>Token</th><th>Feed</th><th>Size</th><th>Now</th><th>Move</th><th>Held</th></tr>`+
@@ -3465,6 +3622,8 @@ def main():
     except KeyboardInterrupt:
         with engine.lock:
             engine._save()
+            if engine.memory and not args.demo:
+                engine.memory.save(force=True)
         print("\nStopped. State saved. Open live positions stay in your wallet until the bot sells them.")
 
 
