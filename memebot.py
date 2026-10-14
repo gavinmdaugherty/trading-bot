@@ -96,6 +96,8 @@ CFG = dict(
     pump_writeoff_secs=1800,     # no price at all for this long: close at the last known value
     grad_window_min=120,         # a graduation counts as "fresh" for this long
     learn_file="learn.json",     # what Spark has learned, kept across restarts
+    report_file="spark-report.html",   # shareable practice record, rewritten every report_every_s
+    report_every_s=600,
     memory_file="memory.json",   # creators and wallets Spark remembers (ruggers, smart money)
     brain_model="claude-opus-5-5",   # the Claude model that reads launches (MEMEBOT_BRAIN_MODEL overrides)
     brain_per_hour=30,           # most launches rated per hour (MEMEBOT_BRAIN_PER_HOUR overrides)
@@ -2117,6 +2119,7 @@ class Learner:
         self.wins, self.win_sum, self.loss_sum = 0, 0.0, 0.0
         self.picks = []                             # net returns of out-of-sample picks (latest 200)
         self.exits = {}                             # stage -> style -> [weight, weighted sum of returns]
+        self.log = []                               # latest 300 practice trades, for the public report
         self.recent = []                            # (net return, won) of the latest 300 shadows
         if path and os.path.exists(path):
             try:
@@ -2127,6 +2130,7 @@ class Learner:
                     for key in ("w", "b", "n", "mean", "m2", "wins", "win_sum", "loss_sum", "picks", "recent"):
                         setattr(self, key, d[key])
                     self.exits = d.get("exits", {})
+                    self.log = d.get("log", [])
                     pad = k - len(old)
                     self.w, self.mean, self.m2 = self.w + [0.0] * pad, self.mean + [0.0] * pad, self.m2 + [0.0] * pad
             except Exception:
@@ -2136,7 +2140,7 @@ class Learner:
         if not self.path:
             return
         d = {key: getattr(self, key) for key in ("w", "b", "n", "mean", "m2", "wins", "win_sum",
-                                                 "loss_sum", "picks", "recent", "exits")}
+                                                 "loss_sum", "picks", "recent", "exits", "log")}
         d["features"] = list(self.FEATURES)
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
@@ -2192,8 +2196,10 @@ class Learner:
         n, avg = self.proof()
         return self.ready() and n >= self.proof_n and avg > 0
 
-    def learn(self, x, ret, picked):
+    def learn(self, x, ret, picked, meta=None):
         won = ret > 0
+        if meta is not None:
+            self.log = (self.log + [dict(meta, ret=round(ret, 4), picked=bool(picked))])[-300:]
         self.n += 1
         for i, v in enumerate(x):  # update the running mean / variance first
             d = v - self.mean[i]
@@ -2292,6 +2298,7 @@ class Engine:
         self.dex_err, self.dex_ok_t = "", None
         self.pump_warned = False
         self.fill_times = deque(maxlen=50)   # seconds from signal to a filled live buy
+        self.report_t = 0.0
         self.blocks = {}          # agent -> (tokens checked, {reason it didn't buy: count})
         self.phase, self.phase_t, self.next_at = "starting up", time.time(), None
         self.state = self._load() or self._fresh()
@@ -3015,7 +3022,7 @@ class Engine:
             if pick:  # proof counts each launch once, however often it is sampled
                 self.picked_mints.add(m)
             ref = q["price"] * (1 + cost)  # what a fill would cost, as for a real buy
-            self.shadows[(m, count)] = dict(mint=m, x=x, ref=ref, peak=ref, last=q["price"], opened=self.t,
+            self.shadows[(m, count)] = dict(mint=m, sym=q["symbol"], x=x, ref=ref, peak=ref, last=q["price"], opened=self.t,
                                             picked=pick, stage=curve_stage(q["prog"]),
                                             open_styles=list(EXIT_PROFILES))
             self.shadowed[m] = (self.t, count + 1)
@@ -3054,7 +3061,9 @@ class Engine:
                     sh["open_styles"].remove(style)
                     L.record_exit(sh.get("stage", "mid"), style, net)
                     if style == "base":  # the buy model learns from the agent's own exits
-                        L.learn(sh["x"], net, sh["picked"])
+                        L.learn(sh["x"], net, sh["picked"],
+                                meta=dict(t=round(time.time() if not self.demo else self.t), sym=sh.get("sym", "?"),
+                                          stage=sh.get("stage", "")))
             if ended or not sh["open_styles"]:
                 del self.shadows[key]
         if len(self.shadowed) > 20000:
@@ -3266,6 +3275,13 @@ class Engine:
             self.last_cycle = self.t
             self.phase, self.phase_t = "waiting for next scan", time.time()
             self._save()
+            if self.learner and not self.demo and time.time() - self.report_t > c["report_every_s"]:
+                self.report_t = time.time()
+                try:
+                    with open(c["report_file"], "w", encoding="utf-8") as f:
+                        f.write(build_report(self, c.get("report_live", False)))
+                except Exception as e:
+                    self.emit("WARN", f"could not write {c['report_file']}: {str(e)[:80]}")
             self._cache = self.snapshot()
 
     def latest(self):
@@ -3375,6 +3391,107 @@ class Engine:
                 themes=self.memory.hot_themes(self.t, 6) if self.memory else [],
                 fomo_off=self.fomo is None, dex=dict(error=self.dex_err, ok_t=self.dex_ok_t), phase=self.phase, phase_t=self.phase_t,
                 next_at=self.next_at, updated=time.time(), poll=self.cfg["poll_seconds"])
+
+
+# --------------------------------------------------------------------------- #
+# Public report (practice record, safe to share)
+# --------------------------------------------------------------------------- #
+def build_report(engine, include_live=False):
+    """A standalone HTML page with Spark's practice-trade record. No wallet, keys or controls,
+    so it can be uploaded anywhere or screenshotted. Real trades only when include_live."""
+    import html as _h
+    L, now = engine.learner, time.time()
+    esc = lambda v: _h.escape(str(v))
+    pc = lambda v: "-" if v is None else f"{v * 100:+.1f}%"
+    if not L:
+        body = "<p class='m'>Spark's learning is off in this run, so there is no practice record yet.</p>"
+        return _REPORT.replace("{{BODY}}", body).replace("{{TIME}}", esc(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")))
+    S = L.summary()
+    log = L.log[-300:]
+    picks = [r for r in log if r.get("picked")]
+    series = picks if len(picks) >= 5 else log
+    cum, pts = 0.0, []
+    for r in series:
+        cum += r["ret"]
+        pts.append(cum)
+    # cumulative-return line as inline SVG
+    svg = "<p class='m'>The chart appears after a few practice trades.</p>"
+    if len(pts) >= 2:
+        lo, hi = min(pts + [0]), max(pts + [0])
+        hi = hi if hi > lo else lo + 1
+        W, H = 900, 240
+        xy = [(i / (len(pts) - 1) * W, H - (v - lo) / (hi - lo) * H) for i, v in enumerate(pts)]
+        zero = H - (0 - lo) / (hi - lo) * H
+        col = "#3dffb5" if pts[-1] >= 0 else "#ff5c7a"
+        line = " ".join(f"{x:.1f},{y:.1f}" for x, y in xy)
+        svg = (f"<svg viewBox='0 0 {W} {H}' preserveAspectRatio='none' class='chart'>"
+               f"<line x1='0' x2='{W}' y1='{zero:.1f}' y2='{zero:.1f}' stroke='rgba(255,255,255,.18)' stroke-dasharray='4 6'/>"
+               f"<polyline points='{line}' fill='none' stroke='{col}' stroke-width='3' vector-effect='non-scaling-stroke'/></svg>"
+               f"<p class='m'>Running sum of returns over the latest {len(series)} "
+               f"{'blind picks by the model' if series is picks else 'practice trades'}, each a separate equal-size "
+               f"position (not compounded): average {pc(pts[-1] / len(series))} per trade.</p>")
+    wins = sum(1 for r in log if r["ret"] > 0)
+    tiles = [("Practice trades learned", f"{S['n']:,}"),
+             ("Recent win rate", "-" if S["win_rate"] is None else f"{S['win_rate'] * 100:.0f}%"),
+             ("Recent average return", pc(S["avg_ret"])),
+             ("Blind picks scored", f"{S['picks']} (avg {pc(S['pick_avg'])})"),
+             ("Status", "Proven" if S["proven"] else ("Proving itself" if S["ready"] else "Learning"))]
+    tiles_html = "".join(f"<div class='tile'><div class='k'>{esc(k)}</div><div class='v'>{esc(v)}</div></div>" for k, v in tiles)
+    styles = "".join(
+        f"<tr><td>{st}</td><td><b>{esc(e['use'])}</b></td><td>"
+        + ", ".join(f"{esc(k)} {pc(v[0])} ({v[1]})" for k, v in sorted(e["means"].items())) + "</td></tr>"
+        for st, e in S["exits"].items())
+    rows = "".join(
+        f"<tr><td>{datetime.fromtimestamp(r['t'], timezone.utc).strftime('%H:%M')}</td><td>${esc(r.get('sym', '?'))}</td>"
+        f"<td>{esc(r.get('stage', ''))}</td><td>{'yes' if r.get('picked') else ''}</td>"
+        f"<td class='{'u' if r['ret'] >= 0 else 'd'}'>{pc(r['ret'])}</td></tr>"
+        for r in reversed(log[-50:]))
+    live_html = ""
+    if include_live:
+        lrows = []
+        for name, st in engine.state["agents"].items():
+            a = engine.acfg.get(name)
+            if not (a and a.get("live")):
+                continue
+            for t in reversed(st["trades"][-30:]):
+                lrows.append(f"<tr><td>{datetime.fromtimestamp(t['t'], timezone.utc).strftime('%m-%d %H:%M')}</td>"
+                             f"<td>${esc(t['symbol'])}</td><td>{esc(t['reason'])}</td>"
+                             f"<td class='{'u' if t['pnl'] >= 0 else 'd'}'>{t['ret']:+.1f}%</td></tr>")
+            live_html += (f"<h2>Real-money trades: {esc(name)}</h2><p class='m'>{st['wins']} wins, {st['losses']} losses, "
+                          f"P&amp;L {st['pnl']:+.2f} USD since it started.</p>"
+                          + ("<table><tr><th>Time</th><th>Token</th><th>Exit</th><th>Return</th></tr>" + "".join(lrows)
+                             + "</table>" if lrows else "<p class='m'>No closed real trades yet.</p>"))
+    body = (f"<div class='tiles'>{tiles_html}</div><h2>Blind-pick proof</h2>{svg}"
+            f"<h2>How Spark sells, by stage of the curve</h2><table><tr><th>Stage</th><th>Uses</th><th>Average return per style (trades)</th></tr>{styles}</table>"
+            f"<h2>Latest practice trades</h2><p class='m'>{wins} of the last {len(log)} were profitable after fees.</p>"
+            f"<table><tr><th>Time (UTC)</th><th>Token</th><th>Stage</th><th>Model pick</th><th>Return</th></tr>{rows}</table>"
+            f"{live_html}")
+    return _REPORT.replace("{{BODY}}", body).replace("{{TIME}}", esc(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")))
+
+
+_REPORT = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Spark: practice record</title><style>
+:root{--bg:#06060b;--p:#14142a;--l:rgba(255,255,255,.09);--t:#eef0ff;--m:#8b8fae;--u:#3dffb5;--d:#ff5c7a}
+*{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--t);font-family:Inter,"Segoe UI",system-ui,sans-serif;
+max-width:1000px;margin:0 auto;padding:28px 18px 50px}
+h1{font-size:40px;letter-spacing:-.03em;background:linear-gradient(90deg,#fff,#bff9e4 50%,#a78bfa);-webkit-background-clip:text;background-clip:text;color:transparent}
+h2{font-size:15px;text-transform:uppercase;letter-spacing:.1em;color:var(--m);margin:32px 0 12px}
+.m{color:var(--m);font-size:14px;line-height:1.5;margin:8px 0}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:22px}
+.tile{background:var(--p);border:1px solid var(--l);border-radius:14px;padding:14px}
+.tile .k{color:var(--m);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.tile .v{font-size:22px;font-weight:700;margin-top:6px}
+.chart{width:100%;height:240px;background:var(--p);border:1px solid var(--l);border-radius:14px;padding:10px}
+table{width:100%;border-collapse:collapse;font-size:14px;background:var(--p);border-radius:14px;overflow:hidden}
+th{color:var(--m);text-align:left;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.06em;padding:10px;border-bottom:1px solid var(--l)}
+td{padding:9px 10px;border-bottom:1px solid rgba(255,255,255,.04)}.u{color:var(--u)}.d{color:var(--d)}
+.foot{margin-top:34px;color:#6f7394;font-size:13px;line-height:1.6}
+</style></head><body>
+<h1>Spark</h1><p class="m">Practice record of a self-learning pump.fun trading bot. Updated {{TIME}}.</p>
+{{BODY}}
+<p class="foot">Practice trades are simulated on live pump.fun data using Spark's own exits and costs (fees and slippage);
+they are not real-money results. "Blind picks" are trades the model chose before their outcome was known.
+Past results do not predict future ones. Memecoins are extremely risky. Not financial advice.</p>
+</body></html>"""
 
 
 # --------------------------------------------------------------------------- #
@@ -3660,7 +3777,7 @@ function renderSpot(s){
   const M=s.memory, B=s.brain, T=s.themes||[];
   const top=(L.top||[]).map(([f,w])=>`<span class="chip ${w>0?"good":"bad"}">${esc(f.replace(/_/g," "))} <b>${w>0?"+":""}${w}</b></span>`).join("");
   setHTML("#spot",`<div class="brain">SPARK<br>BRAIN</div>
-    <div><h3>Learning</h3><div class="state" style="color:${L.proven?"var(--up)":(L.ready?"var(--violet)":"var(--text)")}">${state}</div>
+    <div><h3>Learning <a href="/report" target="_blank" style="color:var(--up);text-decoration:none;margin-left:8px;text-transform:none;letter-spacing:0">shareable report ↗</a></h3><div class="state" style="color:${L.proven?"var(--up)":(L.ready?"var(--violet)":"var(--text)")}">${state}</div>
       <div class="small" style="margin:0">${L.n.toLocaleString()} practice trades learned · ${L.open} running now</div>
       <div class="meterbar"><b style="width:${learnPct}%"></b></div><div class="small" style="margin:0">${Math.min(L.n,L.min_n)}/${L.min_n} to start deciding</div>
       <div class="meterbar p"><b style="width:${proofPct}%"></b></div><div class="small" style="margin:0">proof: ${L.picks}/${L.proof_n} picks, avg ${pc(L.pick_avg)}${L.proven?" ✓":""}</div></div>
@@ -3872,6 +3989,10 @@ def make_handler(engine, port):
             path = self.path.split("?")[0]
             if path == "/state.json":
                 self._send(200, json.dumps(finite(engine.latest())).encode(), "application/json")
+            elif path == "/report":
+                with engine.lock:
+                    page = build_report(engine, engine.cfg.get("report_live", False))
+                self._send(200, page.encode(), "text/html; charset=utf-8")
             elif path in ("/", "/index.html"):
                 self._send(200, HTML.encode(), "text/html; charset=utf-8")
             else:
@@ -3989,6 +4110,8 @@ def main():
     ap.add_argument("--daily-loss", type=float, default=CFG["daily_loss_pct"],
                     help="stop an agent opening trades after it loses this %% of its bankroll in a day "
                          "(default 0 = no daily cap)")
+    ap.add_argument("--report-live", action="store_true",
+                    help="also put real-money trades in the shareable spark-report.html (off: practice only)")
     ap.add_argument("--live-only", action="store_true",
                     help="with --live: run only the live agents, so the dashboard shows just your real money")
     ap.add_argument("--live-usd", type=float, default=CFG["live_usd"],
@@ -4043,6 +4166,7 @@ def main():
             fomo = None
     notify = Notifier()
     CFG["daily_loss_pct"] = args.daily_loss
+    CFG["report_live"] = args.report_live
     apply_risk(AGENTS, args.risk)
     engine = Engine(CFG, AGENTS, src, demo=args.demo, live=live, live_names=live_names,
                     live_only=args.live_only,

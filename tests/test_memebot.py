@@ -583,6 +583,28 @@ class LearnedExits(unittest.TestCase):
         self.assertIn(m.tkey("solana", "EX2"), eng.state["agents"]["Spark"]["positions"])  # swing holds (tp 150)
 
 
+class PublicReport(unittest.TestCase):
+    def test_report_is_safe_to_share(self):
+        eng = demo_engine()
+        eng.wallet = dict(pub="SECRETWALLET", usdc=25.0, sol=0.05)
+        x = m.Learner.features(Learning.q())
+        for i in range(10):
+            eng.learner.learn(x, 0.1 if i % 2 else -0.05, i > 4,
+                              meta=dict(t=1_700_000_000 + i, sym="<script>alert(1)</script>", stage="mid"))
+        page = m.build_report(eng)
+        self.assertIn("Practice record", page)
+        self.assertNotIn("<script>alert", page)              # token names are attacker-controlled: escaped
+        self.assertIn("&lt;script&gt;", page)
+        self.assertNotIn("SECRETWALLET", page)
+        self.assertNotIn("Real-money trades", page)          # real trades only with --report-live
+        self.assertIn("not real-money results", page)
+        self.assertIn("polyline", page)
+
+    def test_report_without_learning(self):
+        eng = m.Engine(m.CFG, [a for a in m.AGENTS if a["name"] == "Bolt"], m.DemoSource(), demo=True)
+        self.assertIn("no practice record yet", m.build_report(eng))
+
+
 class FakeLive:
     def __init__(self):
         self.calls = []

@@ -95,6 +95,16 @@ The hard rug checks always apply. What Spark has learned is saved in `learn.json
 - Source badges show where each position and trade came from.
 - The win-rate card adds profit factor and max drawdown. P&L is broken down by source.
 
+## Public practice record
+
+Every 10 minutes Spark writes `spark-report.html`, a standalone page with its practice-trade record:
+- win rate and average return
+- the running sum of the model's blind picks
+- the selling style it uses at each curve stage
+- the last 50 practice trades
+
+The page is also served at `/report` on the dashboard. It holds no wallet address, keys or controls, so it is safe to upload anywhere or screenshot. Real-money trades are left out unless you start with `--report-live`.
+
 ## Alerts (optional)
 
 Set any of the following to get a message on every entry and exit, and when live trading halts:
