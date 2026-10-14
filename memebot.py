@@ -2320,7 +2320,7 @@ class Engine:
         log.append(dict(t=self.t, tag=tag, msg=msg))
         del log[:-400]
         if self.notify and tag in self.cfg["alert_tags"]:
-            self.notify.send(f"MemeBot [{tag}] {msg}")
+            self.notify.send(f"Spark [{tag}] {msg}")
 
     def _err(self, msg):
         with self.lock:
@@ -3303,7 +3303,7 @@ class Engine:
 HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MemeBot</title>
+<title>Spark</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap">
 <style>
@@ -3461,8 +3461,8 @@ td:first-child{font-weight:600}
 <body>
 <div class="bgfx" aria-hidden="true"><div class="blob a"></div><div class="blob b"></div><div class="blob c"></div></div>
 <header>
-  <div class="logo">M</div>
-  <div><h1>MemeBot</h1><div class="sub" id="sub">connecting...</div></div>
+  <div class="logo">S</div>
+  <div><h1>Spark</h1><div class="sub" id="sub">connecting...</div></div>
   <div class="spacer"></div>
   <div class="pill" id="cyc">0 cycles</div>
   <div class="pill" title="DexScreener market data"><span class="dot dead" id="ddot"></span><span id="dfeed">DexScreener</span></div>
@@ -3979,7 +3979,7 @@ def main():
     if engine.brain and not args.demo:
         b = engine.brain
         print(f"AI brain: {b.model}, up to {b.per_hour} launches an hour" if b.enabled else f"AI brain {b.error}")
-    print(f"MemeBot running ({mode} mode, watching {feeds}). Dashboard: http://127.0.0.1:{args.port}"
+    print(f"Spark running ({mode} mode, watching {feeds}). Dashboard: http://127.0.0.1:{args.port}"
           f"   (Ctrl+C to stop)" + ("\nAlerts on." if notify.enabled else ""))
 
     try:
