@@ -1478,6 +1478,10 @@ class WalletWatch:
         self.jobs = queue.Queue(maxsize=500)
         self.seen = set()
         self.connected, self.error, self.txs = False, "", 0
+        self.notes = 0               # transactions the subscriptions reported
+        self.connected_t = None
+        self.last_seen = {}          # wallet -> time of its latest transaction (block time)
+        self.reconnects = 0
 
     def set_wallets(self, wallets):
         wallets = set(wallets)
@@ -1489,6 +1493,25 @@ class WalletWatch:
         threading.Thread(target=self._run, name="wallet-watch", daemon=True).start()
         for i in range(2):
             threading.Thread(target=self._fetch_loop, name=f"wallet-tx{i}", daemon=True).start()
+        threading.Thread(target=self._activity_loop, name="wallet-activity", daemon=True).start()
+
+    def _activity_loop(self):
+        """Every 5 minutes, when each copy wallet last did anything on-chain: answers "did they even trade?"."""
+        while True:
+            for wallet in list(self.wallets):
+                try:
+                    d = json.loads(post_json(self.rpc, {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+                                                        "params": [wallet, {"limit": 1}]}, timeout=10))
+                    rows = d.get("result") or []
+                    if rows and rows[0].get("blockTime"):
+                        self.last_seen[wallet] = max(self.last_seen.get(wallet, 0), rows[0]["blockTime"])
+                except Exception as e:
+                    self.error = f"activity check: {str(e)[:90]}"
+            time.sleep(300 if self.wallets else 10)
+
+    def status(self):
+        return dict(connected=self.connected, error=self.error, notes=self.notes, txs=self.txs,
+                    reconnects=self.reconnects, since=self.connected_t, last_seen=dict(self.last_seen))
 
     def _run(self):
         delay = 2
@@ -1506,6 +1529,7 @@ class WalletWatch:
                     ws.send(json.dumps({"jsonrpc": "2.0", "id": 100 + i, "method": "logsSubscribe",
                                         "params": [{"mentions": [wallet]}, {"commitment": "confirmed"}]}))
                 self.connected, self.error, delay, quiet = True, "", 2, 0
+                self.connected_t = time.time()
                 self.w.events.append(("PUMP", f"watching {len(self.wallets)} copy-trade wallet"
                                               f"{'s' if len(self.wallets) > 1 else ''} on-chain"))
                 while not self.changed.is_set():
@@ -1526,6 +1550,8 @@ class WalletWatch:
                         raise ConnectionError(f"RPC refused the wallet subscription: {str(msg['error'])[:100]}")
                     v = ((msg.get("params") or {}).get("result") or {}).get("value") or {}
                     sig = v.get("signature")
+                    if sig:
+                        self.notes += 1
                     if sig and v.get("err") is None and sig not in self.seen:
                         self.seen.add(sig)
                         if len(self.seen) > 20000:
@@ -1536,7 +1562,10 @@ class WalletWatch:
                             pass
             except Exception as e:
                 self.connected, self.error = False, str(e)[:120]
-                if "no data" not in self.error:
+                self.reconnects += 1
+                if "no data" in self.error:
+                    delay = 2   # quiet wallets: reconnect quickly, nothing is wrong
+                else:
                     self.w.events.append(("WARN", f"copy-trade wallet watch: {self.error}; retrying in {delay}s"))
                 time.sleep(delay)
                 delay = min(delay * 2, 60)
@@ -1552,7 +1581,13 @@ class WalletWatch:
                         sig, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}]},
                         timeout=10))
                     tx = d.get("result")
+                    if d.get("error"):
+                        raise RuntimeError(str(d["error"])[:90])
                     if tx:
+                        bt = tx.get("blockTime")
+                        for wallet in self.wallets:
+                            if bt and wallet in str((tx.get("transaction") or {}).get("message", {}).get("accountKeys", "")):
+                                self.last_seen[wallet] = max(self.last_seen.get(wallet, 0), bt)
                         for ev in self.parse(tx, self.wallets, sig):
                             ev["t"] = self.w.clock()
                             with self.w.lock:
@@ -4562,6 +4597,7 @@ class Engine:
                 follow=dict(wallets=[dict(addr=a, label=w["label"], mode=w["mode"], **self.follow_stats.get(
                                      a, dict(seen=0, copied=0, skipped=0, last=None))) for a, w in self.watch.items()],
                             log=list(self.follow_log)[::-1][:25], bad=self.watch_bad,
+                            watch=self.wallet_watch.status() if self.wallet_watch else None,
                             file=os.path.basename(self.cfg["watchlist_file"]),
                             on=any(a.get("need") == "follow" for a in self.acfg.values()))
                 if self.pump else None,
@@ -5175,14 +5211,19 @@ function renderWatch(F){
   if(!F){el.style.display="none";return}
   el.style.display="grid";
   const mode={snipe:"snipes launches",copy:"copies trades",both:"snipes + copies"};
-  const rows=F.wallets.length?`<table><tr><th>Wallet</th><th>Mode</th><th>Seen</th><th>Copied</th><th>Skipped</th><th>Last</th></tr>`+
+  const W=F.watch, ago=t=>t?dur(Date.now()/1000-t)+" ago":"-";
+  const rows=F.wallets.length?`<table><tr><th>Wallet</th><th>Mode</th><th>Last on-chain</th><th>Seen</th><th>Copied</th><th>Skipped</th></tr>`+
     F.wallets.map(w=>`<tr><td><a href="https://solscan.io/account/${esc(w.addr)}" target="_blank" rel="noopener" style="color:var(--text)">${esc(w.label)}</a></td>
-      <td class="mute">${mode[w.mode]||esc(w.mode)}</td><td>${w.seen}</td><td class="up">${w.copied}</td><td class="mute">${w.skipped}</td>
-      <td class="mute">${w.last?hhmm(w.last):"-"}</td></tr>`).join("")+"</table>"
+      <td class="mute">${mode[w.mode]||esc(w.mode)}</td><td class="mute" title="when this wallet last did anything on Solana">${W&&W.last_seen[w.addr]?ago(W.last_seen[w.addr]):(W?"checking...":"-")}</td>
+      <td>${w.seen}</td><td class="up">${w.copied}</td><td class="mute">${w.skipped}</td></tr>`).join("")+"</table>"
     :`<div class="empty">No wallets yet. Open <b>${esc(F.file)}</b> next to memebot.py and add lines like<br><code>copy &lt;wallet&gt; name</code> or <code>snipe &lt;wallet&gt; name</code>. Changes apply within 10 seconds.</div>`;
   const bad=(F.bad||[]).length?`<div class="small" style="color:var(--down)">${F.bad.map(esc).join("<br>")}</div>`:"";
+  const ws=!F.on?"":(!W?(F.wallets.some(w=>w.mode!=="snipe")?'<div class="small">On-chain wallet watch: starting...</div>':""):
+    `<div class="small" style="color:${W.connected?"var(--up)":"var(--down)"}">On-chain wallet watch: ${W.connected?"connected":"NOT connected"}`+
+    ` · ${W.notes} transactions seen, ${W.txs} read`+(W.reconnects?` · ${W.reconnects} reconnects`:"")+
+    (W.error&&!W.connected||W.error&&!/no data/.test(W.error)?` · <span style="color:var(--down)">${esc(W.error)}</span>`:"")+`</div>`);
   const log=(F.log||[]).map(e=>`<div><span class="mute">${hhmm(e.t)}</span> <b>${esc(e.label)}</b> <span class="${e.did?"up":"mute"}">${esc(e.note)}</span></div>`).join("");
-  setHTML("#watch",`<div><h3>Watchlist · Hawk ${F.on?"":'<span class="mute" style="text-transform:none;letter-spacing:0">(Hawk is off: add wallets, then restart)</span>'}</h3>${rows}${bad}</div>
+  setHTML("#watch",`<div><h3>Watchlist · Hawk ${F.on?"":'<span class="mute" style="text-transform:none;letter-spacing:0">(Hawk is off: add wallets, then restart)</span>'}</h3>${rows}${ws}${bad}</div>
     <div><h3>What they did</h3><div class="calls" style="max-height:260px;margin-top:0">${log||'<span class="mute small">Nothing yet. Hawk acts the moment a wallet on the list launches, buys or sells.</span>'}</div></div>`);
 }
 function brainTxt(B,T){
@@ -5521,6 +5562,36 @@ def run_checks():
         age, n = PumpWatcher.dev_lookup(who, rpc)
         return f"wallet {who[:4]}… is {age:.1f}h old ({n} recent transactions)"
     check("Creator wallet ages", dev_ages, "your RPC refuses getSignaturesForAddress; a free Helius key allows it")
+
+    watch, _ = load_watchlist(CFG["watchlist_file"], create=False)
+    copy = [(a, w["label"]) for a, w in watch.items() if w["mode"] in ("copy", "both")]
+    if copy:
+        def wallet_watch():
+            ws = WebSocket(RpcPumpFeed.ws_url(), timeout=15)
+            ws.connect()
+            try:
+                ws.send(json.dumps({"jsonrpc": "2.0", "id": 7, "method": "logsSubscribe",
+                                    "params": [{"mentions": [copy[0][0]]}, {"commitment": "confirmed"}]}))
+                end = time.time() + 10
+                while time.time() < end:
+                    msg = json.loads(ws.recv())
+                    if msg.get("id") == 7:
+                        if msg.get("error"):
+                            raise RuntimeError(f"subscription refused: {str(msg['error'])[:80]}")
+                        break
+                else:
+                    raise RuntimeError("no answer to the wallet subscription")
+            finally:
+                ws.close()
+            parts = []
+            for addr, label in copy:
+                d = json.loads(post_json(rpc, {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+                                               "params": [addr, {"limit": 1}]}, timeout=10))
+                rows = d.get("result") or []
+                t = rows[0].get("blockTime") if rows else None
+                parts.append(f"{label} last traded " + (f"{(time.time() - t) / 3600:.1f}h ago" if t else "never"))
+            return "subscription accepted; " + ", ".join(parts)
+        check("Copy-trade wallet watch", wallet_watch, "needs a websocket RPC that allows logsSubscribe, e.g. a free Helius key")
 
     def pumpportal():
         ws = WebSocket(CFG["pump_ws"], timeout=15)
