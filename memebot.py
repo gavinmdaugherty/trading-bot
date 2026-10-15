@@ -5719,6 +5719,40 @@ def anchor_data_files(cfg, here=None, cwd=None):
     return notes
 
 
+def prune_phantom_positions(saved, ex, path=None):
+    """Drop live positions the wallet no longer holds any of (sold by hand, or a buy that never landed),
+    so they neither block startup nor get "sold" again. A copy of the old state is kept as .bak.
+    Returns a note per change. Wallet read errors keep the position: never guess about real money."""
+    notes, changed = [], False
+    for name, st in saved.get("agents", {}).items():
+        if not st.get("live"):
+            continue
+        for k, pos in list(st.get("positions", {}).items()):
+            try:
+                raw, _ = ex.token_balance(pos["addr"])
+            except Exception as e:
+                notes.append(f"{name} ${pos['symbol']}: wallet check failed ({str(e)[:60]}), kept")
+                continue
+            if raw <= 0:
+                del st["positions"][k]
+                st.setdefault("cool", {})[k] = time.time()
+                changed = True
+                notes.append(f"{name} ${pos['symbol']}: the wallet holds none of it any more, so it was cleared "
+                             f"from Spark's records (it was sold or moved outside Spark, or the buy never landed)")
+    if changed and path:
+        try:
+            if os.path.exists(path):
+                with open(path) as f, open(path + ".bak", "w") as b:
+                    b.write(f.read())
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(saved, f)
+            os.replace(tmp, path)
+        except OSError as e:
+            notes.append(f"could not update {path}: {e}")
+    return notes
+
+
 def trading_agents(agents, paper_agents=False, live_names=(), pump=True, watchlist=False):
     """Who trades this run. By default only Spark (plus any live agents, and Hawk when the watchlist
     has wallets); the others are its scouts. Without pump.fun there is nothing to scout or follow,
@@ -5820,6 +5854,16 @@ def main():
                          for n, a in saved.get("agents", {}).items() if a.get("live") and a["positions"]}
         except Exception:
             open_live = {}
+        if open_live and os.environ.get("MEMEBOT_SOLANA_KEY", "").strip():
+            # positions the wallet no longer holds (sold by hand, or a buy that never landed) are cleared
+            try:
+                notes = prune_phantom_positions(saved, SolanaLive(CFG), CFG["state_file"])
+            except (Exception, SystemExit) as e:
+                notes = [f"could not check the wallet for open positions ({str(e)[:80]})"]
+            for note in notes:
+                print("Live positions: " + note)
+            open_live = {n: [p["symbol"] for p in a["positions"].values()]
+                         for n, a in saved.get("agents", {}).items() if a.get("live") and a["positions"]}
         if open_live and not args.live:
             raise SystemExit("Open LIVE positions exist: " + "; ".join(f"{n}: {', '.join(s)}" for n, s in open_live.items())
                              + "\nStart again with --live (and the same --live-agents) so the bot can manage and sell them. "

@@ -1901,5 +1901,33 @@ class WalletWatchCopy(unittest.TestCase):
         self.assertIsNone(eng.wallet_watch)                                  # the demo never opens connections
 
 
+class PhantomPositions(unittest.TestCase):
+    def test_positions_the_wallet_no_longer_holds_are_cleared(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "state.json")
+        saved = {"agents": {
+            "Hawk LIVE": {"live": True, "cash": 18.0, "positions": {
+                "solana:GONE": dict(addr="GONE", symbol="GONE", size=5.0),
+                "solana:HELD": dict(addr="HELD", symbol="HELD", size=5.0),
+                "solana:ERR": dict(addr="ERR", symbol="ERR", size=5.0)}},
+            "Spark": {"live": False, "positions": {"solana:PAPER": dict(addr="PAPER", symbol="P", size=5.0)}}}}
+        with open(path, "w") as f:
+            json.dump(saved, f)
+
+        class Ex:
+            def token_balance(self, mint):
+                if mint == "ERR":
+                    raise RuntimeError("HTTP 429")
+                return (0 if mint == "GONE" else 123, 6)
+        notes = m.prune_phantom_positions(saved, Ex(), path)
+        pos = saved["agents"]["Hawk LIVE"]["positions"]
+        self.assertEqual(sorted(pos), ["solana:ERR", "solana:HELD"])        # a failed check never guesses
+        self.assertIn("solana:PAPER", saved["agents"]["Spark"]["positions"])  # paper positions untouched
+        self.assertEqual(len(notes), 2)
+        with open(path) as f:
+            self.assertNotIn("solana:GONE", json.load(f)["agents"]["Hawk LIVE"]["positions"])
+        self.assertTrue(os.path.exists(path + ".bak"))
+
+
 if __name__ == "__main__":
     unittest.main()
