@@ -1929,5 +1929,60 @@ class PhantomPositions(unittest.TestCase):
         self.assertTrue(os.path.exists(path + ".bak"))
 
 
+class BrainV2(unittest.TestCase):
+    def data(self, n, signal, seed=1):
+        import random
+        r, k = random.Random(seed), len(m.Learner.FEATURES)
+        X, y = [], []
+        for _ in range(n):
+            x = [r.gauss(0, 1) for _ in range(k)]
+            edge = 0.25 if (signal and x[3] > 0.5 and x[7] < 0) else -0.08
+            X.append(x)
+            y.append(edge + r.gauss(0, 0.35))
+        return X, y
+
+    def test_learns_a_combination_and_its_picks_beat_the_rest(self):
+        L = m.Learner(None)
+        for x, v in zip(*self.data(3000, True)):
+            L.add_sample(x, v)
+        self.assertTrue(L.want_training())
+        L.train()
+        self.assertGreater(L.bstat["top_avg"], 0.1)
+        X, y = self.data(1500, True, seed=2)
+        picked = [v for x, v in zip(X, y) if L.ev(x) >= 0.03]
+        self.assertGreater(len(picked), 50)
+        self.assertGreater(sum(picked) / len(picked), sum(y) / len(y) + 0.1)
+        self.assertEqual({f for f, _ in L.bstat["trusts"][:2]}, {m.Learner.FEATURES[3], m.Learner.FEATURES[7]})
+
+    def test_no_edge_means_no_picks(self):
+        L = m.Learner(None)
+        for x, v in zip(*self.data(3000, False)):
+            L.add_sample(x, v)
+        L.train()
+        X, _ = self.data(1000, False, seed=3)
+        self.assertEqual(sum(1 for x in X if L.ev(x) >= 0.03), 0)
+
+    def test_calibration_is_monotone(self):
+        cal = m.Booster.calibrate([1, 2, 3, 4, 5, 6, 7, 8], [0.1, 0.1, -0.2, -0.2, 0.3, 0.3, 0.5, 0.5], 4)
+        avgs = [a for _, a, _ in cal]
+        self.assertEqual(avgs, sorted(avgs))
+        self.assertAlmostEqual(cal[-1][1], 0.5)
+
+    def test_samples_survive_restart_and_retraining_waits_for_new_data(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "learn.json")
+        L = m.Learner(path)
+        for x, v in zip(*self.data(1200, True)):
+            L.learn(x, v, False)
+        L.save()
+        L2 = m.Learner(path)
+        self.assertEqual(len(L2.samples), 1200)
+        L2.train()
+        self.assertFalse(L2.want_training())                    # nothing new since training
+        for x, v in zip(*self.data(400, True, seed=4)):
+            L2.learn(x, v, False)
+        self.assertTrue(L2.want_training())
+
+
 if __name__ == "__main__":
     unittest.main()

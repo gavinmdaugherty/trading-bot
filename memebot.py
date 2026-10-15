@@ -39,6 +39,7 @@ Standard library only (Python 3.9+); live trading additionally needs `solders`.
 """
 import argparse
 import base64
+import bisect
 import concurrent.futures
 import hashlib
 import itertools
@@ -2643,6 +2644,92 @@ class DemoBrain(Brain):
 
 
 
+class Booster:
+    """Gradient-boosted decision stumps on practice-trade returns: Spark's brain v2.
+
+    Unlike the linear model it can learn combinations (a launch that is early AND speeding up AND
+    whose creator still holds), and it predicts the return itself rather than only the chance of a
+    win. Its scores are never trusted raw: calibrate() maps them to what trades with similar scores
+    actually returned on held-out trades the model never trained on. Pure Python, no packages."""
+
+    def __init__(self, trees, base, edges):
+        self.trees, self.base, self.edges = trees, base, edges   # trees: (feature, threshold, left, right)
+
+    @classmethod
+    def fit(cls, X, y, rounds=80, lr=0.1, bins=12, min_leaf=40):
+        n, k = len(X), len(X[0])
+        cols = list(zip(*X))
+        edges, binned = [], []
+        for j in range(k):   # quantile thresholds per feature, and each sample's bin
+            vals = sorted(cols[j])
+            e = sorted({vals[int(len(vals) * q / bins)] for q in range(1, bins)})
+            edges.append(e)
+            binned.append([bisect.bisect_right(e, v) for v in cols[j]])
+        base = sum(y) / n
+        res = [v - base for v in y]
+        trees, gains = [], [0.0] * k
+        for _ in range(rounds):
+            best = None
+            total = sum(res)
+            for j in range(k):
+                nb = len(edges[j]) + 1
+                if nb < 2:
+                    continue
+                sums, cnts = [0.0] * nb, [0] * nb
+                bj = binned[j]
+                for i in range(n):
+                    sums[bj[i]] += res[i]
+                    cnts[bj[i]] += 1
+                ls = lc = 0
+                for b in range(nb - 1):
+                    ls += sums[b]
+                    lc += cnts[b]
+                    rc = n - lc
+                    if lc < min_leaf or rc < min_leaf:
+                        continue
+                    g = ls * ls / lc + (total - ls) ** 2 / rc - total * total / n
+                    if best is None or g > best[0]:
+                        best = (g, j, b, ls / lc, (total - ls) / rc)
+            if best is None or best[0] <= 1e-12:
+                break
+            g, j, b, lv, rv = best
+            gains[j] += g
+            trees.append((j, edges[j][b], lr * lv, lr * rv))
+            bj = binned[j]
+            for i in range(n):
+                res[i] -= lr * (lv if bj[i] <= b else rv)
+        m = cls(trees, base, None)
+        m.gains = gains
+        return m
+
+    def predict(self, x):
+        out = self.base
+        for j, t, lv, rv in self.trees:
+            out += lv if (x[j] if j < len(x) else 0.0) <= t else rv
+        return out
+
+    @staticmethod
+    def calibrate(preds, rets, buckets):
+        """Score bands -> the average return trades in that band really made, made monotone
+        (pool adjacent violators) so a higher score never means a lower expected return."""
+        pairs = sorted(zip(preds, rets))
+        size = max(1, len(pairs) // buckets)
+        groups = [pairs[i:i + size] for i in range(0, len(pairs), size)]
+        if len(groups) > 1 and len(groups[-1]) < size // 2:
+            groups[-2].extend(groups.pop())
+        blocks = [[g[0][0], sum(r for _, r in g), len(g)] for g in groups]   # [lower score, sum, count]
+        i = 0
+        while i < len(blocks) - 1:
+            if blocks[i][1] / blocks[i][2] > blocks[i + 1][1] / blocks[i + 1][2]:
+                blocks[i][1] += blocks[i + 1][1]
+                blocks[i][2] += blocks[i + 1][2]
+                del blocks[i + 1]
+                i = max(0, i - 1)
+            else:
+                i += 1
+        return [(lo, s / c, c) for lo, s, c in blocks]
+
+
 class Learner:
     """Online model that learns which pump.fun launches pay off.
 
@@ -2676,6 +2763,9 @@ class Learner:
         self.log = []                               # latest 300 practice trades, for the public report
         self.recent = []                            # (net return, won) of the latest 300 shadows
         self.picks_total = 0                        # out-of-sample picks ever scored
+        self.samples = []                           # latest practice trades: [features, net return]
+        self.booster, self.bcal, self.bstat = None, None, None
+        self.training, self.trained_n = False, 0
         self.calib = dict(buy=[], sell=[])          # real fills: [cost vs signal price, seconds, route]
         if path and os.path.exists(path):
             try:
@@ -2689,6 +2779,7 @@ class Learner:
                     self.log = d.get("log", [])
                     self.picks_total = d.get("picks_total", len(self.picks))
                     self.calib = d.get("calib") or self.calib
+                    self.samples = [s_ for s_ in d.get("samples", []) if len(s_) == 2]
                     pad = k - len(old)
                     # features added since: no statistics yet, so they sit out until they have some
                     self.fn = (d.get("fn") or [self.n] * len(old)) + [0] * pad
@@ -2702,6 +2793,7 @@ class Learner:
         d = {key: getattr(self, key) for key in ("w", "b", "n", "mean", "m2", "fn", "wins", "win_sum",
                                                  "loss_sum", "picks", "recent", "exits", "log",
                                                  "picks_total", "calib")}
+        d["samples"] = self.samples
         d["features"] = list(self.FEATURES)
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
@@ -2751,8 +2843,59 @@ class Learner:
         return self.loss_sum / losses if losses else -0.2
 
     def ev(self, x):
+        """Expected net return of a buy. With brain v2 trained: what held-out practice trades with a
+        similar score really returned. Before that: the linear model's estimate."""
+        m, cal = self.booster, self.bcal
+        if m is not None and cal:
+            score = m.predict(x)
+            out = cal[0][1]
+            for lo, avg, _ in cal:
+                if score >= lo:
+                    out = avg
+            return out
         p = self.p_win(x)
         return p * self.avg_win() + (1 - p) * self.avg_loss()
+
+    # ---- brain v2: train on the stored practice trades, judged on ones it never saw ---- #
+    SAMPLES = 6000
+    TRAIN_MIN = 1000
+    RETRAIN_EVERY = 400
+
+    def add_sample(self, x, ret):
+        self.samples.append([[round(v, 4) for v in x], round(max(-1.0, min(3.0, ret)), 4)])
+        del self.samples[:-self.SAMPLES]
+
+    def want_training(self):
+        return (not self.training and len(self.samples) >= self.TRAIN_MIN
+                and (self.booster is None or len(self.samples) - self.trained_n >= self.RETRAIN_EVERY
+                     or self.n - self.bstat.get("at_n", 0) >= self.RETRAIN_EVERY))
+
+    def train(self):
+        """Fit on the older 80%, measure on the newest 20%, keep the calibration from that test.
+        Runs in a background thread; swaps the new brain in when done."""
+        self.training = True
+        try:
+            data = list(self.samples)
+            k = len(self.FEATURES)
+            X = [(x + [0.0] * k)[:k] for x, _ in data]
+            y = [r for _, r in data]
+            cut = int(len(data) * 0.8)
+            t0 = time.time()
+            m = Booster.fit(X[:cut], y[:cut])
+            preds = [m.predict(x) for x in X[cut:]]
+            hold = y[cut:]
+            cal = Booster.calibrate(preds, hold, 5 if len(hold) < 500 else 8)
+            top = cal[-1]
+            names = sorted(zip(self.FEATURES, m.gains), key=lambda kv: -kv[1])
+            tot = sum(g for _, g in names) or 1.0
+            self.booster, self.bcal = m, cal
+            self.trained_n = len(self.samples)
+            self.bstat = dict(n=len(data), test=len(hold), secs=round(time.time() - t0, 1), t=time.time(),
+                              at_n=self.n, top_avg=round(top[1], 4), top_n=top[2],
+                              test_avg=round(sum(hold) / len(hold), 4), bands=[[round(a, 4), c] for _, a, c in cal],
+                              trusts=[(f, round(g / tot, 2)) for f, g in names[:3] if g > 0])
+        finally:
+            self.training = False
 
     def ready(self):
         return self.n >= self.min_n
@@ -2772,6 +2915,7 @@ class Learner:
         self.picks_total += 1
 
     def learn(self, x, ret, picked, meta=None, count_pick=True):
+        self.add_sample(x, ret)
         won = ret > 0
         if meta is not None:
             self.log = (self.log + [dict(meta, ret=round(ret, 4), picked=bool(picked))])[-300:]
@@ -2847,7 +2991,11 @@ class Learner:
         n, avg = self.proof()
         recent = self.recent[-100:]
         top = sorted(zip(self.FEATURES, self.w), key=lambda kv: -abs(kv[1]))[:3]
+        if self.bstat and self.bstat.get("trusts"):
+            top = [(f, v) for f, v in self.bstat["trusts"]]
         return dict(n=self.n, min_n=self.min_n, ready=self.ready(), proven=self.proven(),
+                    brain2=dict(samples=len(self.samples), need=self.TRAIN_MIN, training=self.training,
+                                stat=self.bstat),
                     picks=n, pick_avg=avg, proof_n=self.proof_n,
                     win_rate=(sum(1 for r in recent if r[1]) / len(recent)) if recent else None,
                     avg_ret=(sum(r[0] for r in recent) / len(recent)) if recent else None,
@@ -4472,6 +4620,9 @@ class Engine:
             self.last_cycle = self.t
             self.phase, self.phase_t = "waiting for next scan", time.time()
             self._save()
+            if self.learner and self.learner.want_training():
+                self.learner.training = True   # claimed now, so a second cycle cannot start another
+                threading.Thread(target=self.learner.train, name="brain-v2", daemon=True).start()
             if self.learner and not self.demo and time.time() - self.report_t > c["report_every_s"]:
                 self.report_t = time.time()
                 try:
@@ -5148,7 +5299,8 @@ function renderSpot(s){
     <div><h3>Learning <a href="/report" target="_blank" style="color:var(--up);text-decoration:none;margin-left:8px;text-transform:none;letter-spacing:0">shareable report ↗</a></h3><div class="state" style="color:${L.proven?"var(--up)":(L.ready?"var(--violet)":"var(--text)")}">${state}</div>
       <div class="small" style="margin:0">${L.n.toLocaleString()} practice trades learned · ${L.open} running now</div>
       <div class="steps">${["Learning","Proving","Buy mode"].map((t,i)=>`<span class="${i<stage?"done":(i===stage?"now":"")}">${i<stage?"✓ ":""}${t}</span>`).join("")}</div>
-      ${stage===0?`<div class="meterbar"><b style="width:${learnPct}%"></b></div><div class="small" style="margin:0">${L.n}/${L.min_n} practice trades before it starts picking</div>`:proofGauge(L)}</div>
+      ${stage===0?`<div class="meterbar"><b style="width:${learnPct}%"></b></div><div class="small" style="margin:0">${L.n}/${L.min_n} practice trades before it starts picking</div>`:proofGauge(L)}
+      ${brain2Txt(L)}</div>
     <div><h3>What it trusts</h3><div class="chips">${top||'<span class="mute small">still learning which signals matter</span>'}</div>
       <h3 style="margin-top:12px">How it sells</h3><div class="chips">${["early","mid","late"].map(st=>{const e=(L.exits||{})[st]||{};const m=(e.means||{})[e.use||"base"];
         return `<span class="chip ${e.use&&e.use!=="base"?"good":""}">${st}: <b>${esc(e.use||"base")}</b>${m?` ${pc(m[0])}`:""}</span>`}).join("")}</div>
@@ -5158,6 +5310,16 @@ function renderSpot(s){
         <span class="chip bad">${M.ruggers} rugger devs</span><span class="chip bad">${M.rug_wallets} rug wallets</span><span class="chip good">${M.smart} smart wallets</span></div>`:""}
       <h3 style="margin-top:12px">Hot themes</h3><div class="chips">${T.length?T.map(t=>`<span class="chip hot">#${esc(t[0])}</span>`).join(""):'<span class="mute small">none standing out yet</span>'}</div>
       ${B?`<div class="small">AI brain: ${B.enabled?esc(B.model)+", "+B.rated+" rated"+(B.spent?", about $"+B.spent.toFixed(2):""):"off"}</div>`:""}</div>`);
+}
+// brain v2: the boosted model, trained on stored practice trades and tested on ones it never saw
+function brain2Txt(L){
+  const B=L.brain2; if(!B)return "";
+  const pc=v=>(v>=0?"+":"")+(v*100).toFixed(1)+"%";
+  if(!B.stat)return `<div class="small" style="margin-top:8px">Brain v2: ${B.training?"training now...":`collecting practice trades, ${Math.min(B.samples,B.need)}/${B.need} before its first training`}</div>`;
+  const S=B.stat, edge=S.top_avg>0.03;
+  return `<div class="small" style="margin-top:8px">Brain v2${B.training?" (retraining...)":""}: trained on ${S.n.toLocaleString()} practice trades. `+
+    `On ${S.test.toLocaleString()} it never saw, its best-scored ${S.top_n} averaged <b style="color:${edge?"var(--up)":"var(--down)"}">${pc(S.top_avg)}</b> `+
+    `(all of them: ${pc(S.test_avg)}). ${edge?"It has found something worth proving.":"No edge found yet, so it is not picking."}</div>`;
 }
 // step 2 and 3: how far the blind picks are from proving a profit (the line Spark must beat is 0%)
 function proofGauge(L){

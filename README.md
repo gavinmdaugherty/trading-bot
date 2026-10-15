@@ -118,6 +118,12 @@ Spark trains a small model on what actually happens to pump.fun launches:
 
    New signals sit out until they have enough data to be measured, so adding them never upsets what Spark already learned.
 3. **Trading on it:** after 200 shadow trades the model replaces Spark's hand-set thresholds, and Spark buys only when it expects at least +3%.
+   - **Brain v2** takes over once Spark has 1,000 stored practice trades. It keeps the latest 6,000 (signals and result) in `learn.json`.
+   - It trains a gradient-boosted model in the background, retraining every 400 new trades. The model learns combinations of signals and predicts the return itself.
+   - It trains on the older 80% and is tested on the newest 20%, which it never saw.
+   - Its expected return for a launch is what test trades with a similar score actually returned, made consistent so a higher score never means a lower return.
+   - If even its best-scored band loses money on that test, it picks nothing.
+   - The dashboard shows what it found.
 4. **Real money needs proof:** Spark LIVE waits until the model's own picks, scored before their results were known, have made money on average over at least 30 trades. A model that keeps losing is never cleared to trade. Picks are booked the way Spark really trades:
    - no more open at once than Spark's position limit
    - the same buy-rate limit and per-token cooldown
