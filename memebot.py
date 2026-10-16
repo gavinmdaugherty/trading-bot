@@ -5583,7 +5583,7 @@ function render(s){
     b.textContent=(s.halted?"LIVE TRADING HALTED after repeated failed transactions. Check open positions and restart. ":"Real funds at risk. ")+
       (s.wallet?"Wallet "+s.wallet.pub+": "+money(s.wallet.usdc)+" USDC, "+s.wallet.sol.toFixed(4)+" SOL.":"Reading wallet balance...")+
       (s.route&&s.route!=="jupiter"?" Route: "+s.route+".":"")+
-      (s.learn&&s.agents.some(a=>a.live&&a.learns)?(s.learn.proven?" Spark is in BUY MODE.":(s.learn.ready?" Spark is proving itself: no real buys yet.":" Spark is learning: no real buys yet.")):"")+
+      (s.learn&&s.agents.some(a=>a.live&&a.learns)?((s.learn.proven||s.learn.skip_proof)?" Spark is in BUY MODE"+(s.learn.skip_proof&&!s.learn.proven?" (proof skipped).":"."):(s.learn.ready?" Spark is proving itself: no real buys yet.":" Spark is learning: no real buys yet.")):"")+
       (s.fills&&s.fills.n?` Live fills: average ${s.fills.avg.toFixed(1)}s from signal to filled (last ${s.fills.last.toFixed(1)}s, ${s.fills.n} buys).`:"")}
   else if(s.dex&&s.dex.error&&!demo){b.style.display="block";b.textContent="Market data problem: "+s.dex.error+". The bot keeps retrying; check your internet connection or firewall."}
   else if(s.pump&&!demo&&s.pump.seen>=10&&!s.pump.trades&&(s.pump.connected_for>90||s.pump.rpc)){b.style.display="block";
