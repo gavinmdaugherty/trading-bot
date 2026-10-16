@@ -2098,5 +2098,18 @@ class Firehose(unittest.TestCase):
         self.assertTrue(eng(["Spark", "Hawk"], copy)._needs_firehose())
 
 
+
+class RpcErrors(unittest.TestCase):
+    def test_rpc_errors_are_put_in_plain_words(self):
+        t = m.SolanaLive.rpc_error_text
+        e = {"code": -32002, "message": "Transaction simulation failed: Error processing Instruction 3: custom program error: 0x1",
+             "data": {"logs": ["Program log: Instruction: Buy", "Transfer: insufficient lamports 100, need 90000"]}}
+        self.assertIn("not enough SOL", t(e))
+        self.assertIn("simulation failed", t(e))   # still read as a preflight failure
+        e2 = {"code": -32002, "message": "Transaction simulation failed: custom program error: 0x1772",
+              "data": {"logs": ["Program log: AnchorError occurred. Error Code: TooMuchSolRequired."]}}
+        self.assertEqual(m.SolanaLive._stage(t(e2)), "slip")
+        self.assertIn("TooMuchSolRequired", t(e2))
+
 if __name__ == "__main__":
     unittest.main()

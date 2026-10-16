@@ -2210,8 +2210,22 @@ class SolanaLive:
     def _rpc(self, method, params):
         d = self._http(self.rpc, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
         if d.get("error"):
-            raise RuntimeError(f"rpc {method}: {str(d['error'])[:200]}")
+            raise RuntimeError(f"rpc {method}: {self.rpc_error_text(d['error'])}")
         return d["result"]
+
+    @staticmethod
+    def rpc_error_text(err):
+        """An RPC error in plain words: its message plus the program log lines that say what went wrong,
+        instead of the raw JSON (whose start is all that fits on a log line)."""
+        if not isinstance(err, dict):
+            return str(err)[:300]
+        msg = str(err.get("message") or "")
+        logs = (err.get("data") or {}).get("logs") or [] if isinstance(err.get("data"), dict) else []
+        low = (msg + " " + " ".join(map(str, logs))).lower()
+        if "insufficient lamports" in low or "no record of a prior credit" in low or "insufficient funds" in low:
+            return "not enough SOL in the wallet for this buy plus fees (" + msg[:120] + ")"
+        bad = [str(x) for x in logs if any(k in str(x).lower() for k in ("error", "insufficient", "failed", "exceed"))]
+        return (msg + (" | " + " | ".join(b[:120] for b in bad[-2:]) if bad else ""))[:300]
 
     # ---- wallet reads ----
     def token_balance(self, mint):
@@ -3775,7 +3789,7 @@ class Engine:
         """A direct-route problem that is not the market's doing: fall back to Jupiter, and switch
         the route off for this run if it keeps happening."""
         self.direct_fails += 1
-        self.emit("WARN", f"direct pump.fun {what} failed ({err[:120]}); using Jupiter instead")
+        self.emit("WARN", f"direct pump.fun {what} failed ({err.replace('rpc sendTransaction: ', '')[:240]}); using Jupiter instead")
         if self.direct_fails >= self.cfg["live_direct_max_fails"] and self.direct_ok:
             self.direct_ok = False
             self.emit("WARN", "direct pump.fun route switched off for this run after repeated errors. "
