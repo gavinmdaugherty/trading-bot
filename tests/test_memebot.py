@@ -1084,6 +1084,19 @@ class RealityCheck(unittest.TestCase):
         self.eng._buy_curve("Spark LIVE", self.q())
         self.assertEqual(sizes, [25.0])
 
+    def test_no_proof_buys_without_waiting_for_practice_and_is_never_benched(self):
+        eng = self.eng
+        eng._hard_curve_reason = lambda a, q: None
+        eng._soft_curve_reason = lambda a, q: None
+        q = dict(self.q(), prog=30.0)
+        self.assertIn("learning", eng._why_not_curve("Spark LIVE", q))
+        eng.cfg = dict(eng.cfg, skip_proof=True)
+        self.assertIsNone(eng._why_not_curve("Spark LIVE", q))
+        st = eng.state["agents"]["Spark LIVE"]
+        st["real_rets"] = [-0.3] * 20
+        eng._check_bench("Spark LIVE")
+        self.assertFalse(st.get("bench"))
+
     def test_costs_stay_on_the_guess_until_enough_real_fills(self):
         L, guess = self.eng.learner, self.eng._cost_guess()
         for _ in range(4):

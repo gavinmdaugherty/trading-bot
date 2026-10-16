@@ -129,6 +129,7 @@ CFG = dict(
     live_usd=50.0,               # bankroll per live agent: the most it can ever deploy
     live_min_trade_usd=5.0,
     live_max_trade_usd=10.0,     # hard cap per order
+    skip_proof=False,            # --no-proof: real buys start at once, without waiting for practice to prove a profit
     trade_usd=None,              # --trade-usd: every real buy (except Hawk's copies) is this size
     live_slippage_bps=300,       # buys: 3% tolerance
     live_sell_slippage_bps=[500, 1000, 2500],   # sells retry with wider tolerance
@@ -3496,7 +3497,7 @@ class Engine:
             return "live trades Solana only"
         if self.live is None or self.live_halt:
             return "live trading halted"
-        if self.state["agents"][name].get("bench") and not self._unbench(name):
+        if self.state["agents"][name].get("bench") and not self.cfg.get("skip_proof") and not self._unbench(name):
             return "benched: real trades fell behind practice"
         if self.wallet and self.wallet.get("sol", 1.0) < self.cfg["live_min_sol_trade"]:
             return "wallet SOL too low for fees"
@@ -3517,7 +3518,7 @@ class Engine:
         stop real buys and keep practising. Practice then has to prove itself again."""
         c, st = self.cfg, self.state["agents"][name]
         rets = st.get("real_rets", [])
-        if st.get("bench") or len(rets) < c["bench_min"]:
+        if c.get("skip_proof") or st.get("bench") or len(rets) < c["bench_min"]:   # --no-proof: never benched
             return
         last = rets[-c["bench_window"]:]
         real, practice = sum(last) / len(last), self._practice_avg(name)
@@ -3614,11 +3615,12 @@ class Engine:
             if L.ready():  # the model replaces the hand-set thresholds below
                 if L.ev(Learner.features(q)) < c["learn_edge"]:
                     return "model sees no edge"
-                if a.get("live") and not L.proven():
+                if a.get("live") and not L.proven() and not c.get("skip_proof"):
                     return "model not proven yet"
                 return None
-            if a.get("live"):
+            if a.get("live") and not c.get("skip_proof"):
                 return f"learning ({L.n}/{L.min_n} shadow trades)"
+            # --no-proof: until the model is trained, real buys follow the hand-set thresholds below
         if q["prog"] < a["min_prog"]:
             return "curve too early"
         return self._soft_curve_reason(a, q)
@@ -4852,7 +4854,7 @@ class Engine:
                 real_only=bool(agents) and all(a["live"] for a in agents),
                 fills=dict(n=len(self.fill_times), last=self.fill_times[-1] if self.fill_times else None,
                            avg=round(sum(self.fill_times) / len(self.fill_times), 2) if self.fill_times else None),
-                learn=dict(self.learner.summary(), open=len(self.shadows),
+                learn=dict(self.learner.summary(), open=len(self.shadows), skip_proof=bool(self.cfg.get("skip_proof")),
                            calib=self.learner.calib_summary(self._cost_guess())) if self.learner else None,
                 route=("direct" if self.direct_ok else "direct off (errors)") if self.cfg.get("live_direct") else "jupiter",
                 memory=self.memory.summary() if self.memory else None,
@@ -5403,13 +5405,14 @@ function renderSpot(s){
   if(!L){el.style.display="none";return}
   el.style.display="grid";
   const pc=v=>v==null?"-":(v>=0?"+":"")+(v*100).toFixed(1)+"%";
-  const stage=!L.ready?0:(L.proven?2:1);
-  const state=["Step 1: learning","Step 2: proving itself","Buy mode: trading on what it learned"][stage];
+  const stage=L.skip_proof?2:(!L.ready?0:(L.proven?2:1));
+  const state=L.skip_proof?(L.ready?"Buy mode: proof skipped (--no-proof), trading on the model now":"Buy mode: proof skipped (--no-proof), trading on the rules while it learns")
+    :["Step 1: learning","Step 2: proving itself","Buy mode: trading on what it learned"][stage];
   const learnPct=Math.min(100,L.n/L.min_n*100);
   const M=s.memory, B=s.brain, T=s.themes||[];
   const top=(L.top||[]).map(([f,w])=>`<span class="chip ${w>0?"good":"bad"}">${esc(f.replace(/_/g," "))} <b>${w>0?"+":""}${w}</b></span>`).join("");
   setHTML("#spot",`<div class="brain">SPARK<br>BRAIN</div>
-    <div><h3>Learning <a href="/report" target="_blank" style="color:var(--up);text-decoration:none;margin-left:8px;text-transform:none;letter-spacing:0">shareable report ↗</a></h3><div class="state" style="color:${L.proven?"var(--up)":(L.ready?"var(--violet)":"var(--text)")}">${state}</div>
+    <div><h3>Learning <a href="/report" target="_blank" style="color:var(--up);text-decoration:none;margin-left:8px;text-transform:none;letter-spacing:0">shareable report ↗</a></h3><div class="state" style="color:${(L.proven||L.skip_proof)?"var(--up)":(L.ready?"var(--violet)":"var(--text)")}">${state}</div>
       <div class="small" style="margin:0">${L.n.toLocaleString()} practice trades learned · ${L.open} running now</div>
       <div class="steps">${["Learning","Proving","Buy mode"].map((t,i)=>`<span class="${i<stage?"done":(i===stage?"now":"")}">${i<stage?"✓ ":""}${t}</span>`).join("")}</div>
       ${stage===0?`<div class="meterbar"><b style="width:${learnPct}%"></b></div><div class="small" style="margin:0">${L.n}/${L.min_n} practice trades before it starts picking</div>`:proofGauge(L)}
@@ -6179,6 +6182,9 @@ def main():
     ap.add_argument("--trade-usd", type=float, default=None,
                     help="with --live: the size of every real buy in USD (for example 25), instead of a share "
                          "of the bankroll. Hawk's copies use --follow-usd")
+    ap.add_argument("--no-proof", action="store_true",
+                    help="with --live: buy with real money straight away, without waiting for practice to "
+                         "prove a profit, and never bench. Riskier")
     ap.add_argument("--unbench", action="store_true",
                     help="let live agents that were benched (real trades far behind practice) buy again now")
     args = ap.parse_args()
@@ -6200,6 +6206,10 @@ def main():
             raise SystemExit(f"--live-usd {args.live_usd:g} is less than one Hawk trade of ${args.follow_usd:g}. "
                              f"Use --live-usd {args.follow_usd:g} or more (for example "
                              f"{args.follow_usd * 3:g} for three trades at once).")
+    if args.no_proof:
+        if not args.live:
+            raise SystemExit("--no-proof needs --live (it changes when real buys start)")
+        CFG["skip_proof"] = True
     if args.trade_usd is not None:
         if not args.live:
             raise SystemExit("--trade-usd needs --live (it sets the size of real buys)")
