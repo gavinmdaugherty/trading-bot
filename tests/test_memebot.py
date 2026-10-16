@@ -1909,6 +1909,30 @@ class WalletWatchCopy(unittest.TestCase):
         pos = eng.state["agents"]["Hawk LIVE"]["positions"][m.tkey("solana", self.MINT)]
         self.assertAlmostEqual(pos["last_price"], 1.0)
 
+    def test_live_copy_of_a_pump_coin_buys_direct_when_there_is_sol(self):
+        live, calls = FakeLive(), []
+        live.direct_buy = lambda mint, sol, sol_usd: (calls.append("pump") or dict(
+            ok=True, spent_usd=sol * sol_usd, spent_sol=sol, raw=5_000_000, decimals=6, sig="D", route="pump"))
+        live.buy = lambda *a, **kw: (calls.append("jup") or dict(ok=False, stage="quote", err="no route"))
+        eng = self.engine(live=live)
+        eng.direct_ok = True
+        eng.wallet = dict(pub="x", usdc=0.0, sol=2.0)
+        mint = "NewCoin11111111111111111111111111111pump"
+        self.push(eng, dict(kind="buy", mint=mint, wallet=self.W, sol=0.5, px_sol=None, sig="S1", src="wallet"))
+        eng._follow_pass()
+        self.assertEqual(calls, ["pump"])
+        pos = eng.state["agents"]["Hawk LIVE"]["positions"][m.tkey("solana", mint)]
+        self.assertEqual(pos["route"], "pump")
+
+    def test_failed_copy_says_why_and_retries_fast(self):
+        live = FakeLive()
+        live.buy = lambda *a, **kw: dict(ok=False, stage="quote", err="route price 70.0% above market")
+        eng = self.engine(live=live)
+        self.push(eng, dict(kind="buy", mint=self.MINT, wallet=self.W, sol=0.5, px_sol=0.0005, sig="S1", src="wallet"))
+        eng._follow_pass()
+        self.assertIn("70.0% above market", eng.follow_log[-1]["note"])
+        self.assertEqual(eng.follow_pending[0]["retry_at"], eng.t + 2)
+
     def test_same_trade_from_both_sources_is_copied_once_and_partial_sells_each_count(self):
         eng = self.engine()
         eng.pump.handle(dict(txType="create", mint="CURVE1", traderPublicKey="D", symbol="CV", name="cv", initialBuy=0,

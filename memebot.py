@@ -154,6 +154,7 @@ CFG = dict(
     follow_max_per_hour=10,      # most Hawk buys an hour, whatever the watchlist does
     follow_max_dev_pct=60.0,     # copy even when the coin ran up to this much after the copied wallet's buy
     follow_slippage_bps=2500,    # memecoins move fast: a copy that fails on slippage is a missed copy
+    follow_retry_s=120,          # keep trying a copy this long when no route has it yet
     follow_min_sol=0.05,         # ignore a copied wallet's buys smaller than this (dust, tests)
     follow_checks=True,          # skip launches with red flags (bundles, a rugger creator, a scout veto)
     # ---- automatic stop: real results far worse than practice ----
@@ -1488,6 +1489,7 @@ class WalletWatch:
         self.last_seen = {}          # wallet -> time of its latest transaction (block time)
         self.reconnects = 0
         self.backfilled = 0          # trades the websocket missed and the 20s check caught
+        self.labels = {}             # wallet -> its watchlist name
         self.no_trade = 0            # transactions read that were not a buy or a sell (transfers, claims...)
         self.max_version = 0         # newest transaction format to ask the RPC for; raised when one turns up
 
@@ -1634,6 +1636,9 @@ class WalletWatch:
                         evs = self.parse(tx, self.wallets, sig)
                         if not evs:
                             self.no_trade += 1
+                            who = ", ".join(self.labels.get(x) or short(x) for x in self.wallets if x in json.dumps(tx))
+                            self.w.events.append(("PUMP", f"{who or 'copy wallet'}: transaction {sig[:10]}... was not a "
+                                                          f"buy or sell, so nothing to copy (solscan.io/tx/{sig})"))
                         for ev in evs:
                             ev["t"] = self.w.clock()
                             with self.w.lock:
@@ -3316,6 +3321,7 @@ class Engine:
         self.follow_stats = {}                  # wallet -> dict(seen=, copied=, skipped=, last=)
         self.follow_buys = {}                   # agent -> buy times, for the hourly cap
         self.follow_seen, self.follow_pending = {}, []
+        self.follow_err = ""                    # why the latest copy attempt did not fill
         self.wallet_watch = None                # on-chain watch of the copy wallets (real runs)
         self.report_t = 0.0
         self.blocks = {}          # agent -> (tokens checked, {reason it didn't buy: count})
@@ -4212,6 +4218,7 @@ class Engine:
                 self.wallet_watch = WalletWatch(self.pump)
                 self.wallet_watch.start()
             self.wallet_watch.set_wallets(copy)
+            self.wallet_watch.labels = {a: w["label"] for a, w in watch.items()}
         elif self.wallet_watch is not None:
             self.wallet_watch.set_wallets([])
 
@@ -4313,10 +4320,11 @@ class Engine:
                 if not why and sum(1 for t in recent if self.t - t < 3600) >= c["follow_max_per_hour"]:
                     why = f"hourly cap ({c['follow_max_per_hour']} buys)"
                 if not why:
+                    self.follow_err = ""
                     ok = (self._buy_curve(name, q, size=c["follow_usd"]) if curve
                           else self._buy_follow_dex(name, ev, sym, c["follow_usd"]))
                     if not ok:
-                        why, retry = "no route or order failed", True
+                        why, retry = (self.follow_err or "no route or order failed")[:120], True
                 if why:
                     whys.append(f"{name}: {why}" if len(names) > 1 else why)
                     continue
@@ -4328,10 +4336,11 @@ class Engine:
             if bought:
                 self._follow_note(ev, sym, f"{verb} ${sym}: bought ({', '.join(bought)})"
                                   + (f" after {self.t - first:.0f}s of retries" if ev.get("retry") else ""), True)
-            elif retry and self.t - first < 90:
-                self.follow_pending.append(dict(ev=dict(ev, retry=True, first_t=first), retry_at=self.t + 6))
+            elif retry and self.t - first < c["follow_retry_s"]:
+                self.follow_pending.append(dict(ev=dict(ev, retry=True, first_t=first), retry_at=self.t + 2))
                 if not ev.get("retry"):
-                    self._follow_note(ev, sym, f"{verb} ${sym}: no route yet, retrying for up to 90s", False)
+                    self._follow_note(ev, sym, f"{verb} ${sym}: not bought yet ({'; '.join(whys)}), "
+                                               f"retrying every 2s for up to {c['follow_retry_s']}s", False)
             else:
                 self._follow_note(ev, sym, f"{verb} ${sym}: skipped, {'; '.join(whys) or 'no Hawk could buy'}", False)
 
@@ -4350,16 +4359,33 @@ class Engine:
         k = tkey("solana", ev["mint"])
         if live:
             st["cool"][k] = self.t
-            res = self.live.buy(ev["mint"], size, px, slippage_bps=c["follow_slippage_bps"],
-                                max_dev_pct=c["follow_max_dev_pct"], priority=c["live_curve_priority"])
+            res = None
+            # a pump.fun coin (on the curve or in its PumpSwap pool) is bought straight on pump.fun when
+            # there is SOL for it: that works from the first second, before Jupiter has a route
+            if ev["mint"].endswith("pump") and self._direct_usable(size):
+                res = self.live.direct_buy(ev["mint"], size / self.sol_usd, self.sol_usd)
+                if res["ok"]:
+                    self.direct_fails = 0
+                    if self.wallet:
+                        self.wallet["sol"] = self.wallet.get("sol", 0.0) - res.get("spent_sol", 0.0)
+                elif res.get("stage") in ("build", "sim"):
+                    self._direct_error("buy", res["err"])
+                    res = None
+                elif res.get("stage") != "tx":
+                    self.follow_err = f"pump.fun: {res['err']}"
+                    res = None
+            if res is None:
+                res = self.live.buy(ev["mint"], size, px, slippage_bps=c["follow_slippage_bps"],
+                                    max_dev_pct=c["follow_max_dev_pct"], priority=c["live_curve_priority"])
             if not res["ok"]:
+                self.follow_err = res.get("err") or "order failed"
                 if res.get("stage") == "tx":
                     self._live_fail(f"{name} buy ${sym} failed: {res['err']}")
                 return False
             self.live_fails = 0
             spent, units = res["spent_usd"], res["raw"] / 10 ** res["decimals"]
             px = px or spent / units
-            extra = dict(live=True, raw=res["raw"], decimals=res["decimals"], sig=res["sig"], route="jup")
+            extra = dict(live=True, raw=res["raw"], decimals=res["decimals"], sig=res["sig"], route=res.get("route", "jup"))
         else:
             if not px:
                 return False
