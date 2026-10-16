@@ -1901,6 +1901,17 @@ class WalletWatchCopy(unittest.TestCase):
         self.assertIsNone(eng.wallet_watch)                                  # the demo never opens connections
 
 
+    def test_missed_trades_are_backfilled_once(self):
+        ww = m.WalletWatch.__new__(m.WalletWatch)
+        ww.seen = {"OLDWS"}
+        now = 1_000_000
+        rows = [dict(signature="NEW", blockTime=now - 5, err=None),
+                dict(signature="FAILED", blockTime=now - 5, err={"x": 1}),
+                dict(signature="OLDWS", blockTime=now - 10, err=None),
+                dict(signature="STALE", blockTime=now - 600, err=None)]
+        self.assertEqual(ww.missed(rows, now=now), ["NEW"])
+        self.assertEqual(ww.missed(rows, now=now), [])   # never copied twice
+
 class PhantomPositions(unittest.TestCase):
     def test_positions_the_wallet_no_longer_holds_are_cleared(self):
         import tempfile

@@ -1484,6 +1484,7 @@ class WalletWatch:
         self.connected_t = None
         self.last_seen = {}          # wallet -> time of its latest transaction (block time)
         self.reconnects = 0
+        self.backfilled = 0          # trades the websocket missed and the 20s check caught
 
     def set_wallets(self, wallets):
         wallets = set(wallets)
@@ -1498,25 +1499,51 @@ class WalletWatch:
         threading.Thread(target=self._activity_loop, name="wallet-activity", daemon=True).start()
 
     def _activity_loop(self):
-        """Every 5 minutes, when each copy wallet last did anything on-chain: answers "did they even trade?"."""
+        """Every 20 seconds, each copy wallet's latest transactions straight from the RPC. Answers "did they
+        even trade?" (last on-chain), and is a safety net: a trade the websocket missed (it was reconnecting,
+        or the RPC dropped the notification) is still copied if it is under 90 seconds old."""
         while True:
             for wallet in list(self.wallets):
                 try:
-                    d = json.loads(post_json(self.rpc, {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
-                                                        "params": [wallet, {"limit": 1}]}, timeout=10))
-                    rows = d.get("result") or []
+                    rows = self.recent(wallet)
                     if rows and rows[0].get("blockTime"):
                         self.last_seen[wallet] = max(self.last_seen.get(wallet, 0), rows[0]["blockTime"])
+                    for sig in self.missed(rows):
+                        self.backfilled += 1
+                        self.jobs.put_nowait((sig, time.time()))
+                except queue.Full:
+                    pass
                 except Exception as e:
                     self.error = f"activity check: {str(e)[:90]}"
                     if "429" in str(e):
                         break   # rate limited: leave the RPC alone until the next round
-                time.sleep(2)
-            time.sleep(600 if "429" in self.error else (300 if self.wallets else 10))
+                time.sleep(1)
+            time.sleep(300 if "429" in self.error else (20 if self.wallets else 10))
+
+    def recent(self, wallet, n=10):
+        d = json.loads(post_json(self.rpc, {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+                                            "params": [wallet, {"limit": n, "commitment": "confirmed"}]}, timeout=10))
+        if d.get("error"):
+            raise RuntimeError(str(d["error"])[:90])
+        return d.get("result") or []
+
+    def missed(self, rows, now=None, max_age=90):
+        """Signatures in rows (newest first) that succeeded, are recent, and were never seen."""
+        now = now or time.time()
+        out = []
+        for r in rows:
+            sig, bt = r.get("signature"), r.get("blockTime")
+            if not sig or r.get("err") is not None or sig in self.seen:
+                continue
+            if not bt or now - bt > max_age:
+                continue
+            self.seen.add(sig)
+            out.append(sig)
+        return out
 
     def status(self):
         return dict(connected=self.connected, error=self.error, ws_error=self.ws_error, notes=self.notes, txs=self.txs,
-                    reconnects=self.reconnects, since=self.connected_t, last_seen=dict(self.last_seen))
+                    reconnects=self.reconnects, backfilled=self.backfilled, since=self.connected_t, last_seen=dict(self.last_seen))
 
     def _run(self):
         delay = 2
@@ -5397,7 +5424,7 @@ function renderWatch(F){
   const bad=(F.bad||[]).length?`<div class="small" style="color:var(--down)">${F.bad.map(esc).join("<br>")}</div>`:"";
   const ws=!F.on?"":(!W?(F.wallets.some(w=>w.mode!=="snipe")?'<div class="small">On-chain wallet watch: starting...</div>':""):
     `<div class="small" style="color:${W.connected?"var(--up)":"var(--down)"}">On-chain wallet watch: ${W.connected?"connected":"NOT connected"}`+
-    ` · ${W.notes} transactions seen, ${W.txs} read`+(W.reconnects?` · ${W.reconnects} reconnects`:"")+
+    ` · ${W.notes} transactions seen, ${W.txs} read`+(W.reconnects?` · ${W.reconnects} reconnects`:"")+(W.backfilled?` · ${W.backfilled} caught by the 20s check`:"")+
     (!W.connected&&W.ws_error?` · <span style="color:var(--down)">${esc(W.ws_error)}</span>`:"")+
     (W.error?` · <span style="color:var(--down)">${esc(W.error)}</span>`:"")+
     (/429/.test((W.ws_error||"")+(W.error||""))?`<br><span style="color:var(--down)">Your Solana RPC is rate-limiting Spark. Use a Helius key in SOLANA_RPC_URL (free plan is fine) and run only one copy of Spark.</span>`:"")+`</div>`);
