@@ -1075,6 +1075,15 @@ class RealityCheck(unittest.TestCase):
         return dict(addr="MINT1", symbol="GO", price=50 / 900e6 * self.eng.sol_usd, vsol=50.0, vtok=900e6,
                     mcap=1e4, prog=20.0, buyers=40, net_sol_5m=6.0)
 
+    def test_trade_usd_fixes_the_size_of_real_buys(self):
+        sizes = []
+        self.eng._live_buy_curve = lambda name, q, size: sizes.append(size) or False
+        self.eng.cfg = dict(self.eng.cfg, live_usd=50.0, trade_usd=25.0, live_max_trade_usd=25.0)
+        st = self.eng.state["agents"]["Spark LIVE"]
+        st["cash"] = 50.0
+        self.eng._buy_curve("Spark LIVE", self.q())
+        self.assertEqual(sizes, [25.0])
+
     def test_costs_stay_on_the_guess_until_enough_real_fills(self):
         L, guess = self.eng.learner, self.eng._cost_guess()
         for _ in range(4):

@@ -77,7 +77,7 @@ Before a pump.fun entry, these checks are computed live from the trade stream. E
 
 If the creator sells while an agent holds the token, the curve agents exit at once. A curve position that graduates moves over to DEX pricing automatically.
 
-**Live pump.fun trading:** `--live --live-agents Spark --live-usd 15` makes Spark trade real USDC. Jupiter routes each buy to the bonding curve, with a 10% slippage cap, and a buy is refused if the route price is more than 10% above the curve price. After a full sell, the bot closes the empty token account to get its rent (about 0.002 SOL) back. With a small bankroll it skips partial take-profits that would be below the $5 minimum order.
+**Live pump.fun trading:** `--live --live-agents Spark --live-usd 15` makes Spark trade real USDC. Add `--trade-usd 25` to make every real buy exactly $25 instead of a share of the bankroll. Jupiter routes each buy to the bonding curve, with a 10% slippage cap, and a buy is refused if the route price is more than 10% above the curve price. After a full sell, the bot closes the empty token account to get its rent (about 0.002 SOL) back. With a small bankroll it skips partial take-profits that would be below the $5 minimum order.
 
 ## Hawk: snipe and copy wallets
 

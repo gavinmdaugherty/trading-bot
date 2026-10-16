@@ -129,6 +129,7 @@ CFG = dict(
     live_usd=50.0,               # bankroll per live agent: the most it can ever deploy
     live_min_trade_usd=5.0,
     live_max_trade_usd=10.0,     # hard cap per order
+    trade_usd=None,              # --trade-usd: every real buy (except Hawk's copies) is this size
     live_slippage_bps=300,       # buys: 3% tolerance
     live_sell_slippage_bps=[500, 1000, 2500],   # sells retry with wider tolerance
     live_max_price_dev_pct=8.0,  # refuse a buy if the route price is this far above market
@@ -3701,8 +3702,8 @@ class Engine:
         a, st, c = self.acfg[name], self.state["agents"][name], self.cfg
         live = a.get("live")
         min_t = c["live_min_trade_usd"] if live else c["min_trade_usd"]
-        size = min(st["cash"], max(min_t, a["pos_pct"] * self._equity(st)),
-                   p["liq"] * c["max_liq_frac"])
+        want = c["trade_usd"] if live and c.get("trade_usd") else a["pos_pct"] * self._equity(st)
+        size = min(st["cash"], max(min_t, want), p["liq"] * c["max_liq_frac"])
         if live:
             size = min(size, c["live_max_trade_usd"])
         if size < min_t:
@@ -3735,6 +3736,8 @@ class Engine:
         live = a.get("live")
         min_t = c["live_min_trade_usd"] if live else c["min_trade_usd"]
         want = size if size is not None else max(min_t, a["pos_pct"] * self._equity(st))
+        if size is None and live and c.get("trade_usd"):
+            want = c["trade_usd"]   # --trade-usd: a fixed size for every real buy
         size = min(st["cash"], max(min_t, want), q["vsol"] * c["pump_max_impact"] * self.sol_usd)
         if live:
             size = min(size, c["live_max_trade_usd"])
@@ -6173,6 +6176,9 @@ def main():
     ap.add_argument("--follow-unchecked", action="store_true",
                     help="Hawk copies and snipes even when a launch shows red flags (bundles, a creator who "
                          "rugged before, a scout veto). Off by default")
+    ap.add_argument("--trade-usd", type=float, default=None,
+                    help="with --live: the size of every real buy in USD (for example 25), instead of a share "
+                         "of the bankroll. Hawk's copies use --follow-usd")
     ap.add_argument("--unbench", action="store_true",
                     help="let live agents that were benched (real trades far behind practice) buy again now")
     args = ap.parse_args()
@@ -6194,6 +6200,16 @@ def main():
             raise SystemExit(f"--live-usd {args.live_usd:g} is less than one Hawk trade of ${args.follow_usd:g}. "
                              f"Use --live-usd {args.follow_usd:g} or more (for example "
                              f"{args.follow_usd * 3:g} for three trades at once).")
+    if args.trade_usd is not None:
+        if not args.live:
+            raise SystemExit("--trade-usd needs --live (it sets the size of real buys)")
+        if args.trade_usd < CFG["live_min_trade_usd"]:
+            raise SystemExit(f"--trade-usd must be at least {CFG['live_min_trade_usd']:.0f} (the smallest live order)")
+        if args.live_usd < args.trade_usd:
+            raise SystemExit(f"--live-usd {args.live_usd:g} is less than one trade of ${args.trade_usd:g}. "
+                             f"Use --live-usd {args.trade_usd:g} or more.")
+        CFG["trade_usd"] = args.trade_usd
+        CFG["live_max_trade_usd"] = max(CFG["live_max_trade_usd"], args.trade_usd)
     if args.live_only and not args.live:
         raise SystemExit("--live-only needs --live (it hides the paper agents and shows only real money)")
     if args.live and args.demo:
