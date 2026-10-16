@@ -48,6 +48,7 @@ import math
 import os
 import queue
 import random
+import re
 import socket
 import ssl
 import struct
@@ -1485,6 +1486,7 @@ class WalletWatch:
         self.last_seen = {}          # wallet -> time of its latest transaction (block time)
         self.reconnects = 0
         self.backfilled = 0          # trades the websocket missed and the 20s check caught
+        self.max_version = 0         # newest transaction format to ask the RPC for; raised when one turns up
 
     def set_wallets(self, wallets):
         wallets = set(wallets)
@@ -1609,13 +1611,17 @@ class WalletWatch:
     def _fetch_loop(self):
         while True:
             sig, t = self.jobs.get()
-            for attempt in range(4):   # a fresh transaction can take a moment to be served
+            for attempt in range(5):   # a fresh transaction can take a moment to be served
                 try:
                     d = json.loads(post_json(self.rpc, {"jsonrpc": "2.0", "id": 1, "method": "getTransaction", "params": [
-                        sig, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}]},
-                        timeout=10))
+                        sig, {"encoding": "jsonParsed", "commitment": "confirmed",
+                              "maxSupportedTransactionVersion": self.max_version}]}, timeout=10))
                     tx = d.get("result")
                     if d.get("error"):
+                        newer = self.newer_version(d["error"])
+                        if newer is not None:   # a newer transaction format: ask for it and try again now
+                            self.max_version = newer
+                            continue
                         raise RuntimeError(str(d["error"])[:90])
                     if tx:
                         bt = tx.get("blockTime")
@@ -1628,10 +1634,17 @@ class WalletWatch:
                                 self.w.follow_events.append(ev)
                             self.w.wake.set()
                         self.txs += 1
+                        if self.error.startswith("getTransaction"):
+                            self.error = ""
                         break
                 except Exception as e:
                     self.error = f"getTransaction: {str(e)[:90]}"
                 time.sleep(0.6 * (attempt + 1))
+
+    def newer_version(self, err):
+        """The version in "Transaction version (N) is not supported by the requesting client", if above ours."""
+        m = re.search(r"version \((\d+)\) is not supported", str((err or {}).get("message", "") if isinstance(err, dict) else err))
+        return int(m.group(1)) if m and int(m.group(1)) > self.max_version else None
 
     @classmethod
     def parse(cls, tx, wallets, sig=""):

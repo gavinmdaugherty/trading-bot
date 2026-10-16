@@ -1912,6 +1912,17 @@ class WalletWatchCopy(unittest.TestCase):
         self.assertEqual(ww.missed(rows, now=now), ["NEW"])
         self.assertEqual(ww.missed(rows, now=now), [])   # never copied twice
 
+    def test_newer_transaction_versions_are_requested(self):
+        ww = m.WalletWatch.__new__(m.WalletWatch)
+        ww.max_version = 0
+        err = {"code": -32015, "message": "Transaction version (1) is not supported by the requesting client. "
+                                          "Please try the request again with the following configuration parameter: "
+                                          "\"maxSupportedTransactionVersion\": 1"}
+        self.assertEqual(ww.newer_version(err), 1)
+        ww.max_version = 1
+        self.assertIsNone(ww.newer_version(err))
+        self.assertIsNone(ww.newer_version({"code": -32004, "message": "Block not available"}))
+
 class PhantomPositions(unittest.TestCase):
     def test_positions_the_wallet_no_longer_holds_are_cleared(self):
         import tempfile
