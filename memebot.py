@@ -129,6 +129,7 @@ CFG = dict(
     live_usd=50.0,               # bankroll per live agent: the most it can ever deploy
     live_min_trade_usd=5.0,
     live_max_trade_usd=10.0,     # hard cap per order
+    stop_usd=None,               # --stop-usd: sell a real position once it is down this many dollars
     skip_proof=False,            # --no-proof: real buys start at once, without waiting for practice to prove a profit
     trade_usd=None,              # --trade-usd: every real buy (except Hawk's copies) is this size
     live_slippage_bps=300,       # buys: 3% tolerance
@@ -2227,6 +2228,45 @@ class SolanaLive:
         bad = [str(x) for x in logs if any(k in str(x).lower() for k in ("error", "insufficient", "failed", "exceed"))]
         return (msg + (" | " + " | ".join(b[:120] for b in bad[-2:]) if bad else ""))[:300]
 
+    def own_delta(self, sig, tries=4):
+        """(SOL change in lamports, USDC change in raw units) of this wallet in one transaction, read
+        from the transaction itself. Unlike comparing balances before and after, a deposit, a manual
+        swap or another trade landing at the same moment cannot leak into it. None if unreadable."""
+        ver = 1
+        for i in range(tries):
+            try:
+                d = self._http(self.rpc, {"jsonrpc": "2.0", "id": 1, "method": "getTransaction", "params": [
+                    str(sig), {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": ver}]})
+                if d.get("error"):
+                    m = re.search(r"version \((\d+)\)", str(d["error"]))
+                    if m and int(m.group(1)) > ver:
+                        ver = int(m.group(1))
+                        continue
+                    if "invalid" in str(d["error"]).lower() and ver:
+                        ver = 0   # an RPC that does not know version 1 yet
+                        continue
+                tx = d.get("result")
+                if tx and tx.get("meta"):
+                    meta = tx["meta"]
+                    if meta.get("err") is not None:
+                        return None
+                    keys = [k["pubkey"] if isinstance(k, dict) else k
+                            for k in ((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or []]
+                    if self.pub not in keys:
+                        return None
+                    j = keys.index(self.pub)
+                    sol = meta["postBalances"][j] - meta["preBalances"][j]
+                    usdc = 0
+                    for sign, rows in ((-1, meta.get("preTokenBalances") or []), (1, meta.get("postTokenBalances") or [])):
+                        for r in rows:
+                            if r.get("owner") == self.pub and r.get("mint") == self.USDC:
+                                usdc += sign * int((r.get("uiTokenAmount") or {}).get("amount") or 0)
+                    return sol, usdc
+            except Exception:
+                pass
+            time.sleep(0.5 * (i + 1))
+        return None
+
     # ---- wallet reads ----
     def token_balance(self, mint):
         return self.token_accounts(mint)[:2]
@@ -2363,7 +2403,8 @@ class SolanaLive:
         raw = tok1 - tok0
         if raw <= 0:
             return dict(ok=False, stage="tx", err="confirmed but no tokens received")
-        spent = usdc0 - usdc1
+        own = self.own_delta(sig)
+        spent = -own[1] / 1e6 if own else usdc0 - usdc1
         return dict(ok=True, spent_usd=spent if spent > 0 else usd, raw=raw, decimals=dec, sig=sig,
                     timing=dict(quote=t_quote - t0, landed=t_done - t_quote, total=t_done - t0))
 
@@ -2462,8 +2503,11 @@ class SolanaLive:
         t_done = time.time()
         if tok1 - tok0 <= 0:
             return dict(ok=False, stage="tx", err="confirmed but no tokens received")
-        # SOL that left the wallet, minus rent parked in a new token account (returned when it is closed)
-        spent_sol = max(0.0, ((lam0 - lam1) - (rent1 - rent0)) / 1e9) or sol
+        # SOL that left the wallet, minus rent parked in a new token account (returned when it is closed);
+        # from the transaction itself when it can be read, so a deposit at the same moment is not counted
+        own = self.own_delta(sig)
+        moved = -own[0] if own else lam0 - lam1
+        spent_sol = max(0.0, (moved - (rent1 - rent0)) / 1e9) or sol
         return dict(ok=True, spent_usd=spent_sol * sol_usd, spent_sol=spent_sol, raw=tok1 - tok0,
                     decimals=dec if dec is not None else 6, sig=sig, route="pump",
                     timing=dict(quote=t_built - t0, landed=t_done - t_built, total=t_done - t0))
@@ -2507,11 +2551,15 @@ class SolanaLive:
                 if last["stage"] == "tx":
                     return last
                 continue   # slip / sim / reverted: nothing sold, try a wider tolerance
-            try:
-                lam1 = self._retry(lambda: self._changed(self.lamports, lam0))
-                got = max(0.0, (lam1 - lam0) / 1e9)
-            except Exception:
-                got = None   # sold, but the proceeds could not be read: the engine estimates them
+            own = self.own_delta(sig)
+            if own:
+                got = max(0.0, own[0] / 1e9)
+            else:
+                try:
+                    lam1 = self._retry(lambda: self._changed(self.lamports, lam0))
+                    got = max(0.0, (lam1 - lam0) / 1e9)
+                except Exception:
+                    got = None   # sold, but the proceeds could not be read: the engine estimates them
             return dict(ok=True, got_usd=None if got is None else got * sol_usd, got_sol=got, sig=sig,
                         sold_raw=amount, route="pump")
         return last
@@ -2563,8 +2611,12 @@ class SolanaLive:
                     if self.token_balance(mint)[0] >= raw_now:
                         raise
                     sig = str(e)[-90:]
-                usdc1 = self._changed(self.usdc, usdc0)
-                return dict(ok=True, got_usd=max(0.0, usdc1 - usdc0), sig=sig, sold_raw=amount)
+                own = self.own_delta(sig)
+                if own:
+                    got = own[1] / 1e6
+                else:
+                    got = self._changed(self.usdc, usdc0) - usdc0
+                return dict(ok=True, got_usd=max(0.0, got), sig=sig, sold_raw=amount)
             except Exception as e:
                 last = str(e)[:160]
         return dict(ok=False, stage="tx", err=last)
@@ -3995,6 +4047,8 @@ class Engine:
         ret = (price / pos["ref_price"] - 1) * 100
         peak_ret = (pos["peak"] / pos["ref_price"] - 1) * 100
         held = (self.t - pos["opened"]) / 60.0
+        if pos.get("live") and self.cfg.get("stop_usd") and pos.get("size0"):
+            a = dict(a, sl=-self.cfg["stop_usd"] / pos["size0"] * 100)   # --stop-usd: a stop-loss in dollars
         if dev_sold and a.get("exit_dev_sell"):
             self._sell(name, k, "creator sold")
         elif ret >= a["tp"]:
@@ -6196,6 +6250,9 @@ def main():
     ap.add_argument("--trade-usd", type=float, default=None,
                     help="with --live: the size of every real buy in USD (for example 25), instead of a share "
                          "of the bankroll. Hawk's copies use --follow-usd")
+    ap.add_argument("--stop-usd", type=float, default=None,
+                    help="with --live: sell a real position once it is down this many dollars (for example 10), "
+                         "instead of the stop-loss percentage")
     ap.add_argument("--no-proof", action="store_true",
                     help="with --live: buy with real money straight away, without waiting for practice to "
                          "prove a profit, and never bench. Riskier")
@@ -6220,6 +6277,12 @@ def main():
             raise SystemExit(f"--live-usd {args.live_usd:g} is less than one Hawk trade of ${args.follow_usd:g}. "
                              f"Use --live-usd {args.follow_usd:g} or more (for example "
                              f"{args.follow_usd * 3:g} for three trades at once).")
+    if args.stop_usd is not None:
+        if not args.live:
+            raise SystemExit("--stop-usd needs --live (it sets the stop-loss of real positions)")
+        if args.stop_usd <= 0:
+            raise SystemExit("--stop-usd must be above 0")
+        CFG["stop_usd"] = args.stop_usd
     if args.no_proof:
         if not args.live:
             raise SystemExit("--no-proof needs --live (it changes when real buys start)")

@@ -834,6 +834,7 @@ class LiveSpark(unittest.TestCase):
 class LiveBuySpeed(unittest.TestCase):
     def ex(self, slow=0.3, quote_fails=False):
         ex = m.SolanaLive.__new__(m.SolanaLive)
+        ex.own_delta = lambda sig: None   # no network in tests
         ex.cfg = m.CFG
         bal = {"tok": 0, "usdc": 25.0}
 
@@ -883,6 +884,7 @@ class CloseEmpty(unittest.TestCase):
             self.skipTest("solders not installed")
         kp = Keypair()
         ex = m.SolanaLive.__new__(m.SolanaLive)
+        ex.own_delta = lambda sig: None   # no network in tests
         ex.kp, ex.pub, ex.cfg = kp, str(kp.pubkey()), m.CFG
         sent = []
         prog = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
@@ -1096,6 +1098,16 @@ class RealityCheck(unittest.TestCase):
         st["real_rets"] = [-0.3] * 20
         eng._check_bench("Spark LIVE")
         self.assertFalse(st.get("bench"))
+
+    def test_stop_usd_sells_a_real_position_down_that_many_dollars(self):
+        eng, sold = self.eng, []
+        eng._sell = lambda name, k, reason, frac=1.0: sold.append(reason)
+        pos = dict(live=True, size=25.0, size0=25.0, ref_price=1.0, peak=1.0, opened=eng.t, symbol="X")
+        eng.cfg = dict(eng.cfg, stop_usd=10.0)
+        eng._check_exit("Spark LIVE", "k", pos, 0.75)      # down $6.25: the -20% stop would sell, $10 does not
+        self.assertEqual(sold, [])
+        eng._check_exit("Spark LIVE", "k", pos, 0.59)      # down $10.25
+        self.assertEqual(sold, ["stop-loss"])
 
     def test_costs_stay_on_the_guess_until_enough_real_fills(self):
         L, guess = self.eng.learner, self.eng._cost_guess()
@@ -1396,6 +1408,7 @@ class DirectRoute(unittest.TestCase):
 class DirectAccounting(unittest.TestCase):
     def ex(self):
         ex = m.SolanaLive.__new__(m.SolanaLive)
+        ex.own_delta = lambda sig: None   # no network in tests
         ex.cfg = m.CFG
         ex.pub = "PUB"
         ex.kp = "KP"
@@ -1459,6 +1472,7 @@ class DirectAccounting(unittest.TestCase):
 
     def test_pumpportal_request_shape(self):
         ex = m.SolanaLive.__new__(m.SolanaLive)
+        ex.own_delta = lambda sig: None   # no network in tests
         ex.cfg, ex.pub = m.CFG, "PUB"
         ex._VT = type("VT", (), {"from_bytes": staticmethod(lambda b: ("tx", b))})
         seen = {}
