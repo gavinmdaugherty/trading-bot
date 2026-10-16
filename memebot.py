@@ -152,6 +152,8 @@ CFG = dict(
     watchlist_file="watchlist.txt",
     follow_usd=5.0,              # per Hawk buy (live orders are at least live_min_trade_usd)
     follow_max_per_hour=10,      # most Hawk buys an hour, whatever the watchlist does
+    follow_max_dev_pct=60.0,     # copy even when the coin ran up to this much after the copied wallet's buy
+    follow_slippage_bps=2500,    # memecoins move fast: a copy that fails on slippage is a missed copy
     follow_min_sol=0.05,         # ignore a copied wallet's buys smaller than this (dust, tests)
     follow_checks=True,          # skip launches with red flags (bundles, a rugger creator, a scout veto)
     # ---- automatic stop: real results far worse than practice ----
@@ -1486,6 +1488,7 @@ class WalletWatch:
         self.last_seen = {}          # wallet -> time of its latest transaction (block time)
         self.reconnects = 0
         self.backfilled = 0          # trades the websocket missed and the 20s check caught
+        self.no_trade = 0            # transactions read that were not a buy or a sell (transfers, claims...)
         self.max_version = 0         # newest transaction format to ask the RPC for; raised when one turns up
 
     def set_wallets(self, wallets):
@@ -1545,7 +1548,7 @@ class WalletWatch:
 
     def status(self):
         return dict(connected=self.connected, error=self.error, ws_error=self.ws_error, notes=self.notes, txs=self.txs,
-                    reconnects=self.reconnects, backfilled=self.backfilled, since=self.connected_t, last_seen=dict(self.last_seen))
+                    reconnects=self.reconnects, backfilled=self.backfilled, no_trade=self.no_trade, since=self.connected_t, last_seen=dict(self.last_seen))
 
     def _run(self):
         delay = 2
@@ -1628,7 +1631,10 @@ class WalletWatch:
                         for wallet in self.wallets:
                             if bt and wallet in str((tx.get("transaction") or {}).get("message", {}).get("accountKeys", "")):
                                 self.last_seen[wallet] = max(self.last_seen.get(wallet, 0), bt)
-                        for ev in self.parse(tx, self.wallets, sig):
+                        evs = self.parse(tx, self.wallets, sig)
+                        if not evs:
+                            self.no_trade += 1
+                        for ev in evs:
                             ev["t"] = self.w.clock()
                             with self.w.lock:
                                 self.w.follow_events.append(ev)
@@ -1648,18 +1654,24 @@ class WalletWatch:
 
     @classmethod
     def parse(cls, tx, wallets, sig=""):
-        """Buys and sells by the watched wallets in one transaction, from its balance changes."""
+        """Buys and sells by the watched wallets in one transaction, from its balance changes. A wallet
+        counts even when someone else paid the fee (app wallets like Fomo's relay their trades), and a
+        buy paid in USDC counts as well as one paid in SOL; the USDC is in "usd", px_usd its price."""
         meta = tx.get("meta") or {}
         if meta.get("err") is not None:
             return []
-        keys = [k["pubkey"] if isinstance(k, dict) else k
-                for k in ((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or []]
+        msg = (tx.get("transaction") or {}).get("message") or {}
+        keys = [k["pubkey"] if isinstance(k, dict) else k for k in msg.get("accountKeys") or []]
+        loaded = meta.get("loadedAddresses") or {}
+        keys += list(loaded.get("writable") or []) + list(loaded.get("readonly") or [])
+        pre_b, post_b = meta.get("preBalances") or [], meta.get("postBalances") or []
         out = []
         for wallet in wallets:
-            if wallet not in keys:
-                continue
-            i = keys.index(wallet)
-            sol = ((meta.get("postBalances") or [0] * (i + 1))[i] - (meta.get("preBalances") or [0] * (i + 1))[i]) / 1e9
+            sol = 0.0
+            if wallet in keys:
+                i = keys.index(wallet)
+                if i < len(pre_b) and i < len(post_b):
+                    sol = (post_b[i] - pre_b[i]) / 1e9
             bal = {}   # mint -> [before, after, decimals]
             for side, rows in ((0, meta.get("preTokenBalances") or []), (1, meta.get("postTokenBalances") or [])):
                 for r in rows:
@@ -1668,18 +1680,27 @@ class WalletWatch:
                     ui = r.get("uiTokenAmount") or {}
                     e = bal.setdefault(r["mint"], [0, 0, int(ui.get("decimals") or 0)])
                     e[side] += int(ui.get("amount") or 0)
-            sol += (bal.get(WSOL, [0, 0, 9])[1] - bal.get(WSOL, [0, 0, 9])[0]) / 1e9   # wrapped SOL counts as SOL
+            if not bal and wallet not in keys:
+                continue
+            w0, w1, _ = bal.get(WSOL, [0, 0, 9])
+            sol += (w1 - w0) / 1e9   # wrapped SOL counts as SOL
+            u0, u1, ud = bal.get(cls.QUOTES[1], [0, 0, 6])
+            usd = (u1 - u0) / 10 ** ud
             for mint, (before, after, dec) in bal.items():
                 if mint in cls.QUOTES or after == before:
                     continue
                 tokens = (after - before) / 10 ** dec
-                if tokens > 0 and sol < 0:
-                    out.append(dict(kind="buy", mint=mint, wallet=wallet, sol=-sol, frac=0.0,
-                                    px_sol=-sol / tokens, sig=sig, src="wallet"))
-                elif tokens < 0:
-                    out.append(dict(kind="sell", mint=mint, wallet=wallet, sol=max(sol, 0.0),
+                if tokens > 0:
+                    paid_sol = -sol if sol < -0.001 else 0.0   # under 0.001 SOL is just the fee
+                    paid_usd = -usd if usd < 0 else 0.0
+                    out.append(dict(kind="buy", mint=mint, wallet=wallet, sol=paid_sol, usd=paid_usd, frac=0.0,
+                                    px_sol=paid_sol / tokens if paid_sol else None,
+                                    px_usd=paid_usd / tokens if paid_usd and not paid_sol else None,
+                                    sig=sig, src="wallet"))
+                else:
+                    out.append(dict(kind="sell", mint=mint, wallet=wallet, sol=max(sol, 0.0), usd=max(usd, 0.0),
                                     frac=1.0 if after <= 0 or before <= 0 else min(1.0, (before - after) / before),
-                                    px_sol=(max(sol, 0.0) / -tokens) if sol > 0 else None, sig=sig, src="wallet"))
+                                    px_sol=(sol / -tokens) if sol > 0 else None, sig=sig, src="wallet"))
         return out
 
 
@@ -2297,7 +2318,7 @@ class SolanaLive:
             if out <= 0:
                 return dict(ok=False, stage="quote", err="empty quote")
             implied = (int(q["inAmount"]) / 1e6) / (out / 10 ** dec)
-            dev = (implied / ref_price - 1) * 100
+            dev = (implied / ref_price - 1) * 100 if ref_price else 0.0   # no reference: take the route's price
             if dev > max_dev_pct:
                 return dict(ok=False, stage="quote", err=f"route price {dev:.1f}% above market")
         except Exception as e:
@@ -4271,8 +4292,13 @@ class Engine:
                                   " (we did not hold it)"), done)
                 continue
             curve = bool(q and q["price"] > 0 and not q["migrated"] and not q["complete"])
-            verb = "launched" if ev["kind"] == "snipe" else f"bought {ev['sol']:.2f} SOL of"
-            if not curve and not ev.get("px_sol"):
+            if not ev.get("px_sol") and ev.get("px_usd") and self.sol_usd:
+                ev["px_sol"] = ev["px_usd"] / self.sol_usd   # paid in USDC
+            paid = (f"{ev['sol']:.2f} SOL" if ev.get("sol") else
+                    f"${ev['usd']:.0f}" if ev.get("usd") else "some")
+            verb = "launched" if ev["kind"] == "snipe" else f"bought {paid} of"
+            live_any = any(self.acfg[n].get("live") for n in names)
+            if not curve and not ev.get("px_sol") and not live_any:   # a live buy can go ahead at the route's price
                 self._follow_note(ev, sym, f"{verb} ${sym}: skipped, no price yet", False)
                 continue
             red = self._follow_reason(q, ev) if curve else None
@@ -4320,20 +4346,23 @@ class Engine:
             size = min(size, c["live_max_trade_usd"])
         if size < min_t:
             return False
-        px = ev["px_sol"] * self.sol_usd
+        px = ev["px_sol"] * self.sol_usd if ev.get("px_sol") else None
         k = tkey("solana", ev["mint"])
         if live:
             st["cool"][k] = self.t
-            res = self.live.buy(ev["mint"], size, px, slippage_bps=c["live_curve_slippage_bps"],
-                                max_dev_pct=c["live_curve_max_dev_pct"], priority=c["live_curve_priority"])
+            res = self.live.buy(ev["mint"], size, px, slippage_bps=c["follow_slippage_bps"],
+                                max_dev_pct=c["follow_max_dev_pct"], priority=c["live_curve_priority"])
             if not res["ok"]:
                 if res.get("stage") == "tx":
                     self._live_fail(f"{name} buy ${sym} failed: {res['err']}")
                 return False
             self.live_fails = 0
             spent, units = res["spent_usd"], res["raw"] / 10 ** res["decimals"]
+            px = px or spent / units
             extra = dict(live=True, raw=res["raw"], decimals=res["decimals"], sig=res["sig"], route="jup")
         else:
+            if not px:
+                return False
             spent = size
             units = size / (px * (1 + (c["dex_fee_pct"] + c["extra_slip_pct"]) / 100.0))
             extra = {}
@@ -5437,7 +5466,7 @@ function renderWatch(F){
   const bad=(F.bad||[]).length?`<div class="small" style="color:var(--down)">${F.bad.map(esc).join("<br>")}</div>`:"";
   const ws=!F.on?"":(!W?(F.wallets.some(w=>w.mode!=="snipe")?'<div class="small">On-chain wallet watch: starting...</div>':""):
     `<div class="small" style="color:${W.connected?"var(--up)":"var(--down)"}">On-chain wallet watch: ${W.connected?"connected":"NOT connected"}`+
-    ` · ${W.notes} transactions seen, ${W.txs} read`+(W.reconnects?` · ${W.reconnects} reconnects`:"")+(W.backfilled?` · ${W.backfilled} caught by the 20s check`:"")+
+    ` · ${W.notes} transactions seen, ${W.txs} read`+(W.reconnects?` · ${W.reconnects} reconnects`:"")+(W.backfilled?` · ${W.backfilled} caught by the 20s check`:"")+(W.no_trade?` · ${W.no_trade} were not trades`:"")+
     (!W.connected&&W.ws_error?` · <span style="color:var(--down)">${esc(W.ws_error)}</span>`:"")+
     (W.error?` · <span style="color:var(--down)">${esc(W.error)}</span>`:"")+
     (/429/.test((W.ws_error||"")+(W.error||""))?`<br><span style="color:var(--down)">Your Solana RPC is rate-limiting Spark. Use a Helius key in SOLANA_RPC_URL (free plan is fine) and run only one copy of Spark.</span>`:"")+`</div>`);

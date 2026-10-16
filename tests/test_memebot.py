@@ -1828,6 +1828,21 @@ class WalletWatchCopy(unittest.TestCase):
         self.assertAlmostEqual(wrapped[0]["sol"], 0.401, places=3)
         self.assertEqual(m.WalletWatch.parse(self.tx(2.0, 1.5, 0, 10), {"SomeoneElse"}), [])
 
+    def test_parse_app_wallet_paying_usdc_with_relayed_fee(self):
+        # Fomo-style: the wallet is not a signer or account key, pays USDC, someone else pays the fee
+        usdc = m.WalletWatch.QUOTES[1]
+        tx = self.tx(1.0, 0.99, 0, 2_000_000_000)
+        tx["transaction"]["message"]["accountKeys"] = [dict(pubkey="Relayer", signer=True)]
+        tx["meta"]["preTokenBalances"].append(dict(accountIndex=5, mint=usdc, owner=self.W,
+                                                   uiTokenAmount=dict(amount="50000000", decimals=6)))
+        tx["meta"]["postTokenBalances"].append(dict(accountIndex=5, mint=usdc, owner=self.W,
+                                                    uiTokenAmount=dict(amount="30000000", decimals=6)))
+        ev = m.WalletWatch.parse(tx, {self.W}, "S9")
+        self.assertEqual(len(ev), 1)
+        self.assertEqual((ev[0]["kind"], ev[0]["sol"]), ("buy", 0.0))
+        self.assertAlmostEqual(ev[0]["usd"], 20.0)
+        self.assertAlmostEqual(ev[0]["px_usd"], 20.0 / 2000)
+
     def engine(self, live=None):
         c = dict(m.CFG, live_usd=23.0, demo_watch={self.W: dict(mode="copy", label="trader1")})
         src, pump = m.DemoSource(), m.DemoPump(c, clock=time.time)
@@ -1876,6 +1891,23 @@ class WalletWatchCopy(unittest.TestCase):
         self.assertTrue(pos["live"])
         self.assertIn("retries", eng.follow_log[-1]["note"])
         self.assertEqual(eng.live_fails, 0)
+
+    def test_live_copy_of_a_buy_with_no_known_price_goes_ahead_at_the_route_price(self):
+        live, seen = FakeLive(), []
+
+        def buy(mint, usd, ref, **kw):
+            seen.append((ref, kw))
+            return dict(ok=True, spent_usd=usd, raw=int(usd * 1e6), decimals=6, sig="SIG")
+        live.buy = buy
+        eng = self.engine(live=live)
+        self.push(eng, dict(kind="buy", mint=self.MINT, wallet=self.W, sol=0.0, usd=0.0, px_sol=None, sig="S1",
+                            src="wallet"))
+        eng._follow_pass()
+        self.assertEqual(len(seen), 1)
+        self.assertIsNone(seen[0][0])
+        self.assertEqual(seen[0][1]["max_dev_pct"], m.CFG["follow_max_dev_pct"])
+        pos = eng.state["agents"]["Hawk LIVE"]["positions"][m.tkey("solana", self.MINT)]
+        self.assertAlmostEqual(pos["last_price"], 1.0)
 
     def test_same_trade_from_both_sources_is_copied_once_and_partial_sells_each_count(self):
         eng = self.engine()
