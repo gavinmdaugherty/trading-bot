@@ -1479,6 +1479,7 @@ class WalletWatch:
         self.jobs = queue.Queue(maxsize=500)
         self.seen = set()
         self.connected, self.error, self.txs = False, "", 0
+        self.ws_error = ""           # why the websocket is not connected, if it is not
         self.notes = 0               # transactions the subscriptions reported
         self.connected_t = None
         self.last_seen = {}          # wallet -> time of its latest transaction (block time)
@@ -1508,10 +1509,13 @@ class WalletWatch:
                         self.last_seen[wallet] = max(self.last_seen.get(wallet, 0), rows[0]["blockTime"])
                 except Exception as e:
                     self.error = f"activity check: {str(e)[:90]}"
-            time.sleep(300 if self.wallets else 10)
+                    if "429" in str(e):
+                        break   # rate limited: leave the RPC alone until the next round
+                time.sleep(2)
+            time.sleep(600 if "429" in self.error else (300 if self.wallets else 10))
 
     def status(self):
-        return dict(connected=self.connected, error=self.error, notes=self.notes, txs=self.txs,
+        return dict(connected=self.connected, error=self.error, ws_error=self.ws_error, notes=self.notes, txs=self.txs,
                     reconnects=self.reconnects, since=self.connected_t, last_seen=dict(self.last_seen))
 
     def _run(self):
@@ -1529,7 +1533,7 @@ class WalletWatch:
                 for i, wallet in enumerate(sorted(self.wallets)):
                     ws.send(json.dumps({"jsonrpc": "2.0", "id": 100 + i, "method": "logsSubscribe",
                                         "params": [{"mentions": [wallet]}, {"commitment": "confirmed"}]}))
-                self.connected, self.error, delay, quiet = True, "", 2, 0
+                self.connected, self.ws_error, delay, quiet = True, "", 2, 0
                 self.connected_t = time.time()
                 self.w.events.append(("PUMP", f"watching {len(self.wallets)} copy-trade wallet"
                                               f"{'s' if len(self.wallets) > 1 else ''} on-chain"))
@@ -1562,14 +1566,16 @@ class WalletWatch:
                         except queue.Full:
                             pass
             except Exception as e:
-                self.connected, self.error = False, str(e)[:120]
+                self.connected, self.ws_error = False, str(e)[:120]
                 self.reconnects += 1
-                if "no data" in self.error:
+                if "no data" in self.ws_error:
                     delay = 2   # quiet wallets: reconnect quickly, nothing is wrong
                 else:
-                    self.w.events.append(("WARN", f"copy-trade wallet watch: {self.error}; retrying in {delay}s"))
+                    if "429" in self.ws_error:
+                        delay = max(delay, 30)   # rate limited: back off properly
+                    self.w.events.append(("WARN", f"copy-trade wallet watch: {self.ws_error}; retrying in {delay}s"))
                 time.sleep(delay)
-                delay = min(delay * 2, 60)
+                delay = min(delay * 2, 120)
             finally:
                 ws.close()
 
@@ -4003,12 +4009,13 @@ class Engine:
             for g in self.pump.pop_migrations():
                 self._on_grad(g)
             ps = self.pump.status()
-            if not self.demo and self.pump.rpc is None and self.pump.want_rpc:
+            firehose = self._needs_firehose()
+            if not self.demo and self.pump.rpc is None and self.pump.want_rpc and firehose:
                 self.pump_warned = True
                 self.emit("WARN", "PumpPortal does not send trade data without a paid key. "
                                   "Switching on the on-chain pump.fun feed through your Solana RPC.")
                 self.pump.start_rpc()
-            if (not self.demo and not self.pump_warned and self.pump.rpc is None
+            if (not self.demo and not self.pump_warned and self.pump.rpc is None and firehose
                     and ps["connected_for"] > 90 and ps["seen"] >= 10 and ps["trades"] == 0):
                 self.pump_warned = True
                 self.emit("WARN", f"pump.fun: {ps['seen']} launches from PumpPortal but no trades (message types "
@@ -4114,6 +4121,14 @@ class Engine:
             self.shadowed[m] = (self.t, count + 1)
 
     # ---- watchlist (Hawk) -------------------------------------------------------- #
+    def _needs_firehose(self):
+        """The on-chain pump.fun feed streams every pump.fun trade through the RPC, which can use up a
+        free plan. Copy trading alone does not need it: the wallet watch reads the copied wallets
+        directly, and coins are priced from Jupiter fills and DEX data. Spark and sniping do need it."""
+        if any(a.get("venue") == "curve" and a.get("need") != "follow" for a in self.acfg.values()):
+            return True
+        return any(w["mode"] in ("snipe", "both") for w in self.watch.values())
+
     def _load_watch(self):
         """Re-read watchlist.txt every 10 seconds, so edits apply without a restart."""
         if self.t - self.watch_t < 10:
@@ -5383,7 +5398,9 @@ function renderWatch(F){
   const ws=!F.on?"":(!W?(F.wallets.some(w=>w.mode!=="snipe")?'<div class="small">On-chain wallet watch: starting...</div>':""):
     `<div class="small" style="color:${W.connected?"var(--up)":"var(--down)"}">On-chain wallet watch: ${W.connected?"connected":"NOT connected"}`+
     ` · ${W.notes} transactions seen, ${W.txs} read`+(W.reconnects?` · ${W.reconnects} reconnects`:"")+
-    (W.error&&!W.connected||W.error&&!/no data/.test(W.error)?` · <span style="color:var(--down)">${esc(W.error)}</span>`:"")+`</div>`);
+    (!W.connected&&W.ws_error?` · <span style="color:var(--down)">${esc(W.ws_error)}</span>`:"")+
+    (W.error?` · <span style="color:var(--down)">${esc(W.error)}</span>`:"")+
+    (/429/.test((W.ws_error||"")+(W.error||""))?`<br><span style="color:var(--down)">Your Solana RPC is rate-limiting Spark. Use a Helius key in SOLANA_RPC_URL (free plan is fine) and run only one copy of Spark.</span>`:"")+`</div>`);
   const log=(F.log||[]).map(e=>`<div><span class="mute">${hhmm(e.t)}</span> <b>${esc(e.label)}</b> <span class="${e.did?"up":"mute"}">${esc(e.note)}</span></div>`).join("");
   setHTML("#watch",`<div><h3>Watchlist · Hawk ${F.on?"":'<span class="mute" style="text-transform:none;letter-spacing:0">(Hawk is off: add wallets, then restart)</span>'}</h3>${rows}${ws}${bad}</div>
     <div><h3>What they did</h3><div class="calls" style="max-height:260px;margin-top:0">${log||'<span class="mute small">Nothing yet. Hawk acts the moment a wallet on the list launches, buys or sells.</span>'}</div></div>`);

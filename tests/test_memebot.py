@@ -1984,5 +1984,19 @@ class BrainV2(unittest.TestCase):
         self.assertTrue(L2.want_training())
 
 
+class Firehose(unittest.TestCase):
+    def test_copy_only_runs_skip_the_pump_fun_firehose(self):
+        def eng(names, watch):
+            c = dict(m.CFG, demo_watch=watch)
+            src, pump = m.DemoSource(), m.DemoPump(c, clock=time.time)
+            e = m.Engine(c, [a for a in m.AGENTS if a["name"] in names], src, demo=True, pump=pump)
+            e._load_watch()
+            return e
+        copy = {"W": dict(mode="copy", label="a")}
+        self.assertFalse(eng(["Hawk"], copy)._needs_firehose())
+        self.assertTrue(eng(["Hawk"], {"W": dict(mode="snipe", label="a")})._needs_firehose())
+        self.assertTrue(eng(["Spark", "Hawk"], copy)._needs_firehose())
+
+
 if __name__ == "__main__":
     unittest.main()
