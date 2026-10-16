@@ -91,7 +91,7 @@ both  <wallet> [name]   both
 
 Saved changes apply within 10 seconds. How Hawk trades the list:
 - It acts on the fast loop the moment the trade lands on-chain. A wallet's partial sells are copied as the same fraction.
-- Each buy is `follow_usd` ($5), at most `follow_max_per_hour` (10) an hour, with up to 3 positions open.
+- Each buy is `follow_usd` ($5; set it with `--follow-usd 25`), at most `follow_max_per_hour` (10) an hour, with up to 3 positions open.
 - Buys under 0.05 SOL by a copied wallet are ignored.
 - It skips launches with red flags: the creator already sold, a bundle over 30%, a creator who rugged before (unless that creator is the one you're sniping), known rug wallets in early, or a scout veto. `--follow-unchecked` turns these checks off.
 - Its own exits still apply as a safety net: −30% stop, a profit lock once up 50%, a trailing stop, and a 2-hour limit.

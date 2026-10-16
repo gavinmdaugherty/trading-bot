@@ -6055,6 +6055,9 @@ def main():
     ap.add_argument("--paper-agents", action="store_true",
                     help="let the other agents paper-trade as well, as before. By default they work as Spark's "
                          "scouts and only Spark (and any --live-agents) trades")
+    ap.add_argument("--follow-usd", type=float, default=None,
+                    help="dollars per Hawk copy trade (default 5). Raises the per-order cap for live trades to match; "
+                         "--live-usd still limits Hawk's total")
     ap.add_argument("--follow-unchecked", action="store_true",
                     help="Hawk copies and snipes even when a launch shows red flags (bundles, a creator who "
                          "rugged before, a scout veto). Off by default")
@@ -6070,6 +6073,15 @@ def main():
         raise SystemExit("--direct needs --live (it changes how real pump.fun buys are made)")
     CFG["live_direct"] = args.direct
     CFG["follow_checks"] = not args.follow_unchecked
+    if args.follow_usd is not None:
+        if args.follow_usd < CFG["live_min_trade_usd"]:
+            raise SystemExit(f"--follow-usd must be at least {CFG['live_min_trade_usd']:.0f} (the smallest live order)")
+        CFG["follow_usd"] = args.follow_usd
+        CFG["live_max_trade_usd"] = max(CFG["live_max_trade_usd"], args.follow_usd)
+        if args.live and args.live_usd < args.follow_usd:
+            raise SystemExit(f"--live-usd {args.live_usd:g} is less than one Hawk trade of ${args.follow_usd:g}. "
+                             f"Use --live-usd {args.follow_usd:g} or more (for example "
+                             f"{args.follow_usd * 3:g} for three trades at once).")
     if args.live_only and not args.live:
         raise SystemExit("--live-only needs --live (it hides the paper agents and shows only real money)")
     if args.live and args.demo:
