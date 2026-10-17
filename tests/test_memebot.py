@@ -1109,6 +1109,23 @@ class RealityCheck(unittest.TestCase):
         eng._check_exit("Spark LIVE", "k", pos, 0.59)      # down $10.25
         self.assertEqual(sold, ["stop-loss"])
 
+    def test_a_coin_that_will_not_sell_does_not_halt_trading_and_is_set_aside(self):
+        eng = self.eng
+        eng.cfg = dict(eng.cfg, live_direct=False)
+        eng.live.sell = lambda mint, raw: dict(ok=False, stage="tx", err="HTTP 400 from lite-api.jup.ag")
+        eng.live.direct_sell = lambda mint, raw, sol_usd: dict(ok=False, stage="build", err="no pool")
+        st = eng.state["agents"]["Spark LIVE"]
+        k = m.tkey("solana", "GREENpump")
+        st["positions"][k] = dict(chain="solana", addr="GREENpump", symbol="GREEN", units=1e6, size=1.0, size0=1.0,
+                                  ref_price=1e-6, peak=1e-6, opened=eng.t, live=True, raw=10 ** 12, decimals=6,
+                                  last_price=1e-6, venue="curve", route="pump")
+        for _ in range(m.CFG["live_stuck_after"]):
+            st["positions"].get(k, {}).pop("retry_at", None)
+            eng._sell("Spark LIVE", k, "stop-loss")
+        self.assertFalse(eng.live_halt)
+        self.assertNotIn(k, st["positions"])
+        self.assertEqual(st["stuck"][0]["symbol"], "GREEN")
+
     def test_costs_stay_on_the_guess_until_enough_real_fills(self):
         L, guess = self.eng.learner, self.eng._cost_guess()
         for _ in range(4):

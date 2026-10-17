@@ -137,6 +137,7 @@ CFG = dict(
     live_max_price_dev_pct=8.0,  # refuse a buy if the route price is this far above market
     live_max_priority_lamports=500_000,         # cap on the priority fee per transaction
     live_confirm_secs=60,
+    live_stuck_after=12,         # failed sells of one position before it is set aside (sell it by hand)
     live_max_fails=4,            # consecutive failed transactions before live trading halts
     live_min_sol=0.02,           # SOL needed in the wallet for network fees
     live_min_sol_trade=0.008,    # no new live buys below this much SOL (fees + token account rent)
@@ -3834,18 +3835,25 @@ class Engine:
 
     def _direct_usable(self, usd):
         c, w = self.cfg, self.wallet
+        if not self.direct_ok and c.get("live_direct") and self.t - getattr(self, "direct_off_t", self.t) > 900:
+            self.direct_ok, self.direct_fails = True, 0   # paused long enough: try the direct route again
+            self.emit("RISK", "direct pump.fun buys back on")
         return bool(self.direct_ok and hasattr(self.live, "direct_buy") and w
                     and (w.get("sol", 0.0) - c["live_min_sol"]) * self.sol_usd >= usd)
 
     def _direct_error(self, what, err):
         """A direct-route problem that is not the market's doing: fall back to Jupiter, and switch
         the route off for this run if it keeps happening."""
+        if "not enough SOL" in err:   # the wallet's problem, not the route's: do not count it against the route
+            self.emit("WARN", f"direct pump.fun {what}: not enough SOL in the wallet; using Jupiter (USDC) instead")
+            return
         self.direct_fails += 1
         self.emit("WARN", f"direct pump.fun {what} failed ({err.replace('rpc sendTransaction: ', '')[:240]}); using Jupiter instead")
         if self.direct_fails >= self.cfg["live_direct_max_fails"] and self.direct_ok:
             self.direct_ok = False
-            self.emit("WARN", "direct pump.fun route switched off for this run after repeated errors. "
-                              "Run  python memebot.py --check  to see why.")
+            self.direct_off_t = self.t
+            self.emit("WARN", "direct pump.fun buys paused for 15 minutes after repeated errors (sells still go "
+                              "direct). Run  python memebot.py --check  to see why.")
 
     def _live_buy_curve(self, name, q, size):
         """Buy a pump.fun launch with real money: straight on pump.fun in SOL with --direct,
@@ -3914,6 +3922,19 @@ class Engine:
                           + self._call(name, q, spent))
         return True
 
+    def _set_aside(self, name, k, pos, err):
+        """A real position that keeps failing to sell is taken off Spark's books: it frees its slot and
+        no longer counts as money Spark can trade. The tokens stay in the wallet to sell by hand."""
+        st = self.state["agents"][name]
+        st["positions"].pop(k, None)
+        st["cool"][k] = self.t + 10 ** 9   # never buy it again
+        st.setdefault("stuck", []).append(dict(symbol=pos["symbol"], addr=pos["addr"], size=pos.get("size", 0),
+                                               t=self.t, err=str(err)[:120]))
+        st["losses"] = st.get("losses", 0) + 1
+        self.emit("HALT", f"{name} gave up selling ${pos['symbol']} after {pos['sell_fails']} tries ({str(err)[:80]}). "
+                          f"Taken off Spark's books as a ${pos.get('size', 0):.2f} loss so trading carries on; the tokens "
+                          f"are still in the wallet (mint {pos['addr']}) if you want to sell them by hand.")
+
     def _live_fail(self, msg):
         self.live_fails += 1
         self.emit("WARN", msg)
@@ -3958,7 +3979,10 @@ class Engine:
                 return  # a recent sell failed: wait out the backoff instead of hammering the APIs
             want = pos["raw"] if full else int(pos["raw"] * frac)
             res = None
-            if pos.get("route") == "pump" and self.direct_ok and hasattr(self.live, "direct_sell"):
+            pumpish = pos.get("route") == "pump" or str(pos.get("addr", "")).endswith("pump")
+            # sells always try pump.fun first for its coins: Jupiter often has no route for a curve coin,
+            # and switching the direct route off (for buys) must never strand a position
+            if pumpish and self.cfg.get("live_direct") and hasattr(self.live, "direct_sell"):
                 res = self.live.direct_sell(pos["addr"], want, self.sol_usd)
                 if res["ok"]:
                     self.direct_fails = 0
@@ -3976,13 +4000,25 @@ class Engine:
                 # stage "tx": it may have landed, so no second sale now; the backoff retries from a fresh balance
             if res is None:
                 res = self.live.sell(pos["addr"], want)
+                if (not res["ok"] and pumpish and not self.cfg.get("live_direct")
+                        and hasattr(self.live, "direct_sell")):
+                    alt = self.live.direct_sell(pos["addr"], want, self.sol_usd)   # Jupiter had no way out
+                    if alt["ok"]:
+                        res = alt
+                        if res.get("got_usd") is None:
+                            res["got_usd"] = self._value(pos, units)
             if not res["ok"]:
                 if full:
                     pos["pending_exit"] = reason
                 pos["sell_fails"] = pos.get("sell_fails", 0) + 1
                 wait = min(120, 5 * 2 ** min(pos["sell_fails"] - 1, 5))
                 pos["retry_at"] = self.t + wait
-                self._live_fail(f"{name} could not sell ${pos['symbol']}: {res['err']} (retrying in {wait}s)")
+                if res.get("stage") == "tx" and pos["sell_fails"] == 1:
+                    self._live_fail(f"{name} could not sell ${pos['symbol']}: {res['err']} (retrying in {wait}s)")
+                else:   # one coin that will not sell must not halt all trading: it only blocks itself
+                    self.emit("WARN", f"{name} could not sell ${pos['symbol']}: {res['err']} (retrying in {wait}s)")
+                if pos["sell_fails"] >= self.cfg["live_stuck_after"]:
+                    self._set_aside(name, k, pos, res["err"])
                 return
             pos.pop("retry_at", None)
             self.live_fails = 0
