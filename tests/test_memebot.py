@@ -1126,6 +1126,23 @@ class RealityCheck(unittest.TestCase):
         self.assertNotIn(k, st["positions"])
         self.assertEqual(st["stuck"][0]["symbol"], "GREEN")
 
+    def test_rules_only_ignores_the_model_and_why_report_explains_no_buys(self):
+        from unittest import mock
+        eng = self.eng
+        eng._hard_curve_reason = lambda a, q: None
+        eng._soft_curve_reason = lambda a, q: None
+        eng.learner.n = eng.learner.min_n                 # model trained...
+        eng.learner.ev = lambda x: -0.2                   # ...and sees no edge anywhere
+        q = dict(self.q(), prog=30.0)
+        with mock.patch.object(m.Learner, "features", staticmethod(lambda q: [0.0])):
+            self.assertEqual(eng._why_not_curve("Spark LIVE", q), "model sees no edge")
+            eng.cfg = dict(eng.cfg, rules_only=True)
+            self.assertIsNone(eng._why_not_curve("Spark LIVE", q))
+        eng._why_report(["Spark LIVE"], {"Spark LIVE": {"model sees no edge": 9, "creator sold": 1}})
+        eng.t += 601
+        eng._why_report(["Spark LIVE"], {"Spark LIVE": {}})
+        self.assertIn("model sees no edge 90%", eng.state["log"][-1]["msg"])
+
     def test_costs_stay_on_the_guess_until_enough_real_fills(self):
         L, guess = self.eng.learner, self.eng._cost_guess()
         for _ in range(4):

@@ -130,6 +130,7 @@ CFG = dict(
     live_min_trade_usd=5.0,
     live_max_trade_usd=10.0,     # hard cap per order
     stop_usd=None,               # --stop-usd: sell a real position once it is down this many dollars
+    rules_only=False,            # --rules-only: real buys follow Spark's hand-set rules, not the model
     skip_proof=False,            # --no-proof: real buys start at once, without waiting for practice to prove a profit
     trade_usd=None,              # --trade-usd: every real buy (except Hawk's copies) is this size
     live_slippage_bps=300,       # buys: 3% tolerance
@@ -3394,6 +3395,7 @@ class Engine:
         self.wallet_watch = None                # on-chain watch of the copy wallets (real runs)
         self.report_t = 0.0
         self.blocks = {}          # agent -> (tokens checked, {reason it didn't buy: count})
+        self.why_acc = {}         # live agent -> reasons it did not buy, added up for the 10-minute report
         self.phase, self.phase_t, self.next_at = "starting up", time.time(), None
         self.state = self._load() or self._fresh()
         lineup = sorted(self.acfg)
@@ -3677,7 +3679,7 @@ class Engine:
         r = self._hard_curve_reason(a, q)
         if r:
             return r
-        if a.get("learn") and self.learner:
+        if a.get("learn") and self.learner and not (a.get("live") and c.get("rules_only")):
             L = self.learner
             if L.ready():  # the model replaces the hand-set thresholds below
                 if L.ev(Learner.features(q)) < c["learn_edge"]:
@@ -4610,7 +4612,28 @@ class Engine:
                     counts[name][why] = counts[name].get(why, 0) + 1
         for name in names:
             self.blocks[name] = (len(cands), counts[name])
+        self._why_report(names, counts)
         self._update_desk(cands, names)
+
+    def _why_report(self, names, counts):
+        """Every 10 minutes without a real buy, say in the log why: the reasons that stopped it,
+        added up over those 10 minutes."""
+        for name in names:
+            if not self.acfg[name].get("live"):
+                continue
+            acc = self.why_acc.setdefault(name, dict(t=self.t, n=0, why={}))
+            acc["n"] += 1
+            for r, k in counts[name].items():
+                acc["why"][r] = acc["why"].get(r, 0) + k
+            if self.t - acc["t"] < 600:
+                continue
+            bought = any(self.t - t < 600 for t in self.curve_buys.get(name, ()))
+            if not bought and acc["why"]:
+                top = sorted(acc["why"].items(), key=lambda kv: -kv[1])[:4]
+                total = sum(acc["why"].values())
+                self.emit("RISK", f"{name}: no buy in the last 10 min. Why, over {total} looks: "
+                                  + ", ".join(f"{r} {k * 100 // total}%" for r, k in top))
+            self.why_acc[name] = dict(t=self.t, n=0, why={})
 
     def _trending_words(self):
         """Words from what is trending right now, for the trend scout: Fomo's board and DEX
@@ -6289,6 +6312,9 @@ def main():
     ap.add_argument("--stop-usd", type=float, default=None,
                     help="with --live: sell a real position once it is down this many dollars (for example 10), "
                          "instead of the stop-loss percentage")
+    ap.add_argument("--rules-only", action="store_true",
+                    help="with --live: real buys follow Spark's hand-set rules and rug checks and ignore the model "
+                         "(which keeps learning). For when the model sees no edge in anything")
     ap.add_argument("--no-proof", action="store_true",
                     help="with --live: buy with real money straight away, without waiting for practice to "
                          "prove a profit, and never bench. Riskier")
@@ -6319,6 +6345,10 @@ def main():
         if args.stop_usd <= 0:
             raise SystemExit("--stop-usd must be above 0")
         CFG["stop_usd"] = args.stop_usd
+    if args.rules_only:
+        if not args.live:
+            raise SystemExit("--rules-only needs --live (it changes how real buys are picked)")
+        CFG["rules_only"] = True
     if args.no_proof:
         if not args.live:
             raise SystemExit("--no-proof needs --live (it changes when real buys start)")
